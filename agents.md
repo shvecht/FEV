@@ -68,12 +68,12 @@ test_loader.py
 ## 5) Phase milestones (don’t skip)
 
 **Phase 1 – Loader (no cache)**
-- [ ] `EdfLoader.read(i, t0, t1) -> (t_s, x)`
-- [ ] `EdfLoader.read_annotations()` (EDF+)
+- [x] `EdfLoader.read(i, t0, t1) -> (t_s, x)`
+- [x] `EdfLoader.read_annotations()` (EDF+)
 
 **Phase 2 – Single-channel viewer**
-- [ ] Time axis HH:MM:SS
-- [ ] Channel dropdown, start + window controls
+- [x] Time axis HH:MM:SS
+- [x] Channel dropdown, start + window controls *(superseded by multi-channel global controls)*
 
 **Phase 3 – Multi-channel stack**
 - [ ] Checkbox list to toggle channels
@@ -159,13 +159,15 @@ offset_s: 0.0
 ---
 
 ## 9) Testing strategy (minimal but real)
-- test_timebase.py
+- test_timebase.py *(added)*
 - sec↔idx roundtrips (various fs)
 - clamp_window edges
-- test_loader.py
-- short EDF fixture: exact sample counts at edges
-- annotations: NaN durations → 0 span
+- test_loader.py *(using fake pyEDFlib reader added)*
+- short EDF fixture: exact sample counts at edges *(covered via synthetic arrays for now)*
+- annotations: NaN durations → 0 span *(pending)*
 - Golden images (optional): save PNG of 10 s window and diff on CI.
+
+> **Test runner:** `uv pip install pytest` then `uv run python -m pytest` (CI todo).
 
 ---
 
@@ -180,6 +182,8 @@ offset_s: 0.0
 ## 11) Decision log (append entries)
 - 2025-09-23: UI uses seconds-from-start, absolute datetimes only for tooltips.
 - 2025-09-23: Max default window = 60 s; hard cap = 120 s.
+- 2025-09-24: Multi-channel stacked viewer replaces dropdown; labels pinned left, shared absolute axis.
+- 2025-09-24: Dependency installs handled via `uv`; pytest suite (loader, timebase) is baseline gate.
 
 ---
 

@@ -21,6 +21,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.loader.timebase.start_dt is not None:
             self.time_axis.set_mode("absolute")
 
+        self._primary_plot = None
         self._build_ui()
         self._connect_signals()
         self._refresh_limits()
@@ -64,6 +65,11 @@ class MainWindow(QtWidgets.QMainWindow):
         form.addWidget(self.windowSpin, 1, 1)
 
         controlLayout.addWidget(header)
+        self.fileButton = QtWidgets.QPushButton("Open EDF…")
+        self.fileButton.setObjectName("fileSelectButton")
+        self.fileButton.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_DialogOpenButton))
+        self.fileButton.setCursor(QtCore.Qt.PointingHandCursor)
+        controlLayout.addWidget(self.fileButton)
         controlLayout.addLayout(form)
         controlLayout.addWidget(self.absoluteRange)
         controlLayout.addWidget(self.windowSummary)
@@ -73,44 +79,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.plotLayout.ci.layout.setSpacing(0)
         self.plotLayout.ci.layout.setContentsMargins(0, 0, 0, 0)
 
-        self.plots = []
-        self.curves = []
-        self.channel_labels = []
-        for idx, meta in enumerate(self.loader.info):
-            label_text = meta.name if not meta.unit else f"{meta.name} [{meta.unit}]"
-            label_html = (
-                "<span style='color:#dfe7ff;font-weight:600;font-size:11pt;padding-right:12px;'>"
-                f"{label_text}"
-                "</span>"
-            )
-            label = self.plotLayout.addLabel(
-                row=idx,
-                col=0,
-                text=label_html,
-                justify="right",
-            )
-            self.channel_labels.append(label)
+        self.plots: list[pg.PlotItem] = []
+        self.curves: list[pg.PlotDataItem] = []
+        self.channel_labels: list[pg.LabelItem] = []
 
-            axisItems = {"bottom": self.time_axis} if idx == self.loader.n_channels - 1 else None
-            plot = self.plotLayout.addPlot(row=idx, col=1, axisItems=axisItems)
-            if idx != self.loader.n_channels - 1:
-                plot.showAxis("bottom", show=False)
-            plot.showAxis("left", show=False)
-            plot.showAxis("right", show=False)
-            plot.showAxis("top", show=False)
-            plot.setMenuEnabled(False)
-            plot.setMouseEnabled(x=True, y=False)
-            plot.showGrid(x=False, y=True, alpha=0.15)
-            pen = pg.mkPen(pg.intColor(idx, hues=self.loader.n_channels, values=220), width=1.2)
-            curve = plot.plot([], [], pen=pen)
-            curve.setClipToView(True)
-            curve.setDownsampling(auto=True, method="peak")
-            self.plots.append(plot)
-            self.curves.append(curve)
-
-        self._primary_plot = self.plots[-1]
-        for plot in self.plots[:-1]:
-            plot.setXLink(self._primary_plot)
+        self._ensure_plot_rows(self.loader.n_channels)
+        self._configure_plots()
 
         scroll = QtWidgets.QScrollArea()
         scroll.setWidgetResizable(True)
@@ -152,6 +126,21 @@ class MainWindow(QtWidgets.QMainWindow):
                 background-color: #131b2b;
                 border-right: 1px solid #1f2a3d;
             }
+            QPushButton#fileSelectButton {
+                background-color: #1a2436;
+                border: 1px solid #27324a;
+                border-radius: 6px;
+                padding: 8px 12px;
+                color: #f3f6ff;
+                font-weight: 600;
+            }
+            QPushButton#fileSelectButton:hover {
+                background-color: #22304a;
+                border-color: #39507a;
+            }
+            QPushButton#fileSelectButton:pressed {
+                background-color: #182235;
+            }
             QScrollArea { background-color: #0b111c; }
         """
         )
@@ -159,6 +148,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _connect_signals(self):
         self.startSpin.valueChanged.connect(self.refresh)
         self.windowSpin.valueChanged.connect(self._on_window_changed)
+        self.fileButton.clicked.connect(self._prompt_open_file)
 
     # ----- Behaviors -------------------------------------------------------
 
@@ -179,11 +169,12 @@ class MainWindow(QtWidgets.QMainWindow):
         duration = self.windowSpin.value()
         t1 = min(self.loader.duration_s, t0 + duration)
 
-        for i, curve in enumerate(self.curves):
+        for i in range(self.loader.n_channels):
             t, x = self.loader.read(i, t0, t1)
-            curve.setData(t, x)
+            self.curves[i].setData(t, x)
 
-        self._primary_plot.setXRange(t0, t1, padding=0)
+        if self._primary_plot is not None:
+            self._primary_plot.setXRange(t0, t1, padding=0)
         self._update_time_labels(t0, t1)
 
     def _update_time_labels(self, t0, t1):
@@ -201,3 +192,126 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"{start_dt:%Y-%m-%d %H:%M:%S} – {end_dt:%Y-%m-%d %H:%M:%S}"
             )
         self.windowSummary.setText(f"Window: {t1 - t0:.1f} s")
+
+    def _prompt_open_file(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            caption="Open EDF file",
+            filter="EDF Files (*.edf *.EDF);;All Files (*)",
+        )
+        if not path:
+            return
+
+        self._load_new_file(path)
+
+    def _load_new_file(self, path: str):
+        old_loader = self.loader
+        try:
+            new_loader = type(old_loader)(path)
+        except Exception as exc:  # pragma: no cover - UI feedback
+            QtWidgets.QMessageBox.critical(self, "Failed to open", str(exc))
+            return
+
+        self.loader = new_loader
+        old_loader.close()
+
+        self.startSpin.blockSignals(True)
+        self.windowSpin.blockSignals(True)
+        try:
+            self.time_axis.set_timebase(self.loader.timebase)
+            if self.loader.timebase.start_dt is not None:
+                self.time_axis.set_mode("absolute")
+
+            self.startSpin.setValue(0.0)
+            self.windowSpin.setValue(min(30.0, self.loader.duration_s))
+            self._refresh_limits()
+        finally:
+            self.startSpin.blockSignals(False)
+            self.windowSpin.blockSignals(False)
+
+        self._ensure_plot_rows(self.loader.n_channels)
+        self._configure_plots()
+        self.refresh()
+
+    # ----- Plot helpers ------------------------------------------------------
+
+    def _ensure_plot_rows(self, count: int):
+        while len(self.plots) < count:
+            idx = len(self.plots)
+            label = self.plotLayout.addLabel(row=idx, col=0, text="", justify="right")
+            self.channel_labels.append(label)
+
+            plot = self.plotLayout.addPlot(row=idx, col=1)
+            plot.showAxis("bottom", show=False)
+            plot.showAxis("left", show=False)
+            plot.showAxis("right", show=False)
+            plot.showAxis("top", show=False)
+            plot.setMenuEnabled(False)
+            plot.setMouseEnabled(x=True, y=False)
+            plot.showGrid(x=False, y=True, alpha=0.15)
+            curve = plot.plot([], [], pen=pg.mkPen(pg.intColor(idx, values=220), width=1.2))
+            curve.setClipToView(True)
+            curve.setDownsampling(auto=True, method="peak")
+
+            self.plots.append(plot)
+            self.curves.append(curve)
+
+    def _configure_plots(self):
+        n = self.loader.n_channels
+        self._ensure_plot_rows(n)
+
+        # Reset previous primary axis if needed
+        if self._primary_plot and self._primary_plot not in self.plots[:n]:
+            self._primary_plot.setAxisItems({"bottom": pg.AxisItem(orientation="bottom")})
+            self._primary_plot.showAxis("bottom", show=False)
+
+        for idx, plot in enumerate(self.plots):
+            active = idx < n
+            if not active:
+                plot.hide()
+                self.channel_labels[idx].setText("")
+                self.curves[idx].setData([], [])
+                continue
+
+            plot.show()
+            meta = self.loader.info[idx]
+            self.channel_labels[idx].setText(self._format_label(meta))
+
+            pen = pg.mkPen(pg.intColor(idx, hues=max(1, n), values=220), width=1.2)
+            self.curves[idx].setPen(pen)
+
+        if n == 0:
+            self._primary_plot = None
+            return
+
+        new_primary = self.plots[n - 1]
+        if self._primary_plot and self._primary_plot is not new_primary:
+            self._primary_plot.setAxisItems({"bottom": pg.AxisItem(orientation="bottom")})
+            self._primary_plot.showAxis("bottom", show=False)
+
+        new_primary.setAxisItems({"bottom": self.time_axis})
+        new_primary.showAxis("bottom", show=True)
+        self._primary_plot = new_primary
+
+        for idx, plot in enumerate(self.plots[:n]):
+            if plot is new_primary:
+                plot.setXLink(None)
+            else:
+                plot.showAxis("bottom", show=False)
+                plot.setXLink(new_primary)
+
+        for plot in self.plots[n:]:
+            plot.setXLink(None)
+            plot.showAxis("bottom", show=False)
+            if plot.getAxis("bottom") is self.time_axis:
+                plot.setAxisItems({"bottom": pg.AxisItem(orientation="bottom")})
+
+    @staticmethod
+    def _format_label(meta) -> str:
+        unit = f" [{meta.unit}]" if getattr(meta, "unit", "") else ""
+        text = f"{meta.name}{unit}"
+        return (
+            "<span style='color:#dfe7ff;font-weight:600;font-size:11pt;padding-right:12px;'>"
+            f"{text}"
+            "</span>"
+        )
