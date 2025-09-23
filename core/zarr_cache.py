@@ -77,6 +77,7 @@ class EdfToZarr:
         attrs["channels"] = list(loader.channels)
         attrs["chunk_duration_s"] = float(self.chunk_duration)
         attrs["max_chunk_samples"] = int(self.max_chunk_samples)
+        attrs["max_window_s"] = float(getattr(loader, "max_window_s", 120.0))
 
     def _write_channels(self, group: zarr.Group, loader: EdfLoader) -> None:
         channels_group = group.create_group("channels")

@@ -95,11 +95,11 @@ test_loader.py
 - [x] Viewer auto-builds cache in background, swaps to `ZarrLoader` post-ingest
 
 **Phase 6 – Tolerable skimming**
-- [ ] `decimate.minmax(t, x, px)` utility with pytest coverage
-- [ ] Integrate decimation pipeline in viewer (EDF+Zarr parity) behind feature flag
-- [ ] Max window cap enforced at loader level (configurable)
-- [ ] Debounced redraw (Qt timers) + tests for throttle logic
+- [x] `decimate.minmax(t, x, px)` utility with pytest coverage
+- [x] Integrate decimation + pan/zoom UI with debounce
+- [x] Max window cap enforced at loader/Zarr loader
 - [ ] Perf smoke tests (profiling script ± synthetic 500 Hz data)
+- [ ] Prefetch ring-buffer prototype for smoother scrubbing
 
 **Phase 7 – Prefetch ring buffer**
 - [ ] Async read-ahead for prev/next window
@@ -122,8 +122,8 @@ test_loader.py
 ### Viewer Agent
 **Goal:** draw only what eyes can see.  
 **Checklist:**
-- [ ] Choose window `[t0, t1]` → compute `sec_per_px`
-- [ ] If `n_samples > 4*px`: decimate (min/max per bin)
+- [x] Choose window `[t0, t1]` → compute `sec_per_px`
+- [x] If `n_samples > 4*px`: decimate (min/max per bin)
 - [x] One `PlotCurveItem` per visible channel
 - [x] Shared X axis; per-lane vertical offsets
 
@@ -203,6 +203,7 @@ offset_s: 0.0
 - 2025-09-24: Dependency installs handled via `uv`; pytest suite (loader, timebase) is baseline gate.
 - 2025-09-24: Zarr cache ingestion planned; target `EdfToZarr` writer, loader shim, MemoryStore unit tests.
 - 2025-09-24: Viewer swaps to Zarr cache post-build; source badge shows active backend.
+- 2025-09-24: Skimming UI (pan/zoom, decimation) live; next add prefetch buffer + full-night zoom.
 - 2025-09-24: App auto-ingests EDF → Zarr with progress UI; Zarr parity verified post-write.
 
 ---

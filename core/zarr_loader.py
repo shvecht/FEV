@@ -20,7 +20,7 @@ class ChannelMeta:
 
 
 class ZarrLoader:
-    def __init__(self, store_path: str | Path):
+    def __init__(self, store_path: str | Path, *, max_window_s: float | None = None):
         path = Path(store_path)
         self.path = str(path)
         self._root = zarr.open_group(str(path), mode="r")
@@ -28,6 +28,8 @@ class ZarrLoader:
         self.duration_s = float(self._root.attrs.get("duration_s", 0.0))
         start = self._root.attrs.get("start_dt")
         self.start_dt: datetime | None = datetime.fromisoformat(start) if start else None
+        default_cap = float(self._root.attrs.get("max_window_s", 120.0))
+        self.max_window_s = float(default_cap if max_window_s is None else max_window_s)
 
         self._channel_arrays: List[zarr.Array] = []
         self._channel_meta: List[ChannelMeta] = []
@@ -63,6 +65,7 @@ class ZarrLoader:
         meta = self._channel_meta[idx]
         arr = self._channel_arrays[idx]
         t0_c, t1_c = self.timebase.clamp_window(t0, t1)
+        t1_c = min(t0_c + self.max_window_s, t1_c)
         s0, n = Timebase.sec_to_idx(t0_c, t1_c, meta.fs)
         total = meta.n_samples
         if s0 >= total or n <= 0:

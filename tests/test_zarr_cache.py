@@ -19,6 +19,7 @@ class FakeEdfLoader:
         self.n_channels = 2
         self.channels = ["C3", "O2"]
         self._fs = [100.0, 50.0]
+        self.max_window_s = 120.0
         self.info = [
             SimpleNamespace(name="C3", fs=self._fs[0], n_samples=int(duration_s * self._fs[0]), unit="uV"),
             SimpleNamespace(name="O2", fs=self._fs[1], n_samples=int(duration_s * self._fs[1]), unit="uV"),
@@ -162,3 +163,21 @@ def test_zarr_loader_parity_with_edf(tmp_path):
     finally:
         loader.close()
         zarr_loader.close()
+
+
+def test_zarr_loader_respects_window_cap(tmp_path):
+    store_path = tmp_path / "study.zarr"
+    builder = zc.EdfToZarr(
+        "study.edf",
+        out_path=str(store_path),
+    )
+    builder.build()
+
+    zarr_loader = ZarrLoader(store_path, max_window_s=0.5)
+    try:
+        t, x = zarr_loader.read(0, 0.0, 5.0)
+    finally:
+        zarr_loader.close()
+
+    assert t.size == x.size
+    assert t[-1] - t[0] <= 0.5 + 1 / zarr_loader.fs(0)

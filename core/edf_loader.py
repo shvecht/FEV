@@ -15,10 +15,13 @@ class ChannelInfo:
     unit: str
 
 class EdfLoader:
-    def __init__(self, path: str):
+    def __init__(self, path: str, *, max_window_s: float = 120.0):
+        if max_window_s <= 0:
+            raise ValueError("max_window_s must be positive")
         self.path = path
         self._r = pyedflib.EdfReader(path)
         self._lock = threading.RLock()
+        self.max_window_s = float(max_window_s)
         self.duration_s = float(self._r.file_duration)
         self.start_dt: datetime = self._r.getStartdatetime()
         self.n_channels = self._r.signals_in_file
@@ -37,6 +40,7 @@ class EdfLoader:
         fs = self._fs[i]
         with self._lock:
             t0_c, t1_c = self.timebase.clamp_window(t0, t1)
+            t1_c = min(t0_c + self.max_window_s, t1_c)
             s0, n = Timebase.sec_to_idx(t0_c, t1_c, fs)
             total = self._ns[i]
             if s0 >= total:

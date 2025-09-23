@@ -127,3 +127,15 @@ def test_read_annotations_passthrough():
     assert onsets == [0.0, 2.5]
     assert durations == [1.0, 0.0]
     assert labels == ["A", "B"]
+
+
+def test_read_respects_max_window():
+    loader = edf_module.EdfLoader("dummy.edf", max_window_s=0.5)
+    try:
+        t, x = loader.read(0, 0.0, 5.0)
+    finally:
+        loader.close()
+
+    assert t.size == x.size
+    assert t.size <= int(np.ceil(loader.fs(0) * 0.5)) + 1
+    assert t[-1] - t[0] <= 0.5 + 1 / loader.fs(0)

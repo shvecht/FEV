@@ -4,9 +4,11 @@ from __future__ import annotations
 from pathlib import Path
 
 import pyqtgraph as pg
-from PySide6 import QtCore, QtWidgets
+from PySide6 import QtCore, QtWidgets, QtGui
 
 from ui.time_axis import TimeAxis
+from core.decimate import min_max_bins
+from core.view_window import WindowLimits, clamp_window, pan_window, zoom_window
 from core.zarr_cache import EdfToZarr, resolve_output_path
 from core.zarr_loader import ZarrLoader
 
@@ -59,6 +61,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self._ingest_worker: _ZarrIngestWorker | None = None
         self._zarr_path: Path | None = None
         self._pending_loader: object | None = None
+        self._primary_viewbox = None
+        self._limits = WindowLimits(
+            duration_min=0.25,
+            duration_max=float(getattr(loader, "max_window_s", 120.0)),
+        )
+        self._view_start, self._view_duration = clamp_window(
+            0.0,
+            min(30.0, loader.duration_s),
+            total=loader.duration_s,
+            limits=self._limits,
+        )
+        self._updating_viewbox = False
 
         pg.setConfigOptions(antialias=True)
         pg.setConfigOption("background", "#10131d")
@@ -72,7 +86,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._primary_plot = None
         self._build_ui()
         self._connect_signals()
+        self._debounce_timer = QtCore.QTimer(self)
+        self._debounce_timer.setSingleShot(True)
+        self._debounce_timer.setInterval(60)
+        self._debounce_timer.timeout.connect(self.refresh)
         self._refresh_limits()
+        self._update_controls_from_state()
         self.refresh()
         self._update_data_source_label()
         self._start_zarr_ingest()
@@ -108,6 +127,23 @@ class MainWindow(QtWidgets.QMainWindow):
         header = QtWidgets.QLabel("Viewing Window")
         header.setObjectName("panelTitle")
 
+        navLayout = QtWidgets.QHBoxLayout()
+        navLayout.setSpacing(6)
+        self.panLeftBtn = QtWidgets.QToolButton()
+        self.panLeftBtn.setText("◀")
+        self.panRightBtn = QtWidgets.QToolButton()
+        self.panRightBtn.setText("▶")
+        self.zoomInBtn = QtWidgets.QToolButton()
+        self.zoomInBtn.setText("+")
+        self.zoomOutBtn = QtWidgets.QToolButton()
+        self.zoomOutBtn.setText("−")
+        self.resetViewBtn = QtWidgets.QToolButton()
+        self.resetViewBtn.setText("Reset")
+        for btn in (self.panLeftBtn, self.panRightBtn, self.zoomInBtn, self.zoomOutBtn, self.resetViewBtn):
+            btn.setCursor(QtCore.Qt.PointingHandCursor)
+            navLayout.addWidget(btn)
+        navLayout.addStretch(1)
+
         form = QtWidgets.QGridLayout()
         form.setHorizontalSpacing(12)
         form.setVerticalSpacing(10)
@@ -117,6 +153,7 @@ class MainWindow(QtWidgets.QMainWindow):
         form.addWidget(self.windowSpin, 1, 1)
 
         controlLayout.addWidget(header)
+        controlLayout.addLayout(navLayout)
         self.fileButton = QtWidgets.QPushButton("Open EDF…")
         self.fileButton.setObjectName("fileSelectButton")
         self.fileButton.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_DialogOpenButton))
@@ -203,6 +240,19 @@ class MainWindow(QtWidgets.QMainWindow):
             QPushButton#fileSelectButton:pressed {
                 background-color: #182235;
             }
+            QToolButton {
+                background-color: #1a2333;
+                border: 1px solid #263247;
+                border-radius: 4px;
+                padding: 4px 8px;
+                color: #dfe7ff;
+            }
+            QToolButton:hover {
+                background-color: #25314a;
+            }
+            QToolButton:pressed {
+                background-color: #172132;
+            }
             QProgressBar#ingestBar {
                 background-color: #121a24;
                 border: 1px solid #1f2a3d;
@@ -219,35 +269,89 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
     def _connect_signals(self):
-        self.startSpin.valueChanged.connect(self.refresh)
-        self.windowSpin.valueChanged.connect(self._on_window_changed)
+        self.startSpin.valueChanged.connect(self._on_start_spin_changed)
+        self.windowSpin.valueChanged.connect(self._on_duration_spin_changed)
         self.fileButton.clicked.connect(self._prompt_open_file)
+        self.panLeftBtn.clicked.connect(lambda: self._pan_fraction(-0.25))
+        self.panRightBtn.clicked.connect(lambda: self._pan_fraction(0.25))
+        self.zoomInBtn.clicked.connect(lambda: self._zoom_factor(0.5))
+        self.zoomOutBtn.clicked.connect(lambda: self._zoom_factor(2.0))
+        self.resetViewBtn.clicked.connect(self._reset_view)
+
+        self._shortcuts: list[QtGui.QShortcut] = []
+        self._shortcuts.append(QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_Left), self, activated=lambda: self._pan_fraction(-0.1)))
+        self._shortcuts.append(QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_Right), self, activated=lambda: self._pan_fraction(0.1)))
+        self._shortcuts.append(QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_Minus), self, activated=lambda: self._zoom_factor(2.0)))
+        self._shortcuts.append(QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_Equal), self, activated=lambda: self._zoom_factor(0.5)))
+        self._shortcuts.append(QtGui.QShortcut(QtGui.QKeySequence("R"), self, activated=self._reset_view))
 
     # ----- Behaviors -------------------------------------------------------
 
     def _refresh_limits(self):
-        max_start = max(0.0, self.loader.duration_s - self.windowSpin.value())
-        self.startSpin.setRange(0.0, max_start)
-        if self.startSpin.value() > max_start:
-            self.startSpin.setValue(max_start)
+        duration_cap = min(self._limits.duration_max, self.loader.duration_s)
+        self.windowSpin.blockSignals(True)
+        self.windowSpin.setRange(self._limits.duration_min, max(self._limits.duration_min, duration_cap))
+        self.windowSpin.blockSignals(False)
 
-    def _on_window_changed(self, value):
-        _ = value  # unused, keeps slot signature
-        self._refresh_limits()
-        self.refresh()
+        max_start = max(0.0, self.loader.duration_s - self._view_duration)
+        self.startSpin.blockSignals(True)
+        self.startSpin.setRange(0.0, max_start)
+        self.startSpin.blockSignals(False)
+
+    def _update_limits_from_loader(self):
+        self._limits = WindowLimits(
+            duration_min=self._limits.duration_min,
+            duration_max=float(getattr(self.loader, "max_window_s", self._limits.duration_max)),
+        )
+
+    def _update_controls_from_state(self):
+        self.startSpin.blockSignals(True)
+        self.windowSpin.blockSignals(True)
+        self.startSpin.setValue(self._view_start)
+        self.windowSpin.setValue(self._view_duration)
+        self.startSpin.blockSignals(False)
+        self.windowSpin.blockSignals(False)
+
+    def _update_viewbox_from_state(self):
+        if not self._primary_plot:
+            return
+        self._updating_viewbox = True
+        try:
+            self._primary_plot.setXRange(
+                self._view_start,
+                self._view_start + self._view_duration,
+                padding=0,
+            )
+        finally:
+            self._updating_viewbox = False
+
+    def _schedule_refresh(self):
+        self._debounce_timer.start()
+
+    def _on_start_spin_changed(self, value: float):
+        self._set_view(float(value), self._view_duration, sender="controls")
+
+    def _on_duration_spin_changed(self, value: float):
+        self._set_view(self._view_start, float(value), sender="controls")
 
     @QtCore.Slot()
     def refresh(self):
-        t0 = self.startSpin.value()
-        duration = self.windowSpin.value()
+        if hasattr(self, "_debounce_timer"):
+            self._debounce_timer.stop()
+        t0 = self._view_start
+        duration = self._view_duration
         t1 = min(self.loader.duration_s, t0 + duration)
+
+        pixels = self._estimate_pixels()
 
         for i in range(self.loader.n_channels):
             t, x = self.loader.read(i, t0, t1)
+            if pixels and x.size > pixels * 2:
+                t, x = min_max_bins(t, x, pixels)
             self.curves[i].setData(t, x)
 
         if self._primary_plot is not None:
-            self._primary_plot.setXRange(t0, t1, padding=0)
+            self._update_viewbox_from_state()
         self._update_time_labels(t0, t1)
 
     def _update_time_labels(self, t0, t1):
@@ -316,16 +420,21 @@ class MainWindow(QtWidgets.QMainWindow):
             self.time_axis.set_timebase(self.loader.timebase)
             if self.loader.timebase.start_dt is not None:
                 self.time_axis.set_mode("absolute")
-
-            self.startSpin.setValue(0.0)
-            self.windowSpin.setValue(min(30.0, self.loader.duration_s))
-            self._refresh_limits()
+            self._update_limits_from_loader()
+            self._view_start, self._view_duration = clamp_window(
+                0.0,
+                min(30.0, self.loader.duration_s),
+                total=self.loader.duration_s,
+                limits=self._limits,
+            )
         finally:
             self.startSpin.blockSignals(False)
             self.windowSpin.blockSignals(False)
 
         self._ensure_plot_rows(self.loader.n_channels)
         self._configure_plots()
+        self._refresh_limits()
+        self._update_controls_from_state()
         self.refresh()
         self._start_zarr_ingest()
 
@@ -413,6 +522,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
         old_loader = self.loader
         self.loader = pending
+        self._update_limits_from_loader()
+        self._view_start, self._view_duration = clamp_window(
+            self._view_start,
+            self._view_duration,
+            total=self.loader.duration_s,
+            limits=self._limits,
+        )
 
         self.time_axis.set_timebase(self.loader.timebase)
         if self.loader.timebase.start_dt is not None:
@@ -427,6 +543,63 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(old_loader, "close") and not isinstance(old_loader, ZarrLoader):
             old_loader.close()
 
+    def _set_view(self, start: float, duration: float, *, sender: str | None = None):
+        start_new, duration_new = clamp_window(
+            start,
+            duration,
+            total=self.loader.duration_s,
+            limits=self._limits,
+        )
+        if (
+            abs(start_new - self._view_start) < 1e-6
+            and abs(duration_new - self._view_duration) < 1e-6
+        ):
+            if sender == "controls":
+                self._schedule_refresh()
+            return
+
+        self._view_start = start_new
+        self._view_duration = duration_new
+        self._refresh_limits()
+        if sender != "controls":
+            self._update_controls_from_state()
+        if sender != "viewbox":
+            self._update_viewbox_from_state()
+        self._schedule_refresh()
+
+    def _pan_fraction(self, fraction: float):
+        delta = fraction * self._view_duration
+        start, duration = pan_window(
+            self._view_start,
+            self._view_duration,
+            delta=delta,
+            total=self.loader.duration_s,
+            limits=self._limits,
+        )
+        self._set_view(start, duration, sender="buttons")
+
+    def _zoom_factor(self, factor: float):
+        anchor = self._view_start + self._view_duration * 0.5
+        start, duration = zoom_window(
+            self._view_start,
+            self._view_duration,
+            factor=factor,
+            anchor=anchor,
+            total=self.loader.duration_s,
+            limits=self._limits,
+        )
+        self._set_view(start, duration, sender="buttons")
+
+    def _reset_view(self):
+        duration = min(30.0, self.loader.duration_s)
+        start, duration = clamp_window(
+            0.0,
+            duration,
+            total=self.loader.duration_s,
+            limits=self._limits,
+        )
+        self._set_view(start, duration, sender="buttons")
+
     def closeEvent(self, event):
         self._cleanup_ingest_thread(wait=True)
         super().closeEvent(event)
@@ -438,6 +611,15 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self.sourceLabel.setText("Source: EDF (live)")
             self.sourceLabel.setStyleSheet("color: #9ba9bf; font-style: italic;")
+
+    def _estimate_pixels(self) -> int:
+        if not self._primary_plot:
+            return 0
+        vb = self._primary_plot.getViewBox()
+        if vb is None:
+            return 0
+        width = int(vb.width())
+        return max(0, width)
 
     # ----- Plot helpers ------------------------------------------------------
 
@@ -498,6 +680,7 @@ class MainWindow(QtWidgets.QMainWindow):
         new_primary.setAxisItems({"bottom": self.time_axis})
         new_primary.showAxis("bottom", show=True)
         self._primary_plot = new_primary
+        self._connect_primary_viewbox()
 
         for idx, plot in enumerate(self.plots[:n]):
             if plot is new_primary:
@@ -521,3 +704,31 @@ class MainWindow(QtWidgets.QMainWindow):
             f"{text}"
             "</span>"
         )
+
+    def _connect_primary_viewbox(self):
+        if self._primary_viewbox is not None:
+            try:
+                self._primary_viewbox.sigXRangeChanged.disconnect(self._on_viewbox_range)
+            except (TypeError, RuntimeError):
+                pass
+        self._primary_viewbox = None
+        if self._primary_plot is None:
+            return
+        vb = self._primary_plot.getViewBox()
+        if vb is None:
+            return
+        self._primary_viewbox = vb
+        vb.sigXRangeChanged.connect(self._on_viewbox_range)
+        vb.setMouseEnabled(x=True, y=False)
+        vb.enableAutoRange(y=True)
+        self._update_viewbox_from_state()
+
+    def _on_viewbox_range(self, viewbox, xrange):
+        if viewbox is not self._primary_viewbox or self._updating_viewbox:
+            return
+        if not xrange or len(xrange) != 2:
+            return
+        start = float(xrange[0])
+        end = float(xrange[1])
+        duration = max(self._limits.duration_min, end - start)
+        self._set_view(start, duration, sender="viewbox")
