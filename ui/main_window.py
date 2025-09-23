@@ -7,7 +7,9 @@ import pyqtgraph as pg
 from PySide6 import QtCore, QtWidgets, QtGui
 
 from ui.time_axis import TimeAxis
+from config import ViewerConfig
 from core.decimate import min_max_bins
+from core.prefetch import prefetch_service
 from core.view_window import WindowLimits, clamp_window, pan_window, zoom_window
 from core.zarr_cache import EdfToZarr, resolve_output_path
 from core.zarr_loader import ZarrLoader
@@ -54,9 +56,10 @@ class _ZarrIngestWorker(QtCore.QObject):
 
 
 class MainWindow(QtWidgets.QMainWindow):
-    def __init__(self, loader):
+    def __init__(self, loader, *, config: ViewerConfig | None = None):
         super().__init__()
         self.loader = loader
+        self._config = config or ViewerConfig()
         self._ingest_thread: QtCore.QThread | None = None
         self._ingest_worker: _ZarrIngestWorker | None = None
         self._zarr_path: Path | None = None
@@ -73,6 +76,13 @@ class MainWindow(QtWidgets.QMainWindow):
             limits=self._limits,
         )
         self._updating_viewbox = False
+        prefetch_service.configure(
+            tile_duration=self._config.prefetch_tile_s,
+            max_tiles=self._config.prefetch_max_tiles,
+            max_mb=self._config.prefetch_max_mb,
+        )
+        self._prefetch = prefetch_service.create_cache(self._fetch_tile)
+        self._prefetch.start()
 
         pg.setConfigOptions(antialias=True)
         pg.setConfigOption("background", "#10131d")
@@ -137,9 +147,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.zoomInBtn.setText("+")
         self.zoomOutBtn = QtWidgets.QToolButton()
         self.zoomOutBtn.setText("−")
+        self.fullViewBtn = QtWidgets.QToolButton()
+        self.fullViewBtn.setText("All")
         self.resetViewBtn = QtWidgets.QToolButton()
         self.resetViewBtn.setText("Reset")
-        for btn in (self.panLeftBtn, self.panRightBtn, self.zoomInBtn, self.zoomOutBtn, self.resetViewBtn):
+        for btn in (self.panLeftBtn, self.panRightBtn, self.zoomInBtn, self.zoomOutBtn, self.resetViewBtn, self.fullViewBtn):
             btn.setCursor(QtCore.Qt.PointingHandCursor)
             navLayout.addWidget(btn)
         navLayout.addStretch(1)
@@ -163,6 +175,30 @@ class MainWindow(QtWidgets.QMainWindow):
         controlLayout.addWidget(self.absoluteRange)
         controlLayout.addWidget(self.windowSummary)
         controlLayout.addWidget(self.sourceLabel)
+        prefetchBox = QtWidgets.QGroupBox("Prefetch")
+        prefetchLayout = QtWidgets.QGridLayout(prefetchBox)
+        prefetchLayout.setHorizontalSpacing(8)
+        prefetchLayout.setVerticalSpacing(6)
+        self.prefetchTileSpin = QtWidgets.QDoubleSpinBox()
+        self.prefetchTileSpin.setRange(0.5, 300.0)
+        self.prefetchTileSpin.setDecimals(2)
+        self.prefetchTileSpin.setValue(self._config.prefetch_tile_s)
+        self.prefetchMaxTilesSpin = QtWidgets.QSpinBox()
+        self.prefetchMaxTilesSpin.setRange(1, 4096)
+        self.prefetchMaxTilesSpin.setValue(self._config.prefetch_max_tiles or 64)
+        self.prefetchMaxMbSpin = QtWidgets.QDoubleSpinBox()
+        self.prefetchMaxMbSpin.setRange(1.0, 4096.0)
+        self.prefetchMaxMbSpin.setDecimals(1)
+        self.prefetchMaxMbSpin.setValue(self._config.prefetch_max_mb or 16.0)
+        self.prefetchApplyBtn = QtWidgets.QPushButton("Apply Prefetch")
+        prefetchLayout.addWidget(QtWidgets.QLabel("Tile (s)"), 0, 0)
+        prefetchLayout.addWidget(self.prefetchTileSpin, 0, 1)
+        prefetchLayout.addWidget(QtWidgets.QLabel("Max tiles"), 1, 0)
+        prefetchLayout.addWidget(self.prefetchMaxTilesSpin, 1, 1)
+        prefetchLayout.addWidget(QtWidgets.QLabel("Max MB"), 2, 0)
+        prefetchLayout.addWidget(self.prefetchMaxMbSpin, 2, 1)
+        prefetchLayout.addWidget(self.prefetchApplyBtn, 3, 0, 1, 2)
+        controlLayout.addWidget(prefetchBox)
         self.ingestBar = QtWidgets.QProgressBar()
         self.ingestBar.setObjectName("ingestBar")
         self.ingestBar.setRange(0, 100)
@@ -237,8 +273,33 @@ class MainWindow(QtWidgets.QMainWindow):
                 background-color: #22304a;
                 border-color: #39507a;
             }
-            QPushButton#fileSelectButton:pressed {
-                background-color: #182235;
+           QPushButton#fileSelectButton:pressed {
+               background-color: #182235;
+           }
+            QGroupBox QPushButton {
+                background-color: #1c273a;
+                border: 1px solid #2b3850;
+                border-radius: 6px;
+                padding: 6px 10px;
+                color: #e1e9ff;
+            }
+            QGroupBox QPushButton:hover {
+                background-color: #263755;
+            }
+            QGroupBox QPushButton:pressed {
+                background-color: #142033;
+            }
+            QGroupBox {
+                margin-top: 10px;
+                border: 1px solid #1f2a3d;
+                border-radius: 6px;
+                padding: 8px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 12px;
+                padding: 0 4px;
+                color: #a7b4cf;
             }
             QToolButton {
                 background-color: #1a2333;
@@ -276,13 +337,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.panRightBtn.clicked.connect(lambda: self._pan_fraction(0.25))
         self.zoomInBtn.clicked.connect(lambda: self._zoom_factor(0.5))
         self.zoomOutBtn.clicked.connect(lambda: self._zoom_factor(2.0))
+        self.fullViewBtn.clicked.connect(self._full_view)
         self.resetViewBtn.clicked.connect(self._reset_view)
+        self.prefetchApplyBtn.clicked.connect(self._apply_prefetch_settings)
 
         self._shortcuts: list[QtGui.QShortcut] = []
         self._shortcuts.append(QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_Left), self, activated=lambda: self._pan_fraction(-0.1)))
         self._shortcuts.append(QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_Right), self, activated=lambda: self._pan_fraction(0.1)))
         self._shortcuts.append(QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_Minus), self, activated=lambda: self._zoom_factor(2.0)))
         self._shortcuts.append(QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_Equal), self, activated=lambda: self._zoom_factor(0.5)))
+        self._shortcuts.append(QtGui.QShortcut(QtGui.QKeySequence("F"), self, activated=self._full_view))
         self._shortcuts.append(QtGui.QShortcut(QtGui.QKeySequence("R"), self, activated=self._reset_view))
 
     # ----- Behaviors -------------------------------------------------------
@@ -299,9 +363,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.startSpin.blockSignals(False)
 
     def _update_limits_from_loader(self):
+        cap = getattr(self.loader, "max_window_s", self._limits.duration_max)
+        if isinstance(self.loader, ZarrLoader):
+            cap = max(float(cap), self.loader.duration_s)
         self._limits = WindowLimits(
             duration_min=self._limits.duration_min,
-            duration_max=float(getattr(self.loader, "max_window_s", self._limits.duration_max)),
+            duration_max=float(cap),
         )
 
     def _update_controls_from_state(self):
@@ -437,6 +504,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_controls_from_state()
         self.refresh()
         self._start_zarr_ingest()
+        self._prefetch.clear()
+        self._schedule_prefetch()
 
     def _start_zarr_ingest(self):
         if not getattr(self.loader, "path", None):
@@ -449,7 +518,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.ingestBar.hide()
             if not isinstance(self.loader, ZarrLoader):
                 try:
-                    self._pending_loader = ZarrLoader(zarr_path)
+                    self._pending_loader = ZarrLoader(zarr_path, max_window_s=float("inf"))
                 except Exception:
                     self._pending_loader = None
                 else:
@@ -489,7 +558,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ingestBar.setFormat("Zarr cache ready ✓")
         QtCore.QTimer.singleShot(2000, self.ingestBar.hide)
 
-        self._pending_loader = ZarrLoader(path)
+        self._pending_loader = ZarrLoader(path, max_window_s=float("inf"))
         QtCore.QTimer.singleShot(0, self._swap_in_pending_loader)
 
     @QtCore.Slot(str)
@@ -522,6 +591,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         old_loader = self.loader
         self.loader = pending
+        if isinstance(self.loader, ZarrLoader):
+            setattr(self.loader, "max_window_s", self.loader.duration_s)
         self._update_limits_from_loader()
         self._view_start, self._view_duration = clamp_window(
             self._view_start,
@@ -539,6 +610,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_limits()
         self.refresh()
         self._update_data_source_label()
+        self._prefetch.clear()
+        self._schedule_prefetch()
 
         if hasattr(old_loader, "close") and not isinstance(old_loader, ZarrLoader):
             old_loader.close()
@@ -566,6 +639,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if sender != "viewbox":
             self._update_viewbox_from_state()
         self._schedule_refresh()
+        self._schedule_prefetch()
 
     def _pan_fraction(self, fraction: float):
         delta = fraction * self._view_duration
@@ -578,6 +652,31 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self._set_view(start, duration, sender="buttons")
 
+    def _apply_prefetch_settings(self):
+        tile = self.prefetchTileSpin.value()
+        max_tiles = self.prefetchMaxTilesSpin.value()
+        max_mb_val = self.prefetchMaxMbSpin.value()
+        max_mb = max_mb_val if max_mb_val > 0 else None
+        self._config.prefetch_tile_s = tile
+        self._config.prefetch_max_tiles = max_tiles
+        self._config.prefetch_max_mb = max_mb_val if max_mb_val > 0 else None
+        prefetch_service.configure(tile_duration=tile, max_tiles=max_tiles, max_mb=max_mb)
+        if self._prefetch is not None:
+            self._prefetch.stop()
+        self._prefetch = prefetch_service.create_cache(self._fetch_tile)
+        self._prefetch.start()
+        self._schedule_prefetch()
+        self._config.save()
+
+    def _schedule_prefetch(self):
+        total = self.loader.duration_s
+        for ch in range(self.loader.n_channels):
+            start = max(0.0, self._view_start - self._view_duration)
+            start = min(start, total)
+            duration = min(self._view_duration * 3, max(0.0, total - start))
+            if duration <= 0:
+                continue
+            self._prefetch.prefetch_window(ch, start, duration)
     def _zoom_factor(self, factor: float):
         anchor = self._view_start + self._view_duration * 0.5
         start, duration = zoom_window(
@@ -600,8 +699,23 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self._set_view(start, duration, sender="buttons")
 
+    def _schedule_prefetch(self):
+        for ch in range(self.loader.n_channels):
+            start = max(0.0, self._view_start - self._view_duration)
+            duration = self._view_duration * 3
+            self._prefetch.prefetch_window(ch, start, duration)
+
+    def _full_view(self):
+        self._set_view(0.0, self.loader.duration_s, sender="buttons")
+
+    def _fetch_tile(self, channel: int, start: float, end: float):
+        loader = self.loader
+        start, duration = clamp_window(start, end - start, total=loader.duration_s, limits=self._limits)
+        return loader.read(channel, start, start + duration)
+
     def closeEvent(self, event):
         self._cleanup_ingest_thread(wait=True)
+        self._prefetch.stop()
         super().closeEvent(event)
 
     def _update_data_source_label(self):

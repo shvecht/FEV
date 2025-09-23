@@ -1,6 +1,7 @@
 # app.py
 import sys
 from PySide6 import QtWidgets
+from config import ViewerConfig
 from core.edf_loader import EdfLoader
 from ui.main_window import MainWindow
 
@@ -19,7 +20,21 @@ def _select_file_dialog(parent=None):
     return None
 
 
-def main(path=None):
+def main(
+    path=None,
+    *,
+    config_path: str | None = None,
+    prefetch_tile: float | None = None,
+    prefetch_max_tiles: int | None = None,
+    prefetch_max_mb: float | None = None,
+):
+    cfg = ViewerConfig.load(config_path)
+    if prefetch_tile is not None:
+        cfg.prefetch_tile_s = prefetch_tile
+    if prefetch_max_tiles is not None and prefetch_max_tiles > 0:
+        cfg.prefetch_max_tiles = prefetch_max_tiles
+    if prefetch_max_mb is not None:
+        cfg.prefetch_max_mb = prefetch_max_mb if prefetch_max_mb > 0 else None
     app = QtWidgets.QApplication(sys.argv)
 
     if not path:
@@ -28,7 +43,7 @@ def main(path=None):
             return
 
     loader = EdfLoader(path)
-    w = MainWindow(loader)
+    w = MainWindow(loader, config=cfg)
     w.resize(1200, 700)
     w.show()
     app.exec()
@@ -38,5 +53,15 @@ if __name__ == "__main__":
     import argparse
     p = argparse.ArgumentParser()
     p.add_argument("edf_path", nargs="?")
+    p.add_argument("--config")
+    p.add_argument("--prefetch-tile", type=float)
+    p.add_argument("--prefetch-max-tiles", type=int)
+    p.add_argument("--prefetch-max-mb", type=float)
     args = p.parse_args()
-    main(args.edf_path)
+    main(
+        args.edf_path,
+        config_path=args.config,
+        prefetch_tile=args.prefetch_tile,
+        prefetch_max_tiles=args.prefetch_max_tiles,
+        prefetch_max_mb=args.prefetch_max_mb,
+    )

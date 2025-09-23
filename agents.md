@@ -99,11 +99,12 @@ test_loader.py
 - [x] Integrate decimation + pan/zoom UI with debounce
 - [x] Max window cap enforced at loader/Zarr loader
 - [ ] Perf smoke tests (profiling script ± synthetic 500 Hz data)
-- [ ] Prefetch ring-buffer prototype for smoother scrubbing
+- [x] Prefetch ring-buffer prototype for smoother scrubbing
 
 **Phase 7 – Prefetch ring buffer**
-- [ ] Async read-ahead for prev/next window
-- [ ] LRU in-RAM tiles
+- [x] Async read-ahead for prev/next window
+- [x] LRU in-RAM tiles (PrefetchService with tile/time budget)
+- [x] Prefetch knobs surfaced via CLI/INI/UI
 
 > **Later (Phase 9+)**: HDF5/Zarr multiresolution pyramids, Parquet events, GPU-friendly envelopes.
 
@@ -126,6 +127,8 @@ test_loader.py
 - [x] If `n_samples > 4*px`: decimate (min/max per bin)
 - [x] One `PlotCurveItem` per visible channel
 - [x] Shared X axis; per-lane vertical offsets
+- [x] Prefetch knobs exposed in UI (tile_s, max MB)
+
 
 ### Annotation Agent
 **Goal:** fast interval queries.  
@@ -152,11 +155,14 @@ test_loader.py
 
 ---
 
-## 7) CLI & scripts (future slots)
-- `scripts/pack_study.py <edf> [--csv …]` → writes `processed_data/<study>/…`
+## 7) CLI & scripts (living)
+- `scripts/pack_study.py <edf> [--csv …]` → writes `processed/<study>/…`
 - `scripts/validate_alignment.py <edf> <csv>` → drift & offset report
 - `scripts/make_fixture.py` → generate 60 s synthetic EDF for tests
 - `scripts/edf_to_zarr.py <edf> [--out dir]` → one-shot ingest using `EdfToZarr`
+- `scripts/profile_draw.py <path>` → render timings (10/60/120 s)
+- `scripts/run_perf_smoke.sh` → CI helper (requires PERF_PROFILE_PATH env)
+- TODO: Perf smoke in CI runs this script on a small fixture (capture baseline).
 
 ---
 
@@ -203,7 +209,7 @@ offset_s: 0.0
 - 2025-09-24: Dependency installs handled via `uv`; pytest suite (loader, timebase) is baseline gate.
 - 2025-09-24: Zarr cache ingestion planned; target `EdfToZarr` writer, loader shim, MemoryStore unit tests.
 - 2025-09-24: Viewer swaps to Zarr cache post-build; source badge shows active backend.
-- 2025-09-24: Skimming UI (pan/zoom, decimation) live; next add prefetch buffer + full-night zoom.
+- 2025-09-24: Skimming UI (pan/zoom, decimation) live; PrefetchService warms ±1 window; full-night zoom enabled via Zarr; prefetch knobs adjustable in UI/INI.
 - 2025-09-24: App auto-ingests EDF → Zarr with progress UI; Zarr parity verified post-write.
 
 ---
