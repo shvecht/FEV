@@ -1,16 +1,64 @@
 # ui/main_window.py
 from __future__ import annotations
 
+from pathlib import Path
+
 import pyqtgraph as pg
 from PySide6 import QtCore, QtWidgets
 
 from ui.time_axis import TimeAxis
+from core.zarr_cache import EdfToZarr, resolve_output_path
+from core.zarr_loader import ZarrLoader
+
+
+class _ZarrIngestWorker(QtCore.QObject):
+    progress = QtCore.Signal(int, int)
+    finished = QtCore.Signal(str)
+    failed = QtCore.Signal(str)
+
+    def __init__(self, edf_path: str, out_path: Path, loader=None):
+        super().__init__()
+        self._edf_path = edf_path
+        self._out_path = Path(out_path)
+        self._loader = loader
+
+    @QtCore.Slot()
+    def run(self):
+        try:
+            kwargs = {
+                "edf_path": self._edf_path,
+                "out_path": str(self._out_path),
+                "progress_callback": self._handle_progress,
+            }
+            if self._loader is not None:
+                kwargs["loader_factory"] = lambda _path: self._loader
+                kwargs["owns_loader"] = False
+            builder = EdfToZarr(**kwargs)
+            builder.build()
+
+            # Simple parity assertion: ensure loader can open and read metadata
+            z_loader = ZarrLoader(self._out_path)
+            try:
+                assert z_loader.n_channels > 0
+            finally:
+                z_loader.close()
+
+            self.finished.emit(str(self._out_path))
+        except Exception as exc:  # pragma: no cover - UI feedback
+            self.failed.emit(str(exc))
+
+    def _handle_progress(self, done: int, total: int):
+        self.progress.emit(done, total)
 
 
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self, loader):
         super().__init__()
         self.loader = loader
+        self._ingest_thread: QtCore.QThread | None = None
+        self._ingest_worker: _ZarrIngestWorker | None = None
+        self._zarr_path: Path | None = None
+        self._pending_loader: object | None = None
 
         pg.setConfigOptions(antialias=True)
         pg.setConfigOption("background", "#10131d")
@@ -26,6 +74,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._connect_signals()
         self._refresh_limits()
         self.refresh()
+        self._update_data_source_label()
+        self._start_zarr_ingest()
 
     # ----- UI construction -------------------------------------------------
 
@@ -46,6 +96,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.absoluteRange.setObjectName("absoluteRange")
         self.windowSummary = QtWidgets.QLabel("Window: 30.0 s")
         self.windowSummary.setObjectName("windowSummary")
+        self.sourceLabel = QtWidgets.QLabel("Source: EDF (live)")
+        self.sourceLabel.setObjectName("sourceLabel")
 
         control = QtWidgets.QFrame()
         control.setObjectName("controlPanel")
@@ -73,6 +125,15 @@ class MainWindow(QtWidgets.QMainWindow):
         controlLayout.addLayout(form)
         controlLayout.addWidget(self.absoluteRange)
         controlLayout.addWidget(self.windowSummary)
+        controlLayout.addWidget(self.sourceLabel)
+        self.ingestBar = QtWidgets.QProgressBar()
+        self.ingestBar.setObjectName("ingestBar")
+        self.ingestBar.setRange(0, 100)
+        self.ingestBar.setValue(0)
+        self.ingestBar.setFormat("Caching EDF → Zarr: %p%")
+        self.ingestBar.setTextVisible(True)
+        self.ingestBar.hide()
+        controlLayout.addWidget(self.ingestBar)
         controlLayout.addStretch(1)
 
         self.plotLayout = pg.GraphicsLayoutWidget()
@@ -111,6 +172,7 @@ class MainWindow(QtWidgets.QMainWindow):
             QLabel { font-size: 13px; color: #e6ebf5; }
             QLabel#panelTitle { font-size: 15px; font-weight: 600; color: #f3f6ff; }
             QLabel#absoluteRange, QLabel#windowSummary { color: #9ba9bf; }
+            QLabel#sourceLabel { color: #9ba9bf; font-style: italic; }
             QDoubleSpinBox {
                 background-color: #121a2a;
                 border: 1px solid #1f2a3d;
@@ -140,6 +202,17 @@ class MainWindow(QtWidgets.QMainWindow):
             }
             QPushButton#fileSelectButton:pressed {
                 background-color: #182235;
+            }
+            QProgressBar#ingestBar {
+                background-color: #121a24;
+                border: 1px solid #1f2a3d;
+                border-radius: 6px;
+                padding: 3px;
+                color: #e6ebf5;
+            }
+            QProgressBar#ingestBar::chunk {
+                background-color: #3d6dff;
+                border-radius: 4px;
             }
             QScrollArea { background-color: #0b111c; }
         """
@@ -205,15 +278,37 @@ class MainWindow(QtWidgets.QMainWindow):
         self._load_new_file(path)
 
     def _load_new_file(self, path: str):
+        self._cleanup_ingest_thread(wait=True)
+        self.ingestBar.hide()
+        self.ingestBar.setValue(0)
+
         old_loader = self.loader
+        old_path = getattr(old_loader, "path", None)
+        same_path = old_path == path
+
+        if same_path:
+            old_loader.close()
+
         try:
             new_loader = type(old_loader)(path)
         except Exception as exc:  # pragma: no cover - UI feedback
             QtWidgets.QMessageBox.critical(self, "Failed to open", str(exc))
+            # attempt to restore previous loader if possible
+            if old_path:
+                try:
+                    restored = type(old_loader)(old_path)
+                except Exception:
+                    pass
+                else:
+                    self.loader = restored
+                    self._update_data_source_label()
             return
 
+        if not same_path:
+            old_loader.close()
+
         self.loader = new_loader
-        old_loader.close()
+        self._update_data_source_label()
 
         self.startSpin.blockSignals(True)
         self.windowSpin.blockSignals(True)
@@ -232,6 +327,117 @@ class MainWindow(QtWidgets.QMainWindow):
         self._ensure_plot_rows(self.loader.n_channels)
         self._configure_plots()
         self.refresh()
+        self._start_zarr_ingest()
+
+    def _start_zarr_ingest(self):
+        if not getattr(self.loader, "path", None):
+            return
+
+        zarr_path = resolve_output_path(self.loader.path)
+        self._zarr_path = zarr_path
+
+        if zarr_path.exists():
+            self.ingestBar.hide()
+            if not isinstance(self.loader, ZarrLoader):
+                try:
+                    self._pending_loader = ZarrLoader(zarr_path)
+                except Exception:
+                    self._pending_loader = None
+                else:
+                    QtCore.QTimer.singleShot(0, self._swap_in_pending_loader)
+            else:
+                self._update_data_source_label()
+            return
+
+        total_samples = sum(int(info.n_samples) for info in self.loader.info)
+        self.ingestBar.setRange(0, max(1, total_samples))
+        self.ingestBar.setValue(0)
+        self.ingestBar.setFormat("Caching EDF → Zarr: %p%")
+        self.ingestBar.show()
+
+        self._ingest_thread = QtCore.QThread(self)
+        self._ingest_worker = _ZarrIngestWorker(self.loader.path, zarr_path, loader=self.loader)
+        self._ingest_worker.moveToThread(self._ingest_thread)
+        self._ingest_thread.started.connect(self._ingest_worker.run)
+        self._ingest_worker.progress.connect(self._handle_ingest_progress)
+        self._ingest_worker.finished.connect(self._handle_ingest_finished)
+        self._ingest_worker.failed.connect(self._handle_ingest_error)
+        self._ingest_worker.finished.connect(self._ingest_thread.quit)
+        self._ingest_worker.failed.connect(self._ingest_thread.quit)
+        self._ingest_thread.finished.connect(self._cleanup_ingest_thread)
+        self._ingest_thread.start()
+
+    @QtCore.Slot(int, int)
+    def _handle_ingest_progress(self, done: int, total: int):
+        total = max(1, total)
+        if self.ingestBar.maximum() != total:
+            self.ingestBar.setRange(0, total)
+        self.ingestBar.setValue(done)
+
+    @QtCore.Slot(str)
+    def _handle_ingest_finished(self, path: str):
+        self.ingestBar.setValue(self.ingestBar.maximum())
+        self.ingestBar.setFormat("Zarr cache ready ✓")
+        QtCore.QTimer.singleShot(2000, self.ingestBar.hide)
+
+        self._pending_loader = ZarrLoader(path)
+        QtCore.QTimer.singleShot(0, self._swap_in_pending_loader)
+
+    @QtCore.Slot(str)
+    def _handle_ingest_error(self, message: str):
+        self.ingestBar.setFormat("Zarr cache failed")
+        QtWidgets.QMessageBox.warning(self, "Zarr ingest failed", message)
+        QtCore.QTimer.singleShot(2000, self.ingestBar.hide)
+
+    def _cleanup_ingest_thread(self, wait: bool = False):
+        thread = self._ingest_thread
+        worker = self._ingest_worker
+        self._ingest_thread = None
+        self._ingest_worker = None
+        if worker is not None:
+            worker.deleteLater()
+        if thread is not None:
+            if wait and thread.isRunning():
+                thread.quit()
+                thread.wait()
+            if thread.isFinished():
+                thread.deleteLater()
+
+    @QtCore.Slot()
+    def _swap_in_pending_loader(self):
+        pending = self._pending_loader
+        if pending is None:
+            return
+
+        self._pending_loader = None
+
+        old_loader = self.loader
+        self.loader = pending
+
+        self.time_axis.set_timebase(self.loader.timebase)
+        if self.loader.timebase.start_dt is not None:
+            self.time_axis.set_mode("absolute")
+
+        self._ensure_plot_rows(self.loader.n_channels)
+        self._configure_plots()
+        self._refresh_limits()
+        self.refresh()
+        self._update_data_source_label()
+
+        if hasattr(old_loader, "close") and not isinstance(old_loader, ZarrLoader):
+            old_loader.close()
+
+    def closeEvent(self, event):
+        self._cleanup_ingest_thread(wait=True)
+        super().closeEvent(event)
+
+    def _update_data_source_label(self):
+        if isinstance(self.loader, ZarrLoader):
+            self.sourceLabel.setText("Source: Zarr cache")
+            self.sourceLabel.setStyleSheet("color: #7fb57d; font-style: italic;")
+        else:
+            self.sourceLabel.setText("Source: EDF (live)")
+            self.sourceLabel.setStyleSheet("color: #9ba9bf; font-style: italic;")
 
     # ----- Plot helpers ------------------------------------------------------
 

@@ -63,6 +63,11 @@ test_loader.py
 - If total samples to draw > 4× plot width → decimate.
 - Use a 60 ms debounce on sliders (no constant re-draw).
 
+### 4.4 Build Zarr cache (Phase 5)
+1. Opening an EDF automatically kicks off `EdfToZarr` in the background (progress shown in the control panel).
+2. Cached stores land in `processed/<stem>.zarr/` (created if missing).
+3. Viewer still reads from EDF; parity tests ensure Zarr mirrors the source for later swap-over.
+
 ---
 
 ## 5) Phase milestones (don’t skip)
@@ -82,6 +87,11 @@ test_loader.py
 **Phase 4 – Annotations overlays**
 - [ ] EDF+ events (onset, spans)
 - [ ] CSV adapter with mapping
+
+**Phase 5 – Zarr cache (single-study)**
+- [ ] `EdfToZarr.build()` writes chunked per-channel arrays to `processed_data/<study>.zarr`
+- [ ] Store recording metadata (start_dt, duration, fs, units, channel map)
+- [ ] Smoke-test on synthetic EDF (MemoryStore) + round-trip via loader shim
 
 **Phase 6 – Tolerable skimming**
 - [ ] On-the-fly decimation
@@ -143,6 +153,7 @@ test_loader.py
 - `scripts/pack_study.py <edf> [--csv …]` → writes `processed_data/<study>/…`
 - `scripts/validate_alignment.py <edf> <csv>` → drift & offset report
 - `scripts/make_fixture.py` → generate 60 s synthetic EDF for tests
+- `scripts/edf_to_zarr.py <edf> [--out dir]` → one-shot ingest using `EdfToZarr`
 
 ---
 
@@ -166,6 +177,9 @@ offset_s: 0.0
 - short EDF fixture: exact sample counts at edges *(covered via synthetic arrays for now)*
 - annotations: NaN durations → 0 span *(pending)*
 - Golden images (optional): save PNG of 10 s window and diff on CI.
+- test_zarr_cache.py *(planned)*
+  - MemoryStore ingest → asserts attrs, chunk sizes, dtype
+  - Loader shim reads from Zarr with identical API as `EdfLoader`
 
 > **Test runner:** `uv pip install pytest` then `uv run python -m pytest` (CI todo).
 
@@ -184,6 +198,8 @@ offset_s: 0.0
 - 2025-09-23: Max default window = 60 s; hard cap = 120 s.
 - 2025-09-24: Multi-channel stacked viewer replaces dropdown; labels pinned left, shared absolute axis.
 - 2025-09-24: Dependency installs handled via `uv`; pytest suite (loader, timebase) is baseline gate.
+- 2025-09-24: Zarr cache ingestion planned; target `EdfToZarr` writer, loader shim, MemoryStore unit tests.
+- 2025-09-24: App auto-ingests EDF → Zarr with progress UI; Zarr parity verified post-write.
 
 ---
 

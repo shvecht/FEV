@@ -3,6 +3,7 @@ numpy>=1.24,<3
 PySide6>=6.6,<7
 pyqtgraph>=0.13,<0.14
 pyEDFlib>=0.1.36,<0.2
+zarr>=2.16,<3
 
 # --- Nice-to-haves (optional; uncomment when needed) ---
 scipy>=1.10,<2           # higher-quality decimation, filtering (Phase 6)
