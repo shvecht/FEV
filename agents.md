@@ -89,14 +89,17 @@ test_loader.py
 - [ ] CSV adapter with mapping
 
 **Phase 5 – Zarr cache (single-study)**
-- [ ] `EdfToZarr.build()` writes chunked per-channel arrays to `processed_data/<study>.zarr`
-- [ ] Store recording metadata (start_dt, duration, fs, units, channel map)
-- [ ] Smoke-test on synthetic EDF (MemoryStore) + round-trip via loader shim
+- [x] `EdfToZarr.build()` writes chunked per-channel arrays to `processed/<study>.zarr`
+- [x] Store recording metadata (start_dt, duration, fs, units, channel map)
+- [x] Smoke-test on synthetic EDF (MemoryStore) + round-trip via loader shim
+- [x] Viewer auto-builds cache in background, swaps to `ZarrLoader` post-ingest
 
 **Phase 6 – Tolerable skimming**
-- [ ] On-the-fly decimation
-- [ ] Max window cap
-- [ ] Debounced redraw
+- [ ] `decimate.minmax(t, x, px)` utility with pytest coverage
+- [ ] Integrate decimation pipeline in viewer (EDF+Zarr parity) behind feature flag
+- [ ] Max window cap enforced at loader level (configurable)
+- [ ] Debounced redraw (Qt timers) + tests for throttle logic
+- [ ] Perf smoke tests (profiling script ± synthetic 500 Hz data)
 
 **Phase 7 – Prefetch ring buffer**
 - [ ] Async read-ahead for prev/next window
@@ -111,18 +114,18 @@ test_loader.py
 ### Loader Agent
 **Goal:** deterministic slices from EDF without surprises.  
 **Checklist:**
-- [ ] `sec_to_idx` & `idx_to_time` via `Timebase` only
-- [ ] Clamp `[t0, t1]` to file duration
-- [ ] Handle different `fs` per channel
-- [ ] Unit tests: start-of-file, end-of-file, sub-second windows
+- [x] `sec_to_idx` & `idx_to_time` via `Timebase` only
+- [x] Clamp `[t0, t1]` to file duration
+- [x] Handle different `fs` per channel
+- [x] Unit tests: start-of-file, end-of-file, sub-second windows
 
 ### Viewer Agent
 **Goal:** draw only what eyes can see.  
 **Checklist:**
 - [ ] Choose window `[t0, t1]` → compute `sec_per_px`
 - [ ] If `n_samples > 4*px`: decimate (min/max per bin)
-- [ ] One `PlotCurveItem` per visible channel
-- [ ] Shared X axis; per-lane vertical offsets
+- [x] One `PlotCurveItem` per visible channel
+- [x] Shared X axis; per-lane vertical offsets
 
 ### Annotation Agent
 **Goal:** fast interval queries.  
@@ -199,6 +202,7 @@ offset_s: 0.0
 - 2025-09-24: Multi-channel stacked viewer replaces dropdown; labels pinned left, shared absolute axis.
 - 2025-09-24: Dependency installs handled via `uv`; pytest suite (loader, timebase) is baseline gate.
 - 2025-09-24: Zarr cache ingestion planned; target `EdfToZarr` writer, loader shim, MemoryStore unit tests.
+- 2025-09-24: Viewer swaps to Zarr cache post-build; source badge shows active backend.
 - 2025-09-24: App auto-ingests EDF → Zarr with progress UI; Zarr parity verified post-write.
 
 ---
