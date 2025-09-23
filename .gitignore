@@ -1,0 +1,21 @@
+# Ignore raw and processed data (big, not for source control)
+raw/
+processed/
+
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual envs
+.venv/
+env/
+venv/
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# IDE settings
+.vscode/
+.idea/
