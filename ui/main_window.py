@@ -1,18 +1,26 @@
 # ui/main_window.py
 from __future__ import annotations
 
+import logging
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional, Sequence
 
+import numpy as np
 import pyqtgraph as pg
 from PySide6 import QtCore, QtWidgets, QtGui
 
 from ui.time_axis import TimeAxis
 from config import ViewerConfig
 from core.decimate import min_max_bins
+from core.overscan import slice_and_decimate
 from core.prefetch import prefetch_service
 from core.view_window import WindowLimits, clamp_window, pan_window, zoom_window
 from core.zarr_cache import EdfToZarr, resolve_output_path
 from core.zarr_loader import ZarrLoader
+
+
+LOG = logging.getLogger(__name__)
 
 
 class _ZarrIngestWorker(QtCore.QObject):
@@ -55,7 +63,77 @@ class _ZarrIngestWorker(QtCore.QObject):
         self.progress.emit(done, total)
 
 
+@dataclass(frozen=True)
+class _OverscanRequest:
+    request_id: int
+    start: float
+    end: float
+    view_start: float
+    view_duration: float
+    channel_indices: tuple[int, ...]
+    max_samples: Optional[int]
+
+
+@dataclass
+class _OverscanTile:
+    request_id: int
+    start: float
+    end: float
+    view_start: float
+    view_duration: float
+    raw_channel_data: list[tuple[np.ndarray, np.ndarray]]
+    channel_data: list[tuple[np.ndarray, np.ndarray]]
+    max_samples: Optional[int]
+    pixel_budget: Optional[int] = None
+
+    def contains(self, window_start: float, window_end: float) -> bool:
+        return window_start >= self.start and window_end <= self.end
+
+
+class _OverscanWorker(QtCore.QObject):
+    finished = QtCore.Signal(int, object)
+    failed = QtCore.Signal(int, str)
+
+    def __init__(self, loader):
+        super().__init__()
+        self._loader = loader
+
+    @QtCore.Slot(object)
+    def render(self, request_obj):
+        if not isinstance(request_obj, _OverscanRequest):
+            return
+        req: _OverscanRequest = request_obj
+        try:
+            data: list[tuple[np.ndarray, np.ndarray]] = []
+            for ch in req.channel_indices:
+                data.append(self._read_channel(ch, req.start, req.end, req.max_samples))
+        except Exception as exc:  # pragma: no cover - worker error propagated to UI
+            self.failed.emit(req.request_id, str(exc))
+            return
+
+        tile = _OverscanTile(
+            request_id=req.request_id,
+            start=req.start,
+            end=req.end,
+            view_start=req.view_start,
+            view_duration=req.view_duration,
+            raw_channel_data=data,
+            channel_data=list(data),
+            max_samples=req.max_samples,
+        )
+        self.finished.emit(req.request_id, tile)
+
+    def _read_channel(self, channel: int, start: float, end: float, max_samples: Optional[int]):
+        try:
+            if max_samples is not None:
+                return self._loader.read(channel, start, end, max_samples=max_samples)
+        except TypeError:
+            pass
+        return self._loader.read(channel, start, end)
+
+
 class MainWindow(QtWidgets.QMainWindow):
+    overscanRequested = QtCore.Signal(object)
     def __init__(self, loader, *, config: ViewerConfig | None = None):
         super().__init__()
         self.loader = loader
@@ -94,6 +172,15 @@ class MainWindow(QtWidgets.QMainWindow):
             self.time_axis.set_mode("absolute")
 
         self._primary_plot = None
+        self._overscan_factor = 2.0  # windows per side
+        self._overscan_tile: _OverscanTile | None = None
+        self._overscan_request_id = 0
+        self._overscan_inflight: Optional[int] = None
+        self._current_tile_id: Optional[int] = None
+        self._overscan_thread: QtCore.QThread | None = None
+        self._overscan_worker: _OverscanWorker | None = None
+        self._init_overscan_worker()
+
         self._build_ui()
         self._connect_signals()
         self._debounce_timer = QtCore.QTimer(self)
@@ -105,6 +192,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.refresh()
         self._update_data_source_label()
         self._start_zarr_ingest()
+        QtCore.QTimer.singleShot(0, self._ensure_overscan_for_view)
 
     # ----- UI construction -------------------------------------------------
 
@@ -349,6 +437,41 @@ class MainWindow(QtWidgets.QMainWindow):
         self._shortcuts.append(QtGui.QShortcut(QtGui.QKeySequence("F"), self, activated=self._full_view))
         self._shortcuts.append(QtGui.QShortcut(QtGui.QKeySequence("R"), self, activated=self._reset_view))
 
+    def _init_overscan_worker(self):
+        self._shutdown_overscan_worker()
+        thread = QtCore.QThread(self)
+        worker = _OverscanWorker(self.loader)
+        worker.moveToThread(thread)
+        worker.finished.connect(self._handle_overscan_finished)
+        worker.failed.connect(self._handle_overscan_failed)
+        thread.finished.connect(worker.deleteLater)
+        thread.start()
+        self._overscan_thread = thread
+        self._overscan_worker = worker
+        self.overscanRequested.connect(worker.render)
+        self._overscan_request_id = 0
+        self._overscan_inflight = None
+        self._current_tile_id = None
+
+    def _shutdown_overscan_worker(self):
+        thread = self._overscan_thread
+        worker = self._overscan_worker
+        self._overscan_thread = None
+        self._overscan_worker = None
+        if worker is not None:
+            try:
+                self.overscanRequested.disconnect(worker.render)
+            except (TypeError, RuntimeError):
+                pass
+        if thread is not None:
+            thread.quit()
+            thread.wait()
+        if worker is not None:
+            try:
+                worker.deleteLater()
+            except RuntimeError:
+                pass
+
     # ----- Behaviors -------------------------------------------------------
 
     def _refresh_limits(self):
@@ -410,16 +533,27 @@ class MainWindow(QtWidgets.QMainWindow):
         t1 = min(self.loader.duration_s, t0 + duration)
 
         pixels = self._estimate_pixels()
+        tile = self._overscan_tile
+        used_tile = tile is not None and tile.contains(t0, t1)
 
-        for i in range(self.loader.n_channels):
-            t, x = self.loader.read(i, t0, t1)
-            if pixels and x.size > pixels * 2:
-                t, x = min_max_bins(t, x, pixels)
-            self.curves[i].setData(t, x)
+        if used_tile:
+            tile_updated = self._prepare_tile(tile)
+            if self._current_tile_id != tile.request_id or tile_updated:
+                self._apply_tile_to_curves(tile)
+        else:
+            self._current_tile_id = None
+            for i in range(self.loader.n_channels):
+                t, x = self.loader.read(i, t0, t1)
+                if pixels and x.size > pixels * 2:
+                    t, x = min_max_bins(t, x, pixels)
+                self.curves[i].setData(t, x)
 
         if self._primary_plot is not None:
             self._update_viewbox_from_state()
         self._update_time_labels(t0, t1)
+
+        if not used_tile and self._overscan_inflight is None:
+            self._ensure_overscan_for_view()
 
     def _update_time_labels(self, t0, t1):
         tb = self.loader.timebase
@@ -503,6 +637,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_limits()
         self._update_controls_from_state()
         self.refresh()
+        self._overscan_tile = None
+        self._overscan_inflight = None
+        self._current_tile_id = None
+        self._init_overscan_worker()
+        self._ensure_overscan_for_view()
         self._start_zarr_ingest()
         self._prefetch.clear()
         self._schedule_prefetch()
@@ -608,10 +747,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self._ensure_plot_rows(self.loader.n_channels)
         self._configure_plots()
         self._refresh_limits()
+        self._overscan_tile = None
+        self._overscan_inflight = None
+        self._current_tile_id = None
+        self._init_overscan_worker()
         self.refresh()
         self._update_data_source_label()
         self._prefetch.clear()
         self._schedule_prefetch()
+        self._ensure_overscan_for_view()
 
         if hasattr(old_loader, "close") and not isinstance(old_loader, ZarrLoader):
             old_loader.close()
@@ -640,6 +784,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._update_viewbox_from_state()
         self._schedule_refresh()
         self._schedule_prefetch()
+        self._ensure_overscan_for_view()
 
     def _pan_fraction(self, fraction: float):
         delta = fraction * self._view_duration
@@ -713,9 +858,103 @@ class MainWindow(QtWidgets.QMainWindow):
         start, duration = clamp_window(start, end - start, total=loader.duration_s, limits=self._limits)
         return loader.read(channel, start, start + duration)
 
+    def _ensure_overscan_for_view(self):
+        if self._overscan_worker is None or self.loader.n_channels == 0:
+            return
+        window_start = self._view_start
+        window_end = min(self.loader.duration_s, window_start + self._view_duration)
+        tile = self._overscan_tile
+        if tile is not None and tile.contains(window_start, window_end):
+            return
+        self._request_overscan_tile(window_start, self._view_duration)
+
+    def _request_overscan_tile(self, window_start: float, window_duration: float):
+        if self._overscan_worker is None or self.loader.n_channels == 0:
+            return
+        start, end = self._compute_overscan_bounds(window_start, window_duration)
+        if end <= start:
+            return
+        req_id = self._overscan_request_id + 1
+        self._overscan_request_id = req_id
+        self._overscan_inflight = req_id
+        channels = tuple(range(self.loader.n_channels))
+        request = _OverscanRequest(
+            request_id=req_id,
+            start=start,
+            end=end,
+            view_start=window_start,
+            view_duration=window_duration,
+            channel_indices=channels,
+            max_samples=None,
+        )
+        self.overscanRequested.emit(request)
+
+    def _compute_overscan_bounds(self, view_start: float, view_duration: float) -> tuple[float, float]:
+        total = self.loader.duration_s
+        left_desired = self._overscan_factor * view_duration
+        right_desired = self._overscan_factor * view_duration
+        left = min(left_desired, view_start)
+        right = min(right_desired, max(0.0, total - (view_start + view_duration)))
+        span = left + view_duration + right
+        max_span = getattr(self.loader, "max_window_s", None)
+        if max_span:
+            max_span = float(max_span)
+            if span > max_span:
+                excess = span - max_span
+                reduce_left = min(left, excess / 2.0)
+                left -= reduce_left
+                excess -= reduce_left
+                if excess > 0:
+                    right -= min(right, excess)
+                left = max(left, 0.0)
+                right = max(right, 0.0)
+                span = left + view_duration + right
+        start = max(0.0, view_start - left)
+        end = min(total, view_start + view_duration + right)
+        return start, end
+
+    def _handle_overscan_finished(self, request_id: int, tile_obj):
+        if request_id != self._overscan_request_id:
+            return
+        if not isinstance(tile_obj, _OverscanTile):
+            return
+        self._overscan_inflight = None
+        self._overscan_tile = tile_obj
+        self._current_tile_id = None
+        self._apply_tile_to_curves(tile_obj)
+        self._schedule_refresh()
+
+    def _handle_overscan_failed(self, request_id: int, message: str):
+        if request_id != self._overscan_request_id:
+            return
+        self._overscan_inflight = None
+        LOG.warning("Overscan render failed: %s", message)
+
+    def _prepare_tile(self, tile: _OverscanTile) -> bool:
+        pixels = self._estimate_pixels() or 0
+        overscan_span = 2 * self._overscan_factor + 1
+        budget = int(max(200, pixels * overscan_span * 2)) if pixels else 2000
+        if tile.pixel_budget == budget and tile.channel_data:
+            return False
+        prepared: list[tuple[np.ndarray, np.ndarray]] = []
+        for t_arr, x_arr in tile.raw_channel_data:
+            t_slice, x_slice = slice_and_decimate(t_arr, x_arr, tile.start, tile.end, budget)
+            prepared.append((t_slice, x_slice))
+        tile.channel_data = prepared
+        tile.pixel_budget = budget
+        return True
+
+    def _apply_tile_to_curves(self, tile: _OverscanTile) -> None:
+        self._prepare_tile(tile)
+        for idx, (t_arr, x_arr) in enumerate(tile.channel_data):
+            if idx < len(self.curves):
+                self.curves[idx].setData(t_arr, x_arr)
+        self._current_tile_id = tile.request_id
+
     def closeEvent(self, event):
         self._cleanup_ingest_thread(wait=True)
         self._prefetch.stop()
+        self._shutdown_overscan_worker()
         super().closeEvent(event)
 
     def _update_data_source_label(self):
