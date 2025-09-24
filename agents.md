@@ -6,6 +6,8 @@ A lightweight playbook for Future-You (and any local “agent”) to work consis
 ## 0) Purpose
 Keep tasks small, interfaces clean, and decisions visible. This doc is the “how we work” guide for building a fast, reliable EDF/annotation viewer—step by step.
 
+> **Current status:** v0.2 (2025-09-25) — overscan tile renderer delivers instant ±2-window pans; CSV annotations are next on deck.
+
 ---
 
 ## 1) Repo map (living)
@@ -20,12 +22,14 @@ core/
 edf_loader.py
 timebase.py
 annotations.py
+overscan.py
 ui/
 main_window.py
 time_axis.py
 tests/
 test_timebase.py
 test_loader.py
+test_overscan.py
 
 ---
 
@@ -68,6 +72,11 @@ test_loader.py
 2. Cached stores land in `processed/<stem>.zarr/` (created if missing).
 3. Viewer still reads from EDF; parity tests ensure Zarr mirrors the source for later swap-over.
 
+### 4.5 Overscan sanity (v0.2)
+1. With an EDF open, pan left/right in ≤2-window increments.
+2. Confirm curves stay static (no redraw shimmer) and axis updates immediately.
+3. Watch logs for `Overscan render failed`—treat as regression if emitted.
+
 ---
 
 ## 5) Phase milestones (don’t skip)
@@ -100,6 +109,7 @@ test_loader.py
 - [x] Max window cap enforced at loader/Zarr loader
 - [ ] Perf smoke tests (profiling script ± synthetic 500 Hz data)
 - [x] Prefetch ring-buffer prototype for smoother scrubbing
+- [x] Overscan renderer precomputes ±2 windows and reuses cached curves (v0.2)
 
 **Phase 7 – Prefetch ring buffer**
 - [x] Async read-ahead for prev/next window
@@ -128,6 +138,7 @@ test_loader.py
 - [x] One `PlotCurveItem` per visible channel
 - [x] Shared X axis; per-lane vertical offsets
 - [x] Prefetch knobs exposed in UI (tile_s, max MB)
+- [x] Overscan tile cache keeps curves hot within ±2 windows for instant pans
 
 
 ### Annotation Agent
@@ -141,9 +152,9 @@ test_loader.py
 ### Prefetch Agent (Phase 7)
 **Goal:** hide I/O latency.  
 **Checklist:**
-- [ ] Tile size ≈ 5–10 s per channel
-- [ ] Background thread prefetches prev/next tiles
-- [ ] LRU cache with memory budget (e.g., 128 MB)
+- [x] Tile size ≈ 5–10 s per channel
+- [x] Background thread prefetches prev/next tiles
+- [x] LRU cache with memory budget (e.g., 128 MB)
 
 ### Cache Architect (Phase 9+)
 **Goal:** O(pixels) rendering, any window size.  
@@ -186,6 +197,7 @@ offset_s: 0.0
 - short EDF fixture: exact sample counts at edges *(covered via synthetic arrays for now)*
 - annotations: NaN durations → 0 span *(pending)*
 - Golden images (optional): save PNG of 10 s window and diff on CI.
+- test_overscan.py *(new)* verifies slice+decimate helper for overscan tiles
 - test_zarr_cache.py *(planned)*
   - MemoryStore ingest → asserts attrs, chunk sizes, dtype
   - Loader shim reads from Zarr with identical API as `EdfLoader`
@@ -211,6 +223,8 @@ offset_s: 0.0
 - 2025-09-24: Viewer swaps to Zarr cache post-build; source badge shows active backend.
 - 2025-09-24: Skimming UI (pan/zoom, decimation) live; PrefetchService warms ±1 window; full-night zoom enabled via Zarr; prefetch knobs adjustable in UI/INI.
 - 2025-09-24: App auto-ingests EDF → Zarr with progress UI; Zarr parity verified post-write.
+- 2025-09-25: v0.2 adds overscan tile renderer (±2 windows) with reusable curves + `core.overscan` helper.
+- 2025-09-25: Phase 4 (CSV annotations) is next; formal plan captured below.
 
 ---
 
@@ -220,9 +234,16 @@ offset_s: 0.0
 
 Build EdfLoader with read(i, t0, t1) returning (t_s, x), and read_annotations() for EDF+. Use Timebase.sec_to_idx & time_vector. Add unit tests for edges.
 
-### Ticket: Add CSV annotations
+### Ticket: CSV annotations (Phase 4)
 
-Implement annotations.from_csv(path, mapping) → normalized schema. Add between(t0, t1). Provide YAML mapping for APPLES.
+1. **File survey** – gather 2–3 representative CSVs (APPLES, clinical export). Document required columns, sample frequency, timezone treatment. Update snippet in §8 if headers differ.
+2. **Parser** – implement `core.annotations.from_csv(path, mapping, *, default_chan=None, tz_hint=None)` returning immutable records `(start_s, end_s, label, chan)` and metadata (source path, tz). Handle duration/end columns, offset_s, optional channel column, blank/NaN durations (treat as instant).
+3. **Index** – add `AnnotationIndex` with `.between(t0, t1)` using bisect + vectorized overlap mask; include pytest fixtures covering overlapping/adjacent spans, channel filtering, offsets.
+4. **UI integration** –
+   - Add "Import CSV annotations…" action → file dialog + YAML mapping selection (remember last used).
+   - Persist loaded annotations per study, show count badge, allow toggle/filter by channel.
+   - Render markers/spans atop overscan tiles without breaking pan performance.
+5. **Validation** – CLI script `scripts/validate_alignment.py` reuses parser; add UI toast/log when CSV clock drifts from EDF start ≥ configurable threshold.
 
 ### Ticket: Decimation util
 
