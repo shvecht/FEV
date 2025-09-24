@@ -30,6 +30,7 @@ tests/
 test_timebase.py
 test_loader.py
 test_overscan.py
+test_annotations_csv.py
 
 ---
 
@@ -76,6 +77,11 @@ test_overscan.py
 1. With an EDF open, pan left/right in ≤2-window increments.
 2. Confirm curves stay static (no redraw shimmer) and axis updates immediately.
 3. Watch logs for `Overscan render failed`—treat as regression if emitted.
+
+### 4.6 Annotations auto-import
+1. Place companion CSVs (`<stem>.csv`, `<stem>STAGE.csv`) beside the EDF.
+2. Open the EDF and ensure the control panel toggles "Show annotations" automatically.
+3. Verify event markers render as vertical lines and the stage label updates while panning.
 
 ---
 
@@ -139,6 +145,7 @@ test_overscan.py
 - [x] Shared X axis; per-lane vertical offsets
 - [x] Prefetch knobs exposed in UI (tile_s, max MB)
 - [x] Overscan tile cache keeps curves hot within ±2 windows for instant pans
+- [x] Hypnogram lane + shaded event regions with hover tooltips and navigator list
 
 
 ### Annotation Agent
@@ -225,6 +232,7 @@ offset_s: 0.0
 - 2025-09-24: App auto-ingests EDF → Zarr with progress UI; Zarr parity verified post-write.
 - 2025-09-25: v0.2 adds overscan tile renderer (±2 windows) with reusable curves + `core.overscan` helper.
 - 2025-09-25: Phase 4 (CSV annotations) is next; formal plan captured below.
+- 2025-09-26: Auto-detects APPLES CSV/stage files; events plot as markers, stage label updates during pan.
 
 ---
 
@@ -236,14 +244,16 @@ Build EdfLoader with read(i, t0, t1) returning (t_s, x), and read_annotations() 
 
 ### Ticket: CSV annotations (Phase 4)
 
-1. **File survey** – gather 2–3 representative CSVs (APPLES, clinical export). Document required columns, sample frequency, timezone treatment. Update snippet in §8 if headers differ.
-2. **Parser** – implement `core.annotations.from_csv(path, mapping, *, default_chan=None, tz_hint=None)` returning immutable records `(start_s, end_s, label, chan)` and metadata (source path, tz). Handle duration/end columns, offset_s, optional channel column, blank/NaN durations (treat as instant).
-3. **Index** – add `AnnotationIndex` with `.between(t0, t1)` using bisect + vectorized overlap mask; include pytest fixtures covering overlapping/adjacent spans, channel filtering, offsets.
-4. **UI integration** –
-   - Add "Import CSV annotations…" action → file dialog + YAML mapping selection (remember last used).
-   - Persist loaded annotations per study, show count badge, allow toggle/filter by channel.
-   - Render markers/spans atop overscan tiles without breaking pan performance.
-5. **Validation** – CLI script `scripts/validate_alignment.py` reuses parser; add UI toast/log when CSV clock drifts from EDF start ≥ configurable threshold.
+1. **Auto-detect siblings** – when opening `<stem>.edf`, look for `<stem>.csv` (event log) and `<stem>STAGE.csv` (sleep stages). Allow manual import via menu if files live elsewhere; remember last-used directory.
+2. **Event parser** – implement `core.annotations.from_csv(path, mapping, *, default_chan=None, tz_hint=None)` returning immutable records `(start_s, end_s, label, chan, attrs)` and metadata (source path, tz, validation flag). Handle string durations with units (`"0.0 cmH2O"`, `"5 (43)"`), blank `Duration` values, and optional channel/body-position columns. Normalize times against EDF start time using mapping fields (`start`, `duration` *or* `end`).
+3. **Stage parser** – detect one-column numerical staging files (values 11/12/13/14). Convert to `(start_s, end_s, label)` spans assuming 30 s epochs (confirm APPLES docs). Provide configurable mapping (e.g., 11=W, 12=N1, 13=N2, 14=REM/N3) so sites can override.
+4. **Index** – add `AnnotationIndex` with `.between(t0, t1)` using bisect + vectorized overlap mask; support channel filtering, stage+event separation, and metadata-driven styling. Cover with pytest fixtures for overlapping events, multichannel labels, and stage files.
+5. **UI integration** –
+   - Show auto-detected CSVs in a modal before rendering; allow opt-in/opt-out per file.
+   - Add "Import CSV annotations…" action to re-run parser manually; surface load status + error messages in control panel.
+   - Render markers/spans atop overscan tiles without breaking pan performance (reuse existing overscan cache; overlay drawn from index results).
+   - Add channel/stage filters, legend snippets, and badge with total counts.
+6. **Validation & tooling** – update `scripts/validate_alignment.py` to reuse parser; add drift report and stage histogram. Log warnings when validation column isn't `*`. Provide docs snippet (`agents.md` §8) describing required columns.
 
 ### Ticket: Decimation util
 

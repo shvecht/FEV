@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from collections import Counter
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -18,6 +20,7 @@ from core.prefetch import prefetch_service
 from core.view_window import WindowLimits, clamp_window, pan_window, zoom_window
 from core.zarr_cache import EdfToZarr, resolve_output_path
 from core.zarr_loader import ZarrLoader
+from core import annotations as annotation_core
 
 
 LOG = logging.getLogger(__name__)
@@ -181,6 +184,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self._overscan_worker: _OverscanWorker | None = None
         self._init_overscan_worker()
 
+        self._manual_annotation_paths: dict[str, Path] = {}
+        self._annotations_index: annotation_core.AnnotationIndex | None = None
+        self._annotation_lines: list[pg.InfiniteLine] = []
+        self._annotations_enabled = False
+        self._annotation_rects: list[QtWidgets.QGraphicsRectItem] = []
+        self._event_records: list[dict[str, float | str | int]] = []
+        self._current_event_index: int = -1
+        self._current_event_id: Optional[int] = None
+        self._event_color_cache: dict[str, QtGui.QColor] = {}
+        self.stage_plot: pg.PlotItem | None = None
+        self._stage_curve: pg.PlotDataItem | None = None
+        self._stage_label_item: pg.LabelItem | None = None
+
         self._build_ui()
         self._connect_signals()
         self._debounce_timer = QtCore.QTimer(self)
@@ -191,7 +207,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_controls_from_state()
         self.refresh()
         self._update_data_source_label()
+        self._manual_annotation_paths.clear()
         self._start_zarr_ingest()
+        self._load_companion_annotations()
         QtCore.QTimer.singleShot(0, self._ensure_overscan_for_view)
 
     # ----- UI construction -------------------------------------------------
@@ -213,8 +231,24 @@ class MainWindow(QtWidgets.QMainWindow):
         self.absoluteRange.setObjectName("absoluteRange")
         self.windowSummary = QtWidgets.QLabel("Window: 30.0 s")
         self.windowSummary.setObjectName("windowSummary")
+        self.stageSummaryLabel = QtWidgets.QLabel("Stage: --")
+        self.stageSummaryLabel.setObjectName("stageSummary")
         self.sourceLabel = QtWidgets.QLabel("Source: EDF (live)")
         self.sourceLabel.setObjectName("sourceLabel")
+        self.annotationToggle = QtWidgets.QCheckBox("Show annotations")
+        self.annotationToggle.setChecked(True)
+        self.annotationToggle.setEnabled(False)
+        self.annotationImportBtn = QtWidgets.QPushButton("Import annotations…")
+        self.annotationImportBtn.setEnabled(True)
+        eventHeader = QtWidgets.QLabel("Annotations")
+        eventHeader.setObjectName("annotationsHeader")
+        self.eventList = QtWidgets.QListWidget()
+        self.eventList.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self.eventList.setEnabled(False)
+        self.eventPrevBtn = QtWidgets.QPushButton("Prev")
+        self.eventPrevBtn.setEnabled(False)
+        self.eventNextBtn = QtWidgets.QPushButton("Next")
+        self.eventNextBtn.setEnabled(False)
 
         control = QtWidgets.QFrame()
         control.setObjectName("controlPanel")
@@ -262,7 +296,16 @@ class MainWindow(QtWidgets.QMainWindow):
         controlLayout.addLayout(form)
         controlLayout.addWidget(self.absoluteRange)
         controlLayout.addWidget(self.windowSummary)
+        controlLayout.addWidget(self.stageSummaryLabel)
         controlLayout.addWidget(self.sourceLabel)
+        controlLayout.addWidget(self.annotationToggle)
+        controlLayout.addWidget(self.annotationImportBtn)
+        controlLayout.addWidget(eventHeader)
+        controlLayout.addWidget(self.eventList)
+        eventNav = QtWidgets.QHBoxLayout()
+        eventNav.addWidget(self.eventPrevBtn)
+        eventNav.addWidget(self.eventNextBtn)
+        controlLayout.addLayout(eventNav)
         prefetchBox = QtWidgets.QGroupBox("Prefetch")
         prefetchLayout = QtWidgets.QGridLayout(prefetchBox)
         prefetchLayout.setHorizontalSpacing(8)
@@ -428,6 +471,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.fullViewBtn.clicked.connect(self._full_view)
         self.resetViewBtn.clicked.connect(self._reset_view)
         self.prefetchApplyBtn.clicked.connect(self._apply_prefetch_settings)
+        self.annotationToggle.toggled.connect(self._on_annotation_toggle)
+        self.annotationImportBtn.clicked.connect(self._prompt_import_annotations)
+        self.eventList.itemSelectionChanged.connect(self._on_event_selection_changed)
+        self.eventList.itemDoubleClicked.connect(self._on_event_activated)
+        self.eventPrevBtn.clicked.connect(lambda: self._step_event(-1))
+        self.eventNextBtn.clicked.connect(lambda: self._step_event(1))
 
         self._shortcuts: list[QtGui.QShortcut] = []
         self._shortcuts.append(QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_Left), self, activated=lambda: self._pan_fraction(-0.1)))
@@ -555,6 +604,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if not used_tile and self._overscan_inflight is None:
             self._ensure_overscan_for_view()
 
+        self._update_annotation_overlays(t0, t1)
+
     def _update_time_labels(self, t0, t1):
         tb = self.loader.timebase
         start_dt = tb.to_datetime(t0)
@@ -637,6 +688,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_limits()
         self._update_controls_from_state()
         self.refresh()
+        self._manual_annotation_paths.clear()
+        self._load_companion_annotations()
         self._overscan_tile = None
         self._overscan_inflight = None
         self._current_tile_id = None
@@ -652,6 +705,18 @@ class MainWindow(QtWidgets.QMainWindow):
 
         zarr_path = resolve_output_path(self.loader.path)
         self._zarr_path = zarr_path
+
+        if zarr_path.exists() and not zarr_path.is_dir():
+            LOG.warning("Conflicting file at %s; attempting to remove", zarr_path)
+            try:
+                zarr_path.unlink()
+            except Exception as exc:  # pragma: no cover - user-facing warning
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Zarr cache conflict",
+                    f"Existing file blocks cache directory:\n{zarr_path}\n{exc}",
+                )
+                return
 
         if zarr_path.exists():
             self.ingestBar.hide()
@@ -751,7 +816,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._overscan_inflight = None
         self._current_tile_id = None
         self._init_overscan_worker()
+        self._manual_annotation_paths.clear()
         self.refresh()
+        self._load_companion_annotations()
         self._update_data_source_label()
         self._prefetch.clear()
         self._schedule_prefetch()
@@ -812,6 +879,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._prefetch.start()
         self._schedule_prefetch()
         self._config.save()
+
+    def _on_annotation_toggle(self, checked: bool):
+        self._annotations_enabled = bool(checked)
+        self._update_annotation_overlays(
+            self._view_start,
+            min(self.loader.duration_s, self._view_start + self._view_duration),
+        )
 
     def _schedule_prefetch(self):
         total = self.loader.duration_s
@@ -929,6 +1003,373 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._overscan_inflight = None
         LOG.warning("Overscan render failed: %s", message)
+        self._update_annotation_overlays(
+            self._view_start,
+            min(self.loader.duration_s, self._view_start + self._view_duration),
+        )
+
+    # ----- Annotations -----------------------------------------------------
+
+    def _load_companion_annotations(self):
+        self._annotations_index = None
+        self.annotationToggle.setEnabled(False)
+        self._annotations_enabled = False
+        self.stageSummaryLabel.setText("Stage: --")
+        self._clear_annotation_lines()
+        self._clear_annotation_rects()
+        self._populate_event_list(clear=True)
+        self._update_stage_plot_data()
+        self._update_annotation_summary()
+
+        path = getattr(self.loader, "path", None)
+        if not path:
+            return
+
+        ann_sets: list[annotation_core.Annotations] = []
+        found = annotation_core.discover_annotation_files(path)
+        found.update(self._manual_annotation_paths)
+        start_dt = getattr(getattr(self.loader, "timebase", None), "start_dt", None)
+
+        events_path = found.get("events")
+        if events_path:
+            try:
+                mapping = annotation_core.CsvEventMapping(default_channel="Events")
+                ann_sets.append(
+                    annotation_core.from_csv_events(events_path, mapping, start_dt=start_dt)
+                )
+            except Exception as exc:  # pragma: no cover - file parse issues logged
+                LOG.warning("Failed to load events CSV %s: %s", events_path, exc)
+
+        stages_path = found.get("stages")
+        if stages_path:
+            try:
+                ann_sets.append(annotation_core.from_csv_stages(stages_path))
+            except Exception as exc:  # pragma: no cover
+                LOG.warning("Failed to load stage CSV %s: %s", stages_path, exc)
+
+        if not ann_sets:
+            return
+
+        self._annotations_index = annotation_core.AnnotationIndex(ann_sets)
+        self.annotationToggle.setEnabled(True)
+        self._annotations_enabled = self.annotationToggle.isChecked()
+        self._populate_event_list()
+        self._update_annotation_summary()
+        self._update_stage_plot_data()
+        self._update_annotation_overlays(
+            self._view_start,
+            min(self.loader.duration_s, self._view_start + self._view_duration),
+        )
+
+    def _update_stage_plot_data(self):
+        if self.stage_plot is None:
+            self._ensure_stage_plot()
+        if self._stage_curve is None:
+            return
+        if not self._annotations_index or self._annotations_index.is_empty():
+            self._stage_curve.setData([], [])
+            self.stage_plot.hide()
+            return
+
+        stage_data = self._annotations_index.between(
+            0.0,
+            self.loader.duration_s,
+            channels=["stage"],
+        )
+        if isinstance(stage_data, tuple):
+            stage_data = stage_data[0]
+        if stage_data.size == 0:
+            self._stage_curve.setData([], [])
+            self.stage_plot.hide()
+            return
+
+        mapping = {
+            "N3": 0.0,
+            "N4": 0.0,  # treat legacy N4 like N3
+            "N2": 1.0,
+            "N1": 2.0,
+            "REM": 3.0,
+            "Wake": 4.0,
+        }
+
+        # Build step-mode arrays: for stepMode=True, pyqtgraph expects
+        # len(x) == len(y) + 1, where x are edge times and y are bin values.
+        xs: list[float] = []
+        ys: list[float] = []
+
+        # Optionally fill a gap before the first stage with the first value
+        first_edge: float | None = None
+        for idx, entry in enumerate(stage_data):
+            start = float(entry["start_s"])
+            end = float(entry["end_s"])
+            label = str(entry["label"])  # e.g., N2, REM, Wake
+            value = mapping.get(label, 2.0)
+
+            if idx == 0:
+                # first edge
+                first_edge = start
+                xs.append(start)
+            else:
+                # if there is a gap from the previous edge, extend edges but keep last value
+                prev_end = xs[-1]
+                if start > prev_end:
+                    xs.append(start)  # gap edge; y stays the same (implicit)
+            # push the end edge of this stage and its value
+            xs.append(end)
+            ys.append(value)
+
+        # Safety: ensure the invariant for stepMode=True
+        if not xs or len(xs) != len(ys) + 1:
+            # Fallback to hiding the curve if shapes are inconsistent
+            self._stage_curve.setData([], [])
+        else:
+            self._stage_curve.setData(xs, ys)
+        self.stage_plot.show()
+
+    def _prompt_import_annotations(self):
+        options = QtWidgets.QFileDialog.Options()
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Import annotations",
+            str(Path(self.loader.path).parent if getattr(self.loader, "path", None) else Path.cwd()),
+            "CSV Files (*.csv);;All Files (*)",
+            options=options,
+        )
+        if not path:
+            return
+        path_obj = Path(path)
+        key = "stages" if path_obj.stem.upper().endswith("STAGE") else "events"
+        self._manual_annotation_paths[key] = path_obj
+        self._load_companion_annotations()
+
+    def _update_annotation_summary(self):
+        total_events = len(self._event_records)
+        if not self._annotations_index or self._annotations_index.is_empty():
+            self.stageSummaryLabel.setText(f"Stage: -- | Events: {total_events}")
+            return
+        self.stageSummaryLabel.setText(f"Stage: -- | Events: {total_events}")
+
+    def _ensure_annotation_line_pool(self, count: int):
+        if not self._primary_plot:
+            return
+        while len(self._annotation_lines) < count:
+            line = pg.InfiniteLine(angle=90, pen=pg.mkPen("#ff9f1c", width=1.0))
+            line.setVisible(False)
+            self._primary_plot.addItem(line)
+            self._annotation_lines.append(line)
+
+    def _ensure_annotation_rect_pool(self, count: int):
+        scene = self.plotLayout.scene()
+        while len(self._annotation_rects) < count:
+            rect_item = QtWidgets.QGraphicsRectItem()
+            rect_item.setBrush(QtGui.QBrush(QtGui.QColor(255, 169, 77, 60)))
+            rect_item.setPen(QtGui.QPen(QtCore.Qt.NoPen))
+            rect_item.setZValue(-10)
+            rect_item.setVisible(False)
+            scene.addItem(rect_item)
+            self._annotation_rects.append(rect_item)
+
+    def _clear_annotation_lines(self):
+        for line in self._annotation_lines:
+            line.setVisible(False)
+        self._clear_annotation_rects()
+
+    def _clear_annotation_rects(self):
+        for rect in self._annotation_rects:
+            rect.setVisible(False)
+
+    def _populate_event_list(self, clear: bool = False):
+        self.eventList.blockSignals(True)
+        self.eventList.clear()
+        if clear or not self._annotations_index or self._annotations_index.is_empty():
+            self.eventList.setEnabled(False)
+            self.eventPrevBtn.setEnabled(False)
+            self.eventNextBtn.setEnabled(False)
+            self._event_records = []
+            self._current_event_index = -1
+            self._current_event_id = None
+            self.eventList.blockSignals(False)
+            return
+
+        duration = getattr(self.loader, "duration_s", 0.0)
+        events, ids = self._annotations_index.between(
+            0.0,
+            duration,
+            channels=None,
+            return_indices=True,
+        )
+        data = np.array(events, copy=False)
+        ids = np.asarray(ids, dtype=int)
+        if data.size == 0:
+            self.eventList.setEnabled(False)
+            self.eventPrevBtn.setEnabled(False)
+            self.eventNextBtn.setEnabled(False)
+            self._event_records = []
+            self._current_event_index = -1
+            self._current_event_id = None
+            self.eventList.blockSignals(False)
+            return
+
+        mask = np.array([str(chan) != "stage" for chan in data["chan"]], dtype=bool)
+        data = data[mask]
+        ids = ids[mask]
+        records: list[dict[str, float | str | int]] = []
+        for entry, idx in zip(data, ids):
+            start = float(entry["start_s"])
+            end = float(entry["end_s"])
+            records.append(
+                {
+                    "start": start,
+                    "end": end,
+                    "label": str(entry["label"]) or "event",
+                    "chan": str(entry["chan"]) or "Events",
+                    "id": int(idx),
+                }
+            )
+
+        records.sort(key=lambda r: r["start"])
+        self._event_records = records
+        total = len(records)
+        self.eventList.setEnabled(total > 0)
+        self.eventPrevBtn.setEnabled(total > 0)
+        self.eventNextBtn.setEnabled(total > 0)
+
+        for rec in records:
+            label = rec["label"]
+            chan = rec["chan"]
+            ts = self._format_clock(rec["start"])
+            duration_s = rec["end"] - rec["start"]
+            text = f"{ts} — {label} ({duration_s:.1f} s) [{chan}]"
+            item = QtWidgets.QListWidgetItem(text)
+            item.setData(QtCore.Qt.UserRole, rec)
+            self.eventList.addItem(item)
+
+        self._current_event_index = -1
+        self._current_event_id = None
+        self.eventList.clearSelection()
+        self.eventList.blockSignals(False)
+        self._update_annotation_summary()
+
+    def _format_clock(self, seconds: float) -> str:
+        tb = getattr(self.loader, "timebase", None)
+        if tb is not None and getattr(tb, "start_dt", None) is not None:
+            try:
+                dt = tb.to_datetime(seconds)
+                return dt.strftime("%H:%M:%S")
+            except Exception:
+                pass
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+    def _on_event_selection_changed(self):
+        if not self._event_records:
+            return
+        row = self.eventList.currentRow()
+        if row < 0 or row >= len(self._event_records):
+            return
+        self._jump_to_event(row, from_selection=True)
+
+    def _on_event_activated(self, item: QtWidgets.QListWidgetItem):
+        row = self.eventList.row(item)
+        if row >= 0:
+            self._jump_to_event(row, from_selection=True)
+
+    def _step_event(self, delta: int):
+        if not self._event_records:
+            return
+        if self._current_event_index == -1:
+            index = 0 if delta >= 0 else len(self._event_records) - 1
+        else:
+            index = max(0, min(len(self._event_records) - 1, self._current_event_index + delta))
+        self._jump_to_event(index)
+
+    def _jump_to_event(self, index: int, *, from_selection: bool = False):
+        if index < 0 or index >= len(self._event_records):
+            return
+        record = self._event_records[index]
+        self._current_event_index = index
+        self._current_event_id = record["id"]
+        if not from_selection:
+            self.eventList.blockSignals(True)
+            self.eventList.setCurrentRow(index)
+            self.eventList.blockSignals(False)
+
+        event_start = float(record["start"])
+        event_end = float(record["end"])
+        duration = max(event_end - event_start, 0.0)
+        view_start = event_start - max(0.0, (self._view_duration - duration) * 0.5)
+        max_start = max(0.0, self.loader.duration_s - self._view_duration)
+        view_start = max(0.0, min(view_start, max_start))
+        self._set_view(view_start, self._view_duration, sender="events")
+
+    def _color_for_event(self, label: str) -> QtGui.QColor:
+        base = self._event_color_cache.get(label)
+        if base is None:
+            base = pg.intColor(len(self._event_color_cache), hues=16, values=200)
+            self._event_color_cache[label] = base
+        return QtGui.QColor(base)
+
+    def _update_annotation_overlays(self, t0: float, t1: float):
+        if not self._primary_plot:
+            return
+        if not self._annotations_index or not self._annotations_enabled:
+            self._clear_annotation_lines()
+            if self._annotations_index is None:
+                self.stageSummaryLabel.setText("Stage: --")
+            return
+
+        for line in self._annotation_lines:
+            line.setVisible(False)
+
+        event_channels = [c for c in self._annotations_index.channel_set if c != "stage"]
+        events, ids = self._annotations_index.between(
+            t0,
+            t1,
+            channels=event_channels or None,
+            return_indices=True,
+        )
+
+        events = np.array(events, copy=False)
+        ids = np.asarray(ids, dtype=int)
+        self._clear_annotation_rects()
+        if events.size:
+            self._ensure_annotation_rect_pool(len(events))
+            scene_rect = self.plotLayout.ci.mapRectToScene(self.plotLayout.ci.boundingRect())
+            vb = self._primary_plot.getViewBox()
+            selected_id = self._current_event_id
+            for idx, (ev, ev_id) in enumerate(zip(events, ids)):
+                start = float(ev["start_s"])
+                end = float(ev["end_s"])
+                if end <= start:
+                    end = start + 0.5
+                p1 = vb.mapViewToScene(QtCore.QPointF(start, 0))
+                p2 = vb.mapViewToScene(QtCore.QPointF(end, 0))
+                x1, x2 = p1.x(), p2.x()
+                rect = QtCore.QRectF(min(x1, x2), scene_rect.top(), max(2.0, abs(x2 - x1)), scene_rect.height())
+                color = self._color_for_event(str(ev["label"]))
+                color.setAlpha(140 if ev_id == selected_id else 70)
+                brush = QtGui.QBrush(color)
+                item = self._annotation_rects[idx]
+                item.setRect(rect)
+                item.setBrush(brush)
+                duration = end - start
+                item.setToolTip(f"{ev['label']} ({duration:.1f}s)")
+                item.setVisible(True)
+            for idx in range(len(events), len(self._annotation_rects)):
+                self._annotation_rects[idx].setVisible(False)
+
+        stage_events = self._annotations_index.between(t0, t1, channels=["stage"])
+        if isinstance(stage_events, tuple):
+            stage_events = stage_events[0]
+        total_events = len(self._event_records)
+        if stage_events.size:
+            counts = Counter(stage_events["label"])
+            dominant, count = counts.most_common(1)[0]
+            self.stageSummaryLabel.setText(f"Stage: {dominant} ({count}) | Events: {total_events}")
+        else:
+            self.stageSummaryLabel.setText(f"Stage: -- | Events: {total_events}")
 
     def _prepare_tile(self, tile: _OverscanTile) -> bool:
         pixels = self._estimate_pixels() or 0
@@ -999,6 +1440,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _configure_plots(self):
         n = self.loader.n_channels
+        old_primary = self._primary_plot
         self._ensure_plot_rows(n)
 
         # Reset previous primary axis if needed
@@ -1030,10 +1472,21 @@ class MainWindow(QtWidgets.QMainWindow):
             self._primary_plot.setAxisItems({"bottom": pg.AxisItem(orientation="bottom")})
             self._primary_plot.showAxis("bottom", show=False)
 
+        if old_primary and old_primary is not new_primary:
+            for line in self._annotation_lines:
+                try:
+                    old_primary.removeItem(line)
+                except Exception:
+                    pass
+
         new_primary.setAxisItems({"bottom": self.time_axis})
         new_primary.showAxis("bottom", show=True)
         self._primary_plot = new_primary
         self._connect_primary_viewbox()
+
+        if self._annotation_lines:
+            for line in self._annotation_lines:
+                new_primary.addItem(line)
 
         for idx, plot in enumerate(self.plots[:n]):
             if plot is new_primary:
@@ -1048,6 +1501,8 @@ class MainWindow(QtWidgets.QMainWindow):
             if plot.getAxis("bottom") is self.time_axis:
                 plot.setAxisItems({"bottom": pg.AxisItem(orientation="bottom")})
 
+        self._ensure_stage_plot()
+
     @staticmethod
     def _format_label(meta) -> str:
         unit = f" [{meta.unit}]" if getattr(meta, "unit", "") else ""
@@ -1057,6 +1512,36 @@ class MainWindow(QtWidgets.QMainWindow):
             f"{text}"
             "</span>"
         )
+
+    def _ensure_stage_plot(self):
+        if self.stage_plot is None:
+            row = len(self.plots)
+            self._stage_label_item = self.plotLayout.addLabel(
+                row=row, col=0, text="Stage", justify="right"
+            )
+            plot = self.plotLayout.addPlot(row=row, col=1)
+            plot.setMaximumHeight(90)
+            plot.setMenuEnabled(False)
+            plot.setMouseEnabled(x=False, y=False)
+            plot.showGrid(x=False, y=True, alpha=0.15)
+            plot.hideAxis("right")
+            plot.hideAxis("top")
+            plot.getAxis("left").setStyle(showValues=True)
+            ticks = [
+                (0.0, "N3"),
+                (1.0, "N2"),
+                (2.0, "N1"),
+                (3.0, "REM"),
+                (4.0, "Wake"),
+            ]
+            plot.setYRange(-0.5, 4.5)
+            plot.getAxis("left").setTicks([ticks])
+            plot.showAxis("bottom", show=True)
+            self.stage_plot = plot
+            self._stage_curve = plot.plot([], [], stepMode=True, fillLevel=None, pen=pg.mkPen("#5f8bff", width=2))
+
+        if self._primary_plot is not None and self.stage_plot is not None:
+            self.stage_plot.setXLink(self._primary_plot)
 
     def _connect_primary_viewbox(self):
         if self._primary_viewbox is not None:

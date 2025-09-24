@@ -1,10 +1,14 @@
 # core/annotations.py
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, time, timedelta
+from pathlib import Path
 from typing import Iterable, Optional, Tuple, Dict, Any
-import numpy as np
 import csv
 import math
+import re
+
+import numpy as np
 
 ANNOT_DTYPE = np.dtype([
     ("start_s", "f8"),
@@ -20,10 +24,12 @@ class Annotations:
     Data is a sorted (by start_s) numpy structured array with dtype=ANNOT_DTYPE.
     """
     data: np.ndarray  # sorted by start_s
+    meta: Dict[str, Any] = field(default_factory=dict)
+    attrs: Optional[list[Dict[str, Any]]] = None
 
     @staticmethod
     def empty() -> "Annotations":
-        return Annotations(np.zeros(0, dtype=ANNOT_DTYPE))
+        return Annotations(np.zeros(0, dtype=ANNOT_DTYPE), {}, None)
 
     @property
     def size(self) -> int:
@@ -80,85 +86,337 @@ def from_edfplus(edf_reader, time_zero_s: float = 0.0) -> Annotations:
 
     # sort by start
     order = np.argsort(arr["start_s"], kind="mergesort")
-    return Annotations(arr[order])
+    return Annotations(arr[order], {"source": "edf+"}, None)
 
 
-def from_csv(
-    path: str,
-    mapping: Dict[str, Any],
+_FLOAT_PATTERN = re.compile(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?")
+
+
+def _extract_first_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        if math.isnan(value):
+            return None
+        return float(value)
+    text = str(value).strip()
+    if not text or text == "-":
+        return None
+    match = _FLOAT_PATTERN.search(text)
+    if not match:
+        return None
+    try:
+        return float(match.group())
+    except ValueError:
+        return None
+
+
+def _normalise_label(label: Optional[str]) -> str:
+    if label is None:
+        return "event"
+    return str(label).strip() or "event"
+
+
+def _normalise_channel(channel: Optional[str]) -> str:
+    if channel is None:
+        return ""
+    return str(channel).strip()
+
+
+@dataclass
+class CsvEventMapping:
+    label_field: str = "Event type"
+    epoch_field: Optional[str] = "Epoch"
+    epoch_length_s: float = 30.0
+    epoch_base: float = 1.0
+    time_field: Optional[str] = "Time"
+    time_format: str = "%I:%M:%S %p"
+    duration_field: Optional[str] = "Duration"
+    end_field: Optional[str] = None
+    unit: str = "s"
+    offset_s: float = 0.0
+    channel_field: Optional[str] = None
+    default_channel: Optional[str] = None
+    channel_map: Dict[str, str] = field(default_factory=dict)
+    validation_field: Optional[str] = "Validation"
+    attrs_fields: Tuple[str, ...] = ()  # extra columns to include in metadata per event
+
+
+def _parse_epoch(row_value: Any, mapping: CsvEventMapping) -> Optional[float]:
+    val = _extract_first_float(row_value)
+    if val is None:
+        return None
+    return (val - mapping.epoch_base) * mapping.epoch_length_s
+
+
+def _parse_clock_time(
+    value: Any,
     *,
-    delimiter: str = ",",
-    has_header: bool = True,
+    mapping: CsvEventMapping,
+    start_dt: Optional[datetime],
+    last_dt: Optional[datetime],
+) -> Tuple[Optional[float], Optional[datetime]]:
+    if value is None or start_dt is None:
+        return None, last_dt
+    text = str(value).strip()
+    if not text:
+        return None, last_dt
+    try:
+        parsed_time = datetime.strptime(text, mapping.time_format).time()
+    except ValueError:
+        return None, last_dt
+
+    base_date = start_dt.date()
+    candidate = datetime.combine(base_date, parsed_time)
+
+    # handle rollovers (times past midnight)
+    if last_dt is not None and candidate <= last_dt:
+        candidate += timedelta(days=1)
+    elif candidate < start_dt:
+        candidate += timedelta(days=1)
+
+    seconds = (candidate - start_dt).total_seconds()
+    return seconds, candidate
+
+
+def from_csv_events(
+    path: str | Path,
+    mapping: CsvEventMapping,
+    *,
+    start_dt: Optional[datetime] = None,
 ) -> Annotations:
-    """
-    Load annotations from a CSV using a mapping dict.
+    path = Path(path)
+    records: list[tuple[float, float, str, str]] = []
+    attr_records: list[Dict[str, Any]] = []
+    validation_counter: Dict[str, int] = {}
 
-    Required mapping keys:
-      - 'start': column name or index (0-based) for start time
-      - 'end' OR 'duration': (choose one) column for end time or duration
-      - 'unit': one of {'s','ms'} for the time columns
-    Optional:
-      - 'label': column for text label (default 'event')
-      - 'chan': column for channel tag (default '')
-      - 'offset_s': float seconds to subtract (e.g., align to EDF start)
+    unit_conv = 1.0 if mapping.unit == "s" else 1e-3
+    offset = float(mapping.offset_s)
+    last_clock_dt: Optional[datetime] = None
 
-    Example mapping:
-      {
-        "start": "start_time",
-        "end": "end_time",
-        "unit": "s",
-        "label": "event_type",
-        "chan": "signal",
-        "offset_s": 0.0
-      }
-    """
-    def get(row, key):
-        ref = mapping.get(key)
-        if ref is None: return None
-        if isinstance(ref, int):
-            return row[ref]
-        return row[ref]
-
-    conv = 1.0 if mapping.get("unit", "s") == "s" else 1e-3
-    offset = float(mapping.get("offset_s", 0.0))
-
-    records = []
-    with open(path, "r", newline="") as f:
-        reader = csv.reader(f, delimiter=delimiter)
-        header = None
-        if has_header:
-            header = next(reader)
+    with path.open("r", newline="") as f:
+        reader = csv.DictReader(f)
         for row in reader:
-            row_dict = row if header is None else dict(zip(header, row))
-            s_raw = float(get(row_dict, "start"))
-            e_ref = mapping.get("end")
-            d_ref = mapping.get("duration")
-            if e_ref is not None:
-                e_raw = float(get(row_dict, "end"))
-                start_s = s_raw * conv - offset
-                end_s   = e_raw * conv - offset
-            elif d_ref is not None:
-                dur_raw = float(get(row_dict, "duration"))
-                start_s = s_raw * conv - offset
-                end_s   = start_s + dur_raw * conv
-            else:
-                raise ValueError("mapping must include 'end' or 'duration'")
+            label = _normalise_label(row.get(mapping.label_field))
+            chan = mapping.channel_map.get(label, _normalise_channel(row.get(mapping.channel_field)))
+            if not chan:
+                chan = mapping.default_channel or ""
 
-            lab = str(get(row_dict, "label") or "event")
-            ch  = str(get(row_dict, "chan") or "")
+            start_s = None
+            if mapping.epoch_field and row.get(mapping.epoch_field) not in (None, ""):
+                start_s = _parse_epoch(row.get(mapping.epoch_field), mapping)
 
-            # guard: ensure end >= start
-            if end_s < start_s:
-                start_s, end_s = end_s, start_s
+            if start_s is None and mapping.time_field:
+                start_s, last_clock_dt = _parse_clock_time(
+                    row.get(mapping.time_field),
+                    mapping=mapping,
+                    start_dt=start_dt,
+                    last_dt=last_clock_dt,
+                )
 
-            records.append((start_s, end_s, lab, ch))
+            if start_s is None:
+                # Skip records we cannot time-align yet; future improvements may log warning.
+                continue
+
+            start_s = start_s * unit_conv - offset
+
+            duration_s = None
+            if mapping.end_field:
+                end_val = _extract_first_float(row.get(mapping.end_field))
+                if end_val is not None:
+                    duration_s = (end_val - (start_s + offset) / unit_conv) * unit_conv
+            if duration_s is None and mapping.duration_field:
+                dur_val = _extract_first_float(row.get(mapping.duration_field))
+                duration_s = (dur_val or 0.0) * unit_conv
+            if duration_s is None:
+                duration_s = 0.0
+
+            if duration_s < 0:
+                duration_s = 0.0
+
+            end_s = start_s + duration_s
+
+            records.append((start_s, end_s, label, chan))
+
+            if mapping.validation_field:
+                val = str(row.get(mapping.validation_field, "")).strip()
+                if val:
+                    validation_counter[val] = validation_counter.get(val, 0) + 1
+
+            attr_payload = {key: row.get(key) for key in mapping.attrs_fields}
+            attr_payload["raw"] = row
+            attr_records.append(attr_payload)
 
     if not records:
         return Annotations.empty()
 
     arr = np.array(records, dtype=ANNOT_DTYPE)
     order = np.argsort(arr["start_s"], kind="mergesort")
-    return Annotations(arr[order])
+    attrs_sorted = [attr_records[i] for i in order] if attr_records else None
+    meta = {
+        "source": str(path),
+        "type": "csv_events",
+        "mapping": asdict(mapping),
+        "validation_counts": validation_counter,
+    }
+    return Annotations(arr[order], meta, attrs_sorted)
+
+
+def from_csv_stages(
+    path: str | Path,
+    *,
+    epoch_length_s: float = 30.0,
+    stage_map: Optional[Dict[str, str]] = None,
+    offset_s: float = 0.0,
+) -> Annotations:
+    path = Path(path)
+    if stage_map is None:
+        stage_map = {
+            "11": "Wake",
+            "12": "N1",
+            "13": "N2",
+            "14": "REM",
+        }
+
+    records: list[tuple[float, float, str, str]] = []
+    with path.open("r", newline="") as f:
+        reader = csv.reader(f)
+        for idx, row in enumerate(reader):
+            if not row:
+                continue
+            code = row[0].strip()
+            numeric = _extract_first_float(code)
+            if numeric is not None:
+                numeric_key = str(int(numeric))
+                label = stage_map.get(code, stage_map.get(numeric_key, code))
+            else:
+                label = stage_map.get(code, code)
+            start_s = idx * epoch_length_s + offset_s
+            end_s = start_s + epoch_length_s
+            records.append((start_s, end_s, label, "stage"))
+
+    if not records:
+        return Annotations.empty()
+
+    arr = np.array(records, dtype=ANNOT_DTYPE)
+    meta = {
+        "source": str(path),
+        "type": "csv_stages",
+        "epoch_length_s": epoch_length_s,
+        "stage_map": stage_map,
+    }
+    return Annotations(arr, meta, None)
+
+
+def discover_annotation_files(edf_path: str | Path) -> Dict[str, Path]:
+    base = Path(edf_path)
+    stem = base.with_suffix("")
+    candidates = {
+        "events": stem.with_suffix(".csv"),
+        "stages": stem.with_name(stem.name + "STAGE.csv"),
+    }
+    found: Dict[str, Path] = {}
+    for key, candidate in candidates.items():
+        if candidate.exists():
+            found[key] = candidate
+    return found
+
+
+class AnnotationIndex:
+    """Aggregated view over multiple `Annotations` collections."""
+
+    def __init__(self, annotations: Iterable[Annotations]):
+        ann_list = [ann for ann in annotations if ann.size]
+        arrays: list[np.ndarray] = []
+        attrs: list[Dict[str, Any]] = []
+        self.sources: list[Dict[str, Any]] = []
+        for ann in ann_list:
+            arrays.append(ann.data)
+            if ann.attrs is None:
+                attrs.extend({} for _ in range(ann.size))
+            else:
+                attrs.extend(ann.attrs)
+            self.sources.append(ann.meta)
+
+        if arrays:
+            stacked = np.concatenate(arrays)
+            order = np.argsort(stacked["start_s"], kind="mergesort")
+            self.data = stacked[order]
+            self.attrs = [attrs[i] for i in order]
+            self._indices = np.arange(stacked.shape[0])[order]
+        else:
+            self.data = np.zeros(0, dtype=ANNOT_DTYPE)
+            self.attrs = []
+            self._indices = np.zeros(0, dtype=int)
+
+        self.channel_set = {str(c) for c in self.data["chan"]} if self.data.size else set()
+        self.label_set = {str(l) for l in self.data["label"]} if self.data.size else set()
+
+    def is_empty(self) -> bool:
+        return self.data.size == 0
+
+    def channels(self) -> set[str]:
+        return set(self.channel_set)
+
+    def labels(self) -> set[str]:
+        return set(self.label_set)
+
+    def between(
+        self,
+        t0: float,
+        t1: float,
+        *,
+        channels: Optional[Iterable[str]] = None,
+        labels: Optional[Iterable[str]] = None,
+        with_attrs: bool = False,
+        return_indices: bool = False,
+    ):
+        if self.data.size == 0 or t1 <= t0:
+            empty = self.data[:0]
+            if with_attrs and return_indices:
+                return empty, [], np.zeros(0, dtype=int)
+            if with_attrs:
+                return empty, []
+            if return_indices:
+                return empty, np.zeros(0, dtype=int)
+            return empty
+
+        starts = self.data["start_s"]
+        left = np.searchsorted(starts, t0, side="left")
+        right = np.searchsorted(starts, t1, side="right")
+        if right <= left:
+            empty = self.data[:0]
+            if with_attrs and return_indices:
+                return empty, [], np.zeros(0, dtype=int)
+            if with_attrs:
+                return empty, []
+            if return_indices:
+                return empty, np.zeros(0, dtype=int)
+            return empty
+
+        idx = np.arange(left, right)
+        subset = self.data[idx]
+        mask = (subset["start_s"] < t1) & (subset["end_s"] > t0)
+
+        if channels is not None:
+            channel_set = set(channels)
+            mask &= np.array([chan in channel_set for chan in subset["chan"]], dtype=bool)
+
+        if labels is not None:
+            label_set = set(labels)
+            mask &= np.array([lbl in label_set for lbl in subset["label"]], dtype=bool)
+
+        idx = idx[mask]
+        view = self.data[idx]
+        indices = self._indices[idx]
+        if with_attrs:
+            attrs = [self.attrs[i] for i in idx]
+            if return_indices:
+                return view, attrs, indices
+            return view, attrs
+        if return_indices:
+            return view, indices
+        return view
 
 # -------- Utilities --------
 
@@ -175,7 +433,8 @@ def relabel(ann: Annotations, mapping: Dict[str, str]) -> Annotations:
     labels = vmap(labels)
     new = ann.data.copy()
     new["label"] = labels
-    return Annotations(new)
+    attrs = None if ann.attrs is None else [dict(a) for a in ann.attrs]
+    return Annotations(new, dict(ann.meta), attrs)
 
 def filter_types(ann: Annotations, keep: Iterable[str]) -> Annotations:
     """
@@ -184,7 +443,10 @@ def filter_types(ann: Annotations, keep: Iterable[str]) -> Annotations:
     if ann.size == 0: return ann
     keep = set(keep)
     mask = np.array([lbl in keep for lbl in ann.data["label"]], dtype=bool)
-    return Annotations(ann.data[mask])
+    attrs = None
+    if ann.attrs is not None:
+        attrs = [ann.attrs[i] for i in np.nonzero(mask)[0]]
+    return Annotations(ann.data[mask], dict(ann.meta), attrs)
 
 def shift(ann: Annotations, delta_s: float) -> Annotations:
     """
@@ -195,4 +457,7 @@ def shift(ann: Annotations, delta_s: float) -> Annotations:
     new["start_s"] += delta_s
     new["end_s"]   += delta_s
     order = np.argsort(new["start_s"], kind="mergesort")
-    return Annotations(new[order])
+    meta = dict(ann.meta)
+    meta["shifted_by"] = meta.get("shifted_by", 0.0) + delta_s
+    attrs = None if ann.attrs is None else [ann.attrs[i] for i in order]
+    return Annotations(new[order], meta, attrs)

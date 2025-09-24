@@ -9,6 +9,8 @@ Version 0.2 introduces an overscan renderer that pre-renders ±2 viewport window
 - Automatic EDF → Zarr background ingest with parity checks
 - Prefetch ring buffer and memory budgets exposed in the UI
 - Overscan tile renderer (v0.2) keeps curve data hot within ±2 windows for stutter-free panning
+- Auto-detects companion CSV/Staging files (APPLES-style) and overlays events/stages on the timeline
+- Dedicated hypnogram lane with stage curves and an event navigator (list + next/prev) plus full-screen shaded event regions with hover tooltips
 - Configurable via `config.ini` or CLI overrides; persists user knob values with `QSettings`
 - Tested helper utilities for timebase conversions, decimation, and overscan slicing
 
