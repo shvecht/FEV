@@ -1,6 +1,6 @@
 # app.py
 import sys
-from PySide6 import QtWidgets
+from PySide6 import QtWidgets, QtGui
 from config import ViewerConfig
 from core.edf_loader import EdfLoader
 from ui.main_window import MainWindow
@@ -36,6 +36,7 @@ def main(
     if prefetch_max_mb is not None:
         cfg.prefetch_max_mb = prefetch_max_mb if prefetch_max_mb > 0 else None
     app = QtWidgets.QApplication(sys.argv)
+    app.setWindowIcon(QtGui.QIcon("icon.png"))
 
     if not path:
         path = _select_file_dialog()
