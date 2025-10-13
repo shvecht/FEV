@@ -17,6 +17,7 @@ class ViewerConfig:
     int16_cache_max_mb: float = 512.0
     int16_cache_memmap: bool = False
     hidden_channels: tuple[int, ...] = ()
+    hidden_annotation_channels: tuple[str, ...] = ("stage", "position")
     annotation_focus_only: bool = False
     theme: str = "Midnight"
     ini_path: Path | None = None
@@ -64,6 +65,24 @@ class ViewerConfig:
                     if indices:
                         cfg.hidden_channels = tuple(sorted(indices))
 
+                hidden_ann_raw = ui_section.get("hidden_annotation_channels", fallback="")
+                if hidden_ann_raw:
+                    names: list[str] = []
+                    for part in hidden_ann_raw.split(","):
+                        part = part.strip()
+                        if not part:
+                            continue
+                        names.append(part)
+                    if names:
+                        # Preserve unique entries while maintaining relative order
+                        seen: set[str] = set()
+                        ordered = []
+                        for name in names:
+                            if name not in seen:
+                                seen.add(name)
+                                ordered.append(name)
+                        cfg.hidden_annotation_channels = tuple(ordered)
+
             cache_section = parser["cache"] if "cache" in parser else None
             if cache_section:
                 cfg.int16_cache_enabled = cache_section.getboolean(
@@ -97,10 +116,14 @@ class ViewerConfig:
             "max_mb": f"{self.prefetch_max_mb or 0}",
         }
         hidden_serialized = ",".join(str(idx) for idx in sorted(set(self.hidden_channels)))
+        hidden_ann_serialized = ",".join(
+            name for name in dict.fromkeys(self.hidden_annotation_channels)
+        )
         parser["ui"] = {
             "prefetch_collapsed": "true" if self.prefetch_collapsed else "false",
             "controls_collapsed": "true" if self.controls_collapsed else "false",
             "hidden_channels": hidden_serialized,
+            "hidden_annotation_channels": hidden_ann_serialized,
             "annotation_focus_only": "true" if self.annotation_focus_only else "false",
             "theme": self.theme,
         }

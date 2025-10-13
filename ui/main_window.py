@@ -200,6 +200,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._init_overscan_worker()
 
         self._hidden_channels: set[int] = set(getattr(self._config, "hidden_channels", ()))
+        hidden_ann = getattr(self._config, "hidden_annotation_channels", ("stage", "position"))
+        self._hidden_annotation_channels: set[str] = {
+            str(name).strip() for name in hidden_ann if str(name).strip()
+        }
         self._manual_annotation_paths: dict[str, Path] = {}
         self._annotations_index: annotation_core.AnnotationIndex | None = None
         self._annotation_lines: list[pg.InfiniteLine] = []
@@ -215,8 +219,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._stage_label_item: pg.LabelItem | None = None
         self._stage_info_widget: QtWidgets.QTableWidget | None = None
         self._stage_info_proxy: QtWidgets.QGraphicsProxyWidget | None = None
+        self._annotation_channel_toggles: dict[str, QtWidgets.QCheckBox] = {}
 
         self._build_ui()
+        self._update_annotation_channel_toggles()
         self._apply_theme(self._active_theme_key, persist=False)
         focus_only_pref = bool(getattr(self._config, "annotation_focus_only", False))
         self.annotationFocusOnly.setChecked(focus_only_pref)
@@ -268,6 +274,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.annotationFocusOnly = QtWidgets.QCheckBox("Show only selected event")
         self.annotationFocusOnly.setChecked(False)
         self.annotationFocusOnly.setEnabled(False)
+        self.annotationStageToggle = QtWidgets.QCheckBox("Show sleep stages")
+        self.annotationStageToggle.setChecked(False)
+        self.annotationStageToggle.setEnabled(False)
+        self.annotationPositionToggle = QtWidgets.QCheckBox("Show body position")
+        self.annotationPositionToggle.setChecked(False)
+        self.annotationPositionToggle.setEnabled(False)
         self.annotationImportBtn = QtWidgets.QPushButton("Import annotations…")
         self.annotationImportBtn.setEnabled(True)
         self.eventChannelFilter = QtWidgets.QComboBox()
@@ -385,6 +397,8 @@ class MainWindow(QtWidgets.QMainWindow):
         annotationLayout.setSpacing(10)
         annotationLayout.addWidget(self.annotationToggle)
         annotationLayout.addWidget(self.annotationFocusOnly)
+        annotationLayout.addWidget(self.annotationStageToggle)
+        annotationLayout.addWidget(self.annotationPositionToggle)
         annotationLayout.addWidget(self.annotationImportBtn)
         filterRow = QtWidgets.QHBoxLayout()
         filterRow.setSpacing(6)
@@ -403,6 +417,11 @@ class MainWindow(QtWidgets.QMainWindow):
         controlLayout.addWidget(telemetryBar)
         controlLayout.addWidget(self.sourceLabel)
         controlLayout.addWidget(annotationSection)
+
+        self._annotation_channel_toggles = {
+            annotation_core.STAGE_CHANNEL: self.annotationStageToggle,
+            annotation_core.POSITION_CHANNEL: self.annotationPositionToggle,
+        }
 
         appearanceContent = QtWidgets.QWidget()
         appearanceLayout = QtWidgets.QVBoxLayout(appearanceContent)
@@ -635,6 +654,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.panelCollapseBtn.clicked.connect(
             lambda: self._set_controls_collapsed(True, persist=True)
         )
+
+        for channel, checkbox in self._annotation_channel_toggles.items():
+            if checkbox is not None:
+                checkbox.toggled.connect(
+                    partial(self._on_annotation_channel_toggle, channel)
+                )
 
         self._shortcuts: list[QtGui.QShortcut] = []
         self._shortcuts.append(QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_Left), self, activated=lambda: self._pan_fraction(-0.1)))
@@ -1391,6 +1416,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._clear_annotation_lines()
         self._clear_annotation_rects()
         self._populate_event_list(clear=True)
+        self._update_annotation_channel_toggles()
         self._update_stage_info()
         self._update_annotation_summary()
 
@@ -1443,6 +1469,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._annotations_index = annotation_core.AnnotationIndex(ann_sets)
         self.annotationToggle.setEnabled(True)
         self._annotations_enabled = self.annotationToggle.isChecked()
+        self._update_annotation_channel_toggles()
         self._rebuild_all_event_records()
         self._update_event_channel_options()
         self._reset_event_filters()
@@ -1537,6 +1564,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _stage_annotations(self) -> np.ndarray:
         if not self._annotations_index or self._annotations_index.is_empty():
             return np.zeros(0, dtype=annotation_core.ANNOT_DTYPE)
+        if annotation_core.STAGE_CHANNEL in self._hidden_annotation_channels:
+            return np.zeros(0, dtype=annotation_core.ANNOT_DTYPE)
         data = self._annotations_index.data
         if data.size == 0:
             return data
@@ -1548,6 +1577,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _position_annotations(self) -> np.ndarray:
         if not self._annotations_index or self._annotations_index.is_empty():
+            return np.zeros(0, dtype=annotation_core.ANNOT_DTYPE)
+        if annotation_core.POSITION_CHANNEL in self._hidden_annotation_channels:
             return np.zeros(0, dtype=annotation_core.ANNOT_DTYPE)
         data = self._annotations_index.data
         if data.size == 0:
@@ -1662,6 +1693,25 @@ class MainWindow(QtWidgets.QMainWindow):
         self.eventChannelFilter.setEnabled(bool(self._all_event_records))
         self.eventChannelFilter.blockSignals(False)
 
+    def _update_annotation_channel_toggles(self) -> None:
+        if not self._annotation_channel_toggles:
+            return
+
+        available: set[str] = set()
+        if self._annotations_index and not self._annotations_index.is_empty():
+            available = {str(chan) for chan in self._annotations_index.channel_set}
+
+        for channel, checkbox in self._annotation_channel_toggles.items():
+            if checkbox is None:
+                continue
+            is_available = channel in available
+            blocker = QtCore.QSignalBlocker(checkbox)
+            checkbox.setEnabled(is_available)
+            checkbox.setChecked(
+                is_available and channel not in self._hidden_annotation_channels
+            )
+            del blocker
+
     def _event_count_summary(self) -> str:
         total = len(self._all_event_records)
         filtered = len(self._event_records)
@@ -1705,6 +1755,48 @@ class MainWindow(QtWidgets.QMainWindow):
         for rect in self._annotation_rects:
             rect.setVisible(False)
 
+    def _set_annotation_channel_visible(
+        self, channel: str, visible: bool, *, persist: bool = True
+    ) -> None:
+        key = str(channel).strip()
+        if not key:
+            return
+
+        currently_visible = key not in self._hidden_annotation_channels
+        if bool(visible) == currently_visible:
+            return
+
+        if visible:
+            self._hidden_annotation_channels.discard(key)
+        else:
+            self._hidden_annotation_channels.add(key)
+
+        if persist:
+            ordered = list(dict.fromkeys(self._config.hidden_annotation_channels))
+            if visible:
+                if key in ordered:
+                    ordered.remove(key)
+            else:
+                if key not in ordered:
+                    ordered.append(key)
+            self._config.hidden_annotation_channels = tuple(ordered)
+            self._config.save()
+
+        self._update_annotation_channel_toggles()
+        self._rebuild_all_event_records()
+        self._update_event_channel_options()
+        self._populate_event_list()
+        self._update_annotation_summary()
+        self._update_stage_info()
+        if self.loader is not None:
+            self._update_annotation_overlays(
+                self._view_start,
+                min(self.loader.duration_s, self._view_start + self._view_duration),
+            )
+
+    def _on_annotation_channel_toggle(self, channel: str, checked: bool) -> None:
+        self._set_annotation_channel_visible(channel, bool(checked))
+
     def _rebuild_all_event_records(self):
         self._all_event_records = []
         if not self._annotations_index or self._annotations_index.is_empty():
@@ -1723,10 +1815,14 @@ class MainWindow(QtWidgets.QMainWindow):
         if data.size == 0 or ids.size == 0:
             return
 
-        excluded = {annotation_core.STAGE_CHANNEL, annotation_core.POSITION_CHANNEL}
-        mask = np.array([str(chan) not in excluded for chan in data["chan"]], dtype=bool)
-        data = data[mask]
-        ids = ids[mask]
+        hidden_channels = {str(ch) for ch in self._hidden_annotation_channels}
+        if hidden_channels:
+            mask = np.array(
+                [str(chan) not in hidden_channels for chan in data["chan"]],
+                dtype=bool,
+            )
+            data = data[mask]
+            ids = ids[mask]
         if data.size == 0:
             return
 
@@ -1908,8 +2004,10 @@ class MainWindow(QtWidgets.QMainWindow):
         for line in self._annotation_lines:
             line.setVisible(False)
 
-        excluded = {annotation_core.STAGE_CHANNEL, annotation_core.POSITION_CHANNEL}
-        event_channels = [c for c in self._annotations_index.channel_set if c not in excluded]
+        hidden_channels = {str(ch) for ch in self._hidden_annotation_channels}
+        event_channels = [
+            c for c in self._annotations_index.channel_set if str(c) not in hidden_channels
+        ]
         events, ids = self._annotations_index.between(
             t0,
             t1,
@@ -1957,16 +2055,23 @@ class MainWindow(QtWidgets.QMainWindow):
             for idx in range(len(events), len(self._annotation_rects)):
                 self._annotation_rects[idx].setVisible(False)
 
-        stage_events = self._annotations_index.between(
-            t0, t1, channels=[annotation_core.STAGE_CHANNEL]
-        )
-        if isinstance(stage_events, tuple):
-            stage_events = stage_events[0]
-        position_events = self._annotations_index.between(
-            t0, t1, channels=[annotation_core.POSITION_CHANNEL]
-        )
-        if isinstance(position_events, tuple):
-            position_events = position_events[0]
+        if annotation_core.STAGE_CHANNEL in hidden_channels:
+            stage_events = np.zeros(0, dtype=annotation_core.ANNOT_DTYPE)
+        else:
+            stage_events = self._annotations_index.between(
+                t0, t1, channels=[annotation_core.STAGE_CHANNEL]
+            )
+            if isinstance(stage_events, tuple):
+                stage_events = stage_events[0]
+
+        if annotation_core.POSITION_CHANNEL in hidden_channels:
+            position_events = np.zeros(0, dtype=annotation_core.ANNOT_DTYPE)
+        else:
+            position_events = self._annotations_index.between(
+                t0, t1, channels=[annotation_core.POSITION_CHANNEL]
+            )
+            if isinstance(position_events, tuple):
+                position_events = position_events[0]
 
         stage_display = None
         if getattr(stage_events, "size", 0):
