@@ -194,10 +194,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._annotation_lines: list[pg.InfiniteLine] = []
         self._annotations_enabled = False
         self._annotation_rects: list[QtWidgets.QGraphicsRectItem] = []
+        self._all_event_records: list[dict[str, float | str | int]] = []
         self._event_records: list[dict[str, float | str | int]] = []
         self._current_event_index: int = -1
         self._current_event_id: Optional[int] = None
         self._event_color_cache: dict[str, QtGui.QColor] = {}
+        self._selected_event_channel: str | None = None
+        self._event_label_filter: str = ""
         self.stage_plot: pg.PlotItem | None = None
         self._stage_curve: pg.PlotDataItem | None = None
         self._stage_label_item: pg.LabelItem | None = None
@@ -208,6 +211,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._debounce_timer.setSingleShot(True)
         self._debounce_timer.setInterval(60)
         self._debounce_timer.timeout.connect(self.refresh)
+        self._event_filter_timer = QtCore.QTimer(self)
+        self._event_filter_timer.setSingleShot(True)
+        self._event_filter_timer.setInterval(120)
+        self._event_filter_timer.timeout.connect(self._apply_event_filters)
         self._refresh_limits()
         self._update_controls_from_state()
         self.refresh()
@@ -246,6 +253,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.annotationToggle.setEnabled(False)
         self.annotationImportBtn = QtWidgets.QPushButton("Import annotations…")
         self.annotationImportBtn.setEnabled(True)
+        self.eventChannelFilter = QtWidgets.QComboBox()
+        self.eventChannelFilter.setEnabled(False)
+        self.eventChannelFilter.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToContents)
+        self.eventChannelFilter.addItem("All channels", userData=None)
+        self.eventSearchEdit = QtWidgets.QLineEdit()
+        self.eventSearchEdit.setPlaceholderText("Search labels…")
+        self.eventSearchEdit.setClearButtonEnabled(True)
+        self.eventSearchEdit.setEnabled(False)
         self.eventList = QtWidgets.QListWidget()
         self.eventList.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
         self.eventList.setEnabled(False)
@@ -333,6 +348,11 @@ class MainWindow(QtWidgets.QMainWindow):
         annotationLayout.setSpacing(10)
         annotationLayout.addWidget(self.annotationToggle)
         annotationLayout.addWidget(self.annotationImportBtn)
+        filterRow = QtWidgets.QHBoxLayout()
+        filterRow.setSpacing(6)
+        filterRow.addWidget(self.eventChannelFilter)
+        filterRow.addWidget(self.eventSearchEdit)
+        annotationLayout.addLayout(filterRow)
         annotationLayout.addWidget(self.eventList)
         eventNav = QtWidgets.QHBoxLayout()
         eventNav.setSpacing(8)
@@ -568,6 +588,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.prefetchSection.toggled.connect(self._on_prefetch_section_toggled)
         self.annotationToggle.toggled.connect(self._on_annotation_toggle)
         self.annotationImportBtn.clicked.connect(self._prompt_import_annotations)
+        self.eventChannelFilter.currentIndexChanged.connect(self._on_event_channel_changed)
+        self.eventSearchEdit.textChanged.connect(self._on_event_search_changed)
         self.eventList.itemSelectionChanged.connect(self._on_event_selection_changed)
         self.eventList.itemDoubleClicked.connect(self._on_event_activated)
         self.eventPrevBtn.clicked.connect(lambda: self._step_event(-1))
@@ -1183,6 +1205,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._annotations_index = annotation_core.AnnotationIndex(ann_sets)
         self.annotationToggle.setEnabled(True)
         self._annotations_enabled = self.annotationToggle.isChecked()
+        self._rebuild_all_event_records()
+        self._update_event_channel_options()
+        self._reset_event_filters()
         self._populate_event_list()
         self._update_annotation_summary()
         self._update_stage_plot_data()
@@ -1272,12 +1297,69 @@ class MainWindow(QtWidgets.QMainWindow):
         self._manual_annotation_paths[key] = path_obj
         self._load_companion_annotations()
 
-    def _update_annotation_summary(self):
-        total_events = len(self._event_records)
-        if not self._annotations_index or self._annotations_index.is_empty():
-            self.stageSummaryLabel.setText(f"Stage: -- | Events: {total_events}")
+    def _schedule_event_filter_refresh(self):
+        if self._event_filter_timer.isActive():
+            self._event_filter_timer.stop()
+        self._event_filter_timer.start()
+
+    def _apply_event_filters(self):
+        self._populate_event_list()
+
+    def _on_event_channel_changed(self):
+        data = self.eventChannelFilter.currentData()
+        self._selected_event_channel = str(data) if data else None
+        self._schedule_event_filter_refresh()
+
+    def _on_event_search_changed(self, text: str):
+        normalized = text.strip().lower()
+        if normalized == self._event_label_filter:
             return
-        self.stageSummaryLabel.setText(f"Stage: -- | Events: {total_events}")
+        self._event_label_filter = normalized
+        self._schedule_event_filter_refresh()
+
+    def _reset_event_filters(self):
+        if self._event_filter_timer.isActive():
+            self._event_filter_timer.stop()
+        self._selected_event_channel = None
+        self._event_label_filter = ""
+        self.eventChannelFilter.blockSignals(True)
+        self.eventChannelFilter.setCurrentIndex(0)
+        self.eventChannelFilter.blockSignals(False)
+        self.eventSearchEdit.blockSignals(True)
+        self.eventSearchEdit.clear()
+        self.eventSearchEdit.blockSignals(False)
+
+    def _update_event_channel_options(self):
+        channels = sorted({str(rec["chan"]) for rec in self._all_event_records if rec.get("chan")})
+        current = self._selected_event_channel
+        self.eventChannelFilter.blockSignals(True)
+        self.eventChannelFilter.clear()
+        self.eventChannelFilter.addItem("All channels", userData=None)
+        for chan in channels:
+            self.eventChannelFilter.addItem(chan, userData=chan)
+        if current and current in channels:
+            index = self.eventChannelFilter.findData(current)
+            if index >= 0:
+                self.eventChannelFilter.setCurrentIndex(index)
+            else:
+                self.eventChannelFilter.setCurrentIndex(0)
+                self._selected_event_channel = None
+        else:
+            self.eventChannelFilter.setCurrentIndex(0)
+            self._selected_event_channel = None
+        self.eventChannelFilter.setEnabled(bool(self._all_event_records))
+        self.eventChannelFilter.blockSignals(False)
+
+    def _event_count_summary(self) -> str:
+        total = len(self._all_event_records)
+        filtered = len(self._event_records)
+        if total and filtered != total:
+            return f"Events: {filtered}/{total}"
+        return f"Events: {filtered}"
+
+    def _update_annotation_summary(self):
+        summary = self._event_count_summary()
+        self.stageSummaryLabel.setText(f"Stage: -- | {summary}")
 
     def _ensure_annotation_line_pool(self, count: int):
         if not self._primary_plot:
@@ -1308,17 +1390,9 @@ class MainWindow(QtWidgets.QMainWindow):
         for rect in self._annotation_rects:
             rect.setVisible(False)
 
-    def _populate_event_list(self, clear: bool = False):
-        self.eventList.blockSignals(True)
-        self.eventList.clear()
-        if clear or not self._annotations_index or self._annotations_index.is_empty():
-            self.eventList.setEnabled(False)
-            self.eventPrevBtn.setEnabled(False)
-            self.eventNextBtn.setEnabled(False)
-            self._event_records = []
-            self._current_event_index = -1
-            self._current_event_id = None
-            self.eventList.blockSignals(False)
+    def _rebuild_all_event_records(self):
+        self._all_event_records = []
+        if not self._annotations_index or self._annotations_index.is_empty():
             return
 
         duration = getattr(self.loader, "duration_s", 0.0)
@@ -1328,21 +1402,18 @@ class MainWindow(QtWidgets.QMainWindow):
             channels=None,
             return_indices=True,
         )
+
         data = np.array(events, copy=False)
         ids = np.asarray(ids, dtype=int)
-        if data.size == 0:
-            self.eventList.setEnabled(False)
-            self.eventPrevBtn.setEnabled(False)
-            self.eventNextBtn.setEnabled(False)
-            self._event_records = []
-            self._current_event_index = -1
-            self._current_event_id = None
-            self.eventList.blockSignals(False)
+        if data.size == 0 or ids.size == 0:
             return
 
         mask = np.array([str(chan) != "stage" for chan in data["chan"]], dtype=bool)
         data = data[mask]
         ids = ids[mask]
+        if data.size == 0:
+            return
+
         records: list[dict[str, float | str | int]] = []
         for entry, idx in zip(data, ids):
             start = float(entry["start_s"])
@@ -1357,14 +1428,72 @@ class MainWindow(QtWidgets.QMainWindow):
                 }
             )
 
-        records.sort(key=lambda r: r["start"])
-        self._event_records = records
-        total = len(records)
+        records.sort(key=lambda r: (r["start"], r["end"], r["label"]))
+        self._all_event_records = records
+
+    def _populate_event_list(self, clear: bool = False):
+        self.eventList.blockSignals(True)
+        self.eventList.clear()
+        if clear or not self._annotations_index or self._annotations_index.is_empty():
+            self.eventList.setEnabled(False)
+            self.eventPrevBtn.setEnabled(False)
+            self.eventNextBtn.setEnabled(False)
+            self._all_event_records = []
+            self._event_records = []
+            self._current_event_index = -1
+            self._current_event_id = None
+            self.eventChannelFilter.blockSignals(True)
+            self.eventChannelFilter.clear()
+            self.eventChannelFilter.addItem("All channels", userData=None)
+            self.eventChannelFilter.setEnabled(False)
+            self.eventChannelFilter.blockSignals(False)
+            self.eventSearchEdit.blockSignals(True)
+            self.eventSearchEdit.clear()
+            self.eventSearchEdit.setEnabled(False)
+            self.eventSearchEdit.blockSignals(False)
+            self.eventList.blockSignals(False)
+            self._update_annotation_summary()
+            return
+
+        if not self._all_event_records:
+            self.eventList.setEnabled(False)
+            self.eventPrevBtn.setEnabled(False)
+            self.eventNextBtn.setEnabled(False)
+            self._event_records = []
+            self._current_event_index = -1
+            self._current_event_id = None
+            self.eventChannelFilter.setEnabled(False)
+            self.eventSearchEdit.setEnabled(False)
+            self.eventList.blockSignals(False)
+            self._update_annotation_summary()
+            return
+
+        channel_filter = self._selected_event_channel
+        label_filter = self._event_label_filter
+        previous_id = self._current_event_id
+        filtered: list[dict[str, float | str | int]] = []
+        restored_index = -1
+        for record in self._all_event_records:
+            if channel_filter and str(record.get("chan")) != channel_filter:
+                continue
+            if label_filter:
+                label = str(record.get("label", "")).lower()
+                if label_filter not in label:
+                    continue
+            idx = len(filtered)
+            filtered.append(record)
+            if previous_id is not None and int(record.get("id", -1)) == previous_id:
+                restored_index = idx
+
+        self._event_records = filtered
+        total = len(filtered)
         self.eventList.setEnabled(total > 0)
         self.eventPrevBtn.setEnabled(total > 0)
         self.eventNextBtn.setEnabled(total > 0)
+        self.eventSearchEdit.setEnabled(bool(self._all_event_records))
+        self.eventChannelFilter.setEnabled(bool(self._all_event_records))
 
-        for rec in records:
+        for rec in filtered:
             label = rec["label"]
             chan = rec["chan"]
             ts = self._format_clock(rec["start"])
@@ -1374,9 +1503,14 @@ class MainWindow(QtWidgets.QMainWindow):
             item.setData(QtCore.Qt.UserRole, rec)
             self.eventList.addItem(item)
 
-        self._current_event_index = -1
-        self._current_event_id = None
-        self.eventList.clearSelection()
+        if restored_index >= 0:
+            self.eventList.setCurrentRow(restored_index)
+            self._current_event_index = restored_index
+            self._current_event_id = previous_id
+        else:
+            self._current_event_index = -1
+            self._current_event_id = None
+            self.eventList.clearSelection()
         self.eventList.blockSignals(False)
         self._update_annotation_summary()
 
@@ -1446,8 +1580,8 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         if not self._annotations_index or not self._annotations_enabled:
             self._clear_annotation_lines()
-            if self._annotations_index is None:
-                self.stageSummaryLabel.setText("Stage: --")
+            summary = self._event_count_summary()
+            self.stageSummaryLabel.setText(f"Stage: -- | {summary}")
             return
 
         for line in self._annotation_lines:
@@ -1493,13 +1627,13 @@ class MainWindow(QtWidgets.QMainWindow):
         stage_events = self._annotations_index.between(t0, t1, channels=["stage"])
         if isinstance(stage_events, tuple):
             stage_events = stage_events[0]
-        total_events = len(self._event_records)
+        summary = self._event_count_summary()
         if stage_events.size:
             counts = Counter(stage_events["label"])
             dominant, count = counts.most_common(1)[0]
-            self.stageSummaryLabel.setText(f"Stage: {dominant} ({count}) | Events: {total_events}")
+            self.stageSummaryLabel.setText(f"Stage: {dominant} ({count}) | {summary}")
         else:
-            self.stageSummaryLabel.setText(f"Stage: -- | Events: {total_events}")
+            self.stageSummaryLabel.setText(f"Stage: -- | {summary}")
 
     def _prepare_tile(self, tile: _OverscanTile) -> bool:
         pixels = self._estimate_pixels() or 0
