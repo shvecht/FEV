@@ -296,6 +296,20 @@ class MainWindow(QtWidgets.QMainWindow):
         controlLayout = QtWidgets.QVBoxLayout(control)
         controlLayout.setContentsMargins(18, 18, 18, 18)
         controlLayout.setSpacing(14)
+
+        self.panelCollapseBtn = QtWidgets.QToolButton()
+        self.panelCollapseBtn.setObjectName("panelCollapseBtn")
+        self.panelCollapseBtn.setAutoRaise(True)
+        self.panelCollapseBtn.setToolButtonStyle(QtCore.Qt.ToolButtonIconOnly)
+        self.panelCollapseBtn.setArrowType(QtCore.Qt.LeftArrow)
+        self.panelCollapseBtn.setCursor(QtCore.Qt.PointingHandCursor)
+        self.panelCollapseBtn.setToolTip("Collapse controls")
+        headerLayout = QtWidgets.QHBoxLayout()
+        headerLayout.setContentsMargins(0, 0, 0, 0)
+        headerLayout.setSpacing(6)
+        headerLayout.addStretch(1)
+        headerLayout.addWidget(self.panelCollapseBtn)
+        controlLayout.addLayout(headerLayout)
         self.controlPanel = control
 
         navLayout = QtWidgets.QHBoxLayout()
@@ -618,6 +632,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.eventPrevBtn.clicked.connect(lambda: self._step_event(-1))
         self.eventNextBtn.clicked.connect(lambda: self._step_event(1))
         self.controlToggleBtn.toggled.connect(self._on_control_toggle)
+        self.panelCollapseBtn.clicked.connect(
+            lambda: self._set_controls_collapsed(True, persist=True)
+        )
 
         self._shortcuts: list[QtGui.QShortcut] = []
         self._shortcuts.append(QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_Left), self, activated=lambda: self._pan_fraction(-0.1)))
@@ -654,14 +671,23 @@ class MainWindow(QtWidgets.QMainWindow):
         collapsed = bool(collapsed)
         self._control_scroll.setVisible(not collapsed)
         rail_width = self._control_rail.sizeHint().width()
+        self._control_rail.setVisible(collapsed)
+        self.controlToggleBtn.setVisible(collapsed)
+        if self.panelCollapseBtn is not None:
+            self.panelCollapseBtn.setVisible(not collapsed)
+        panel_min = (
+            self.controlPanel.minimumWidth() if hasattr(self, "controlPanel") else 200
+        )
         if collapsed:
             self._control_wrapper.setMinimumWidth(rail_width)
             self._control_wrapper.setMaximumWidth(rail_width)
         else:
-            expanded_width = max(
-                rail_width + (self.controlPanel.minimumWidth() if hasattr(self, "controlPanel") else 200),
-                self._control_wrapper.sizeHint().width(),
+            scroll_hint = (
+                self._control_scroll.sizeHint().width()
+                if self._control_scroll is not None
+                else panel_min
             )
+            expanded_width = max(panel_min, scroll_hint)
             self._control_wrapper.setMinimumWidth(expanded_width)
             self._control_wrapper.setMaximumWidth(16777215)
         if self.controlToggleBtn.isChecked() != collapsed:
@@ -676,7 +702,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if collapsed:
                 first = rail_width
             else:
-                first = max(self._control_wrapper.sizeHint().width(), rail_width + 200)
+                first = max(self._control_wrapper.sizeHint().width(), panel_min)
             second = max(1, total - first)
             self._splitter.setSizes([first, second])
 
