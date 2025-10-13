@@ -206,6 +206,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._stage_label_item: pg.LabelItem | None = None
 
         self._build_ui()
+        focus_only_pref = bool(getattr(self._config, "annotation_focus_only", False))
+        self.annotationFocusOnly.setChecked(focus_only_pref)
         self._connect_signals()
         self._debounce_timer = QtCore.QTimer(self)
         self._debounce_timer.setSingleShot(True)
@@ -251,6 +253,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.annotationToggle = QtWidgets.QCheckBox("Show annotations")
         self.annotationToggle.setChecked(True)
         self.annotationToggle.setEnabled(False)
+        self.annotationFocusOnly = QtWidgets.QCheckBox("Show only selected event")
+        self.annotationFocusOnly.setChecked(False)
+        self.annotationFocusOnly.setEnabled(False)
         self.annotationImportBtn = QtWidgets.QPushButton("Import annotations…")
         self.annotationImportBtn.setEnabled(True)
         self.eventChannelFilter = QtWidgets.QComboBox()
@@ -352,6 +357,7 @@ class MainWindow(QtWidgets.QMainWindow):
         annotationLayout.setContentsMargins(14, 16, 14, 12)
         annotationLayout.setSpacing(10)
         annotationLayout.addWidget(self.annotationToggle)
+        annotationLayout.addWidget(self.annotationFocusOnly)
         annotationLayout.addWidget(self.annotationImportBtn)
         filterRow = QtWidgets.QHBoxLayout()
         filterRow.setSpacing(6)
@@ -613,6 +619,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.prefetchApplyBtn.clicked.connect(self._apply_prefetch_settings)
         self.prefetchSection.toggled.connect(self._on_prefetch_section_toggled)
         self.annotationToggle.toggled.connect(self._on_annotation_toggle)
+        self.annotationFocusOnly.toggled.connect(self._on_annotation_focus_only_changed)
         self.annotationImportBtn.clicked.connect(self._prompt_import_annotations)
         self.eventChannelFilter.currentIndexChanged.connect(self._on_event_channel_changed)
         self.eventSearchEdit.textChanged.connect(self._on_event_search_changed)
@@ -1051,6 +1058,19 @@ class MainWindow(QtWidgets.QMainWindow):
             min(self.loader.duration_s, self._view_start + self._view_duration),
         )
 
+    def _on_annotation_focus_only_changed(self, checked: bool):
+        self._write_persistent_state()
+        self._update_annotation_overlays(
+            self._view_start,
+            min(self.loader.duration_s, self._view_start + self._view_duration),
+        )
+
+    def _write_persistent_state(self) -> None:
+        if not hasattr(self, "annotationFocusOnly"):
+            return
+        self._config.annotation_focus_only = bool(self.annotationFocusOnly.isChecked())
+        self._config.save()
+
     def _schedule_prefetch(self):
         total = self.loader.duration_s
         for ch in range(self.loader.n_channels):
@@ -1181,6 +1201,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _load_companion_annotations(self):
         self._annotations_index = None
         self.annotationToggle.setEnabled(False)
+        self.annotationFocusOnly.setEnabled(False)
         self._annotations_enabled = False
         self.stageSummaryLabel.setText("Stage: --")
         self._clear_annotation_lines()
@@ -1464,6 +1485,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.eventList.setEnabled(False)
             self.eventPrevBtn.setEnabled(False)
             self.eventNextBtn.setEnabled(False)
+            self.annotationFocusOnly.setEnabled(False)
             self._all_event_records = []
             self._event_records = []
             self._current_event_index = -1
@@ -1485,6 +1507,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.eventList.setEnabled(False)
             self.eventPrevBtn.setEnabled(False)
             self.eventNextBtn.setEnabled(False)
+            self.annotationFocusOnly.setEnabled(False)
             self._event_records = []
             self._current_event_index = -1
             self._current_event_id = None
@@ -1516,6 +1539,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.eventList.setEnabled(total > 0)
         self.eventPrevBtn.setEnabled(total > 0)
         self.eventNextBtn.setEnabled(total > 0)
+        self.annotationFocusOnly.setEnabled(total > 0)
         self.eventSearchEdit.setEnabled(bool(self._all_event_records))
         self.eventChannelFilter.setEnabled(bool(self._all_event_records))
 
@@ -1621,14 +1645,25 @@ class MainWindow(QtWidgets.QMainWindow):
             return_indices=True,
         )
 
+        focus_only_checkbox = getattr(self, "annotationFocusOnly", None)
+        focus_only = bool(focus_only_checkbox and focus_only_checkbox.isChecked())
+        selected_id = self._current_event_id
+
         events = np.array(events, copy=False)
         ids = np.asarray(ids, dtype=int)
+        if focus_only:
+            if selected_id is None or ids.size == 0:
+                mask = np.zeros_like(ids, dtype=bool)
+            else:
+                mask = ids == int(selected_id)
+            events = events[mask]
+            ids = ids[mask]
+
         self._clear_annotation_rects()
         if events.size:
             self._ensure_annotation_rect_pool(len(events))
             scene_rect = self.plotLayout.ci.mapRectToScene(self.plotLayout.ci.boundingRect())
             vb = self._primary_plot.getViewBox()
-            selected_id = self._current_event_id
             for idx, (ev, ev_id) in enumerate(zip(events, ids)):
                 start = float(ev["start_s"])
                 end = float(ev["end_s"])
@@ -1654,12 +1689,17 @@ class MainWindow(QtWidgets.QMainWindow):
         if isinstance(stage_events, tuple):
             stage_events = stage_events[0]
         summary = self._event_count_summary()
+        include_summary = (not focus_only) or bool(events.size)
         if stage_events.size:
             counts = Counter(stage_events["label"])
             dominant, count = counts.most_common(1)[0]
-            self.stageSummaryLabel.setText(f"Stage: {dominant} ({count}) | {summary}")
+            text = f"Stage: {dominant} ({count})"
         else:
-            self.stageSummaryLabel.setText(f"Stage: -- | {summary}")
+            text = "Stage: --"
+
+        if include_summary and summary:
+            text = f"{text} | {summary}"
+        self.stageSummaryLabel.setText(text)
 
     def _prepare_tile(self, tile: _OverscanTile) -> bool:
         pixels = self._estimate_pixels() or 0
