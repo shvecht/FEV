@@ -2,6 +2,12 @@ from __future__ import annotations
 
 from PySide6 import QtCore, QtWidgets
 
+WIDGETSIZE_MAX = getattr(
+    QtWidgets,
+    "QWIDGETSIZE_MAX",
+    getattr(QtCore, "QWIDGETSIZE_MAX", 16_777_215),
+)
+
 
 class CollapsibleSection(QtWidgets.QFrame):
     """A helper widget that animates expansion/collapse of its content."""
@@ -88,17 +94,14 @@ class CollapsibleSection(QtWidgets.QFrame):
             target_height = self._content.minimumSizeHint().height()
         if not animate:
             self._animation.stop()
-            if expanded:
-                self._content.setMaximumHeight(QtWidgets.QWIDGETSIZE_MAX)
-            else:
-                self._content.setMaximumHeight(0)
+            self._content.setMaximumHeight(WIDGETSIZE_MAX if expanded else 0)
             self._content.setVisible(expanded)
             return
 
         self._content.setVisible(True)
         self._animation.stop()
         start_value = self._content.maximumHeight()
-        if start_value in (0, QtWidgets.QWIDGETSIZE_MAX):
+        if start_value in (0, WIDGETSIZE_MAX):
             start_value = self._content.height()
         self._content.setMaximumHeight(start_value)
         self._animation.setStartValue(start_value)
@@ -110,5 +113,4 @@ class CollapsibleSection(QtWidgets.QFrame):
             self._content.setVisible(False)
             self._content.setMaximumHeight(0)
         else:
-            self._content.setMaximumHeight(QtWidgets.QWIDGETSIZE_MAX)
-
+            self._content.setMaximumHeight(WIDGETSIZE_MAX)

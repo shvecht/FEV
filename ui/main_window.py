@@ -271,6 +271,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
         control = QtWidgets.QFrame()
         control.setObjectName("controlPanel")
+        control.setMinimumWidth(200)
+        control.setSizePolicy(
+            QtWidgets.QSizePolicy.Preferred,
+            QtWidgets.QSizePolicy.Expanding,
+        )
         controlLayout = QtWidgets.QVBoxLayout(control)
         controlLayout.setContentsMargins(18, 18, 18, 18)
         controlLayout.setSpacing(14)
@@ -407,6 +412,11 @@ class MainWindow(QtWidgets.QMainWindow):
         controlLayout.addStretch(1)
 
         self.plotLayout = pg.GraphicsLayoutWidget()
+        self.plotLayout.setMinimumSize(0, 0)
+        self.plotLayout.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding,
+            QtWidgets.QSizePolicy.Expanding,
+        )
         self.plotLayout.ci.layout.setSpacing(0)
         self.plotLayout.ci.layout.setContentsMargins(0, 0, 0, 0)
 
@@ -420,14 +430,30 @@ class MainWindow(QtWidgets.QMainWindow):
         scroll = QtWidgets.QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        scroll.setMinimumSize(0, 0)
+        scroll.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding,
+            QtWidgets.QSizePolicy.Expanding,
+        )
         scroll.setWidget(self.plotLayout)
 
+        control_scroll = QtWidgets.QScrollArea()
+        control_scroll.setWidgetResizable(True)
+        control_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        control_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        control_scroll.setSizePolicy(
+            QtWidgets.QSizePolicy.Minimum,
+            QtWidgets.QSizePolicy.Expanding,
+        )
+        control_scroll.setMinimumWidth(control.minimumWidth())
+        control_scroll.setWidget(control)
+
         splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
-        splitter.addWidget(control)
+        splitter.addWidget(control_scroll)
         splitter.addWidget(scroll)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([260, 940])
+        splitter.setSizes([220, 980])
 
         central = QtWidgets.QWidget()
         centralLayout = QtWidgets.QVBoxLayout(central)
@@ -1915,8 +1941,8 @@ class MainWindow(QtWidgets.QMainWindow):
             curve.setData([], [])
 
         if meta is not None:
-            label_item.setVisible(True)
-            label_item.setText(self._format_label(meta, hidden=not visible))
+            label_item.setVisible(visible)
+            label_item.setText(self._format_label(meta, hidden=False))
 
         if sync_checkbox and idx < len(self.channel_checkboxes):
             checkbox = self.channel_checkboxes[idx]
