@@ -3,11 +3,29 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Optional, Protocol, cast
 
 import numpy as np
 import zarr
-from zarr.storage import BaseStore
+
+try:
+    from zarr.storage import BaseStore
+except ImportError:  # pragma: no cover - zarr >= 3 compatibility
+    class BaseStore(Protocol):  # type: ignore[override]
+        def __getitem__(self, key: str) -> bytes: ...
+
+        def __setitem__(self, key: str, value: bytes) -> None: ...
+
+try:
+    from zarr.storage import DirectoryStore as _DirectoryStore
+except ImportError:  # pragma: no cover - zarr >= 3
+    _DirectoryStore = None
+    try:
+        from zarr.storage import LocalStore as _LocalStore
+    except ImportError:  # pragma: no cover - legacy fallback
+        _LocalStore = None
+else:
+    _LocalStore = None
 
 from core.edf_loader import EdfLoader
 
@@ -41,7 +59,7 @@ class EdfToZarr:
             store = self.store_factory(output_path)
         else:
             output_path.parent.mkdir(parents=True, exist_ok=True)
-            store = zarr.DirectoryStore(str(output_path))
+            store = self._create_default_store(output_path)
 
         loader = self._create_loader()
         total_samples = sum(int(info.n_samples) for info in loader.info)
@@ -64,6 +82,13 @@ class EdfToZarr:
         if self.loader_factory is not None:
             return self.loader_factory(self.edf_path)
         return EdfLoader(self.edf_path)
+
+    def _create_default_store(self, output_path: Path) -> BaseStore:
+        if _DirectoryStore is not None:
+            return cast(BaseStore, _DirectoryStore(str(output_path)))
+        if _LocalStore is not None:
+            return cast(BaseStore, _LocalStore(str(output_path)))
+        raise RuntimeError("No compatible Zarr store backend found")
 
     def _write_root_attrs(self, group: zarr.Group, loader: EdfLoader, output_path: Path) -> None:
         attrs = group.attrs

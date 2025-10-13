@@ -5,6 +5,7 @@ import logging
 import os
 from dataclasses import dataclass
 from collections import Counter
+from functools import partial
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, Sequence
@@ -14,6 +15,8 @@ import pyqtgraph as pg
 from PySide6 import QtCore, QtWidgets, QtGui
 
 from ui.time_axis import TimeAxis
+from ui.widgets import CollapsibleSection
+from ui.themes import DEFAULT_THEME, THEMES, ThemeDefinition
 from config import ViewerConfig
 from core.decimate import min_max_bins
 from core.overscan import slice_and_decimate
@@ -147,6 +150,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._zarr_path: Path | None = None
         self._pending_loader: object | None = None
         self._primary_viewbox = None
+        self._splitter: QtWidgets.QSplitter | None = None
+        self._control_wrapper: QtWidgets.QWidget | None = None
+        self._control_scroll: QtWidgets.QScrollArea | None = None
+        self._control_rail: QtWidgets.QWidget | None = None
         self._limits = WindowLimits(
             duration_min=0.25,
             duration_max=float(getattr(loader, "max_window_s", 120.0)),
@@ -167,9 +174,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self._prefetch = prefetch_service.create_cache(self._fetch_tile)
         self._prefetch.start()
 
+        theme_key = getattr(self._config, "theme", DEFAULT_THEME)
+        if theme_key not in THEMES:
+            theme_key = DEFAULT_THEME
+        self._active_theme_key = theme_key
+        self._theme: ThemeDefinition = THEMES[theme_key]
+        self._config.theme = theme_key
+        self._controls_collapsed = bool(getattr(self._config, "controls_collapsed", False))
+
         pg.setConfigOptions(antialias=True)
-        pg.setConfigOption("background", "#10131d")
-        pg.setConfigOption("foreground", "#e3e7f3")
 
         self.setWindowTitle("EDF Viewer — Multi-channel")
         self.time_axis = TimeAxis(orientation="bottom", timebase=loader.timebase)
@@ -186,25 +199,36 @@ class MainWindow(QtWidgets.QMainWindow):
         self._overscan_worker: _OverscanWorker | None = None
         self._init_overscan_worker()
 
+        self._hidden_channels: set[int] = set(getattr(self._config, "hidden_channels", ()))
         self._manual_annotation_paths: dict[str, Path] = {}
         self._annotations_index: annotation_core.AnnotationIndex | None = None
         self._annotation_lines: list[pg.InfiniteLine] = []
         self._annotations_enabled = False
         self._annotation_rects: list[QtWidgets.QGraphicsRectItem] = []
+        self._all_event_records: list[dict[str, float | str | int]] = []
         self._event_records: list[dict[str, float | str | int]] = []
         self._current_event_index: int = -1
         self._current_event_id: Optional[int] = None
         self._event_color_cache: dict[str, QtGui.QColor] = {}
+        self._selected_event_channel: str | None = None
+        self._event_label_filter: str = ""
         self.stage_plot: pg.PlotItem | None = None
         self._stage_curve: pg.PlotDataItem | None = None
         self._stage_label_item: pg.LabelItem | None = None
 
         self._build_ui()
+        self._apply_theme(self._active_theme_key, persist=False)
+        focus_only_pref = bool(getattr(self._config, "annotation_focus_only", False))
+        self.annotationFocusOnly.setChecked(focus_only_pref)
         self._connect_signals()
         self._debounce_timer = QtCore.QTimer(self)
         self._debounce_timer.setSingleShot(True)
         self._debounce_timer.setInterval(60)
         self._debounce_timer.timeout.connect(self.refresh)
+        self._event_filter_timer = QtCore.QTimer(self)
+        self._event_filter_timer.setSingleShot(True)
+        self._event_filter_timer.setInterval(120)
+        self._event_filter_timer.timeout.connect(self._apply_event_filters)
         self._refresh_limits()
         self._update_controls_from_state()
         self.refresh()
@@ -235,15 +259,25 @@ class MainWindow(QtWidgets.QMainWindow):
         self.windowSummary.setObjectName("windowSummary")
         self.stageSummaryLabel = QtWidgets.QLabel("Stage: --")
         self.stageSummaryLabel.setObjectName("stageSummary")
+        self.stageSummaryLabel.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
         self.sourceLabel = QtWidgets.QLabel("Source: EDF (live)")
         self.sourceLabel.setObjectName("sourceLabel")
         self.annotationToggle = QtWidgets.QCheckBox("Show annotations")
         self.annotationToggle.setChecked(True)
         self.annotationToggle.setEnabled(False)
+        self.annotationFocusOnly = QtWidgets.QCheckBox("Show only selected event")
+        self.annotationFocusOnly.setChecked(False)
+        self.annotationFocusOnly.setEnabled(False)
         self.annotationImportBtn = QtWidgets.QPushButton("Import annotations…")
         self.annotationImportBtn.setEnabled(True)
-        eventHeader = QtWidgets.QLabel("Annotations")
-        eventHeader.setObjectName("annotationsHeader")
+        self.eventChannelFilter = QtWidgets.QComboBox()
+        self.eventChannelFilter.setEnabled(False)
+        self.eventChannelFilter.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToContents)
+        self.eventChannelFilter.addItem("All channels", userData=None)
+        self.eventSearchEdit = QtWidgets.QLineEdit()
+        self.eventSearchEdit.setPlaceholderText("Search labels…")
+        self.eventSearchEdit.setClearButtonEnabled(True)
+        self.eventSearchEdit.setEnabled(False)
         self.eventList = QtWidgets.QListWidget()
         self.eventList.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
         self.eventList.setEnabled(False)
@@ -254,12 +288,29 @@ class MainWindow(QtWidgets.QMainWindow):
 
         control = QtWidgets.QFrame()
         control.setObjectName("controlPanel")
+        control.setMinimumWidth(200)
+        control.setSizePolicy(
+            QtWidgets.QSizePolicy.Preferred,
+            QtWidgets.QSizePolicy.Expanding,
+        )
         controlLayout = QtWidgets.QVBoxLayout(control)
         controlLayout.setContentsMargins(18, 18, 18, 18)
-        controlLayout.setSpacing(16)
+        controlLayout.setSpacing(14)
 
-        header = QtWidgets.QLabel("Viewing Window")
-        header.setObjectName("panelTitle")
+        self.panelCollapseBtn = QtWidgets.QToolButton()
+        self.panelCollapseBtn.setObjectName("panelCollapseBtn")
+        self.panelCollapseBtn.setAutoRaise(True)
+        self.panelCollapseBtn.setToolButtonStyle(QtCore.Qt.ToolButtonIconOnly)
+        self.panelCollapseBtn.setArrowType(QtCore.Qt.LeftArrow)
+        self.panelCollapseBtn.setCursor(QtCore.Qt.PointingHandCursor)
+        self.panelCollapseBtn.setToolTip("Collapse controls")
+        headerLayout = QtWidgets.QHBoxLayout()
+        headerLayout.setContentsMargins(0, 0, 0, 0)
+        headerLayout.setSpacing(6)
+        headerLayout.addStretch(1)
+        headerLayout.addWidget(self.panelCollapseBtn)
+        controlLayout.addLayout(headerLayout)
+        self.controlPanel = control
 
         navLayout = QtWidgets.QHBoxLayout()
         navLayout.setSpacing(6)
@@ -288,28 +339,110 @@ class MainWindow(QtWidgets.QMainWindow):
         form.addWidget(QtWidgets.QLabel("Duration"), 1, 0)
         form.addWidget(self.windowSpin, 1, 1)
 
-        controlLayout.addWidget(header)
-        controlLayout.addLayout(navLayout)
         self.fileButton = QtWidgets.QPushButton("Open EDF…")
         self.fileButton.setObjectName("fileSelectButton")
         self.fileButton.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_DialogOpenButton))
         self.fileButton.setCursor(QtCore.Qt.PointingHandCursor)
-        controlLayout.addWidget(self.fileButton)
-        controlLayout.addLayout(form)
-        controlLayout.addWidget(self.absoluteRange)
-        controlLayout.addWidget(self.windowSummary)
-        controlLayout.addWidget(self.stageSummaryLabel)
-        controlLayout.addWidget(self.sourceLabel)
-        controlLayout.addWidget(self.annotationToggle)
-        controlLayout.addWidget(self.annotationImportBtn)
-        controlLayout.addWidget(eventHeader)
-        controlLayout.addWidget(self.eventList)
+
+        primaryControls = QtWidgets.QGroupBox("Viewing Controls")
+        primaryControls.setObjectName("primaryControls")
+        primaryLayout = QtWidgets.QVBoxLayout(primaryControls)
+        primaryLayout.setContentsMargins(14, 16, 14, 12)
+        primaryLayout.setSpacing(12)
+        primaryLayout.addLayout(navLayout)
+        fileRow = QtWidgets.QHBoxLayout()
+        fileRow.addWidget(self.fileButton)
+        fileRow.addStretch(1)
+        primaryLayout.addLayout(fileRow)
+        primaryLayout.addLayout(form)
+
+        channelContent = QtWidgets.QWidget()
+        channelContentLayout = QtWidgets.QVBoxLayout(channelContent)
+        channelContentLayout.setContentsMargins(0, 0, 0, 0)
+        channelContentLayout.setSpacing(6)
+        self.channel_checkboxes: list[QtWidgets.QCheckBox] = []
+        self._channel_list_layout = channelContentLayout
+        channelContentLayout.addStretch(1)
+        self.channelSection = CollapsibleSection("Channels", channelContent, expanded=True)
+        self.channelSection.setObjectName("channelSection")
+
+        telemetryBar = QtWidgets.QFrame()
+        telemetryBar.setObjectName("telemetryBar")
+        telemetryBar.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
+        telemetryLayout = QtWidgets.QHBoxLayout(telemetryBar)
+        telemetryLayout.setContentsMargins(12, 6, 12, 6)
+        telemetryLayout.setSpacing(8)
+        telemetryLayout.addWidget(self.absoluteRange)
+        telemetryLayout.addWidget(self.windowSummary)
+        telemetryLayout.addStretch(1)
+        telemetryLayout.addWidget(self.stageSummaryLabel)
+
+        annotationSection = QtWidgets.QGroupBox("Annotations")
+        annotationSection.setObjectName("annotationSection")
+        annotationSection.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Expanding)
+        annotationLayout = QtWidgets.QVBoxLayout(annotationSection)
+        annotationLayout.setContentsMargins(14, 16, 14, 12)
+        annotationLayout.setSpacing(10)
+        annotationLayout.addWidget(self.annotationToggle)
+        annotationLayout.addWidget(self.annotationFocusOnly)
+        annotationLayout.addWidget(self.annotationImportBtn)
+        filterRow = QtWidgets.QHBoxLayout()
+        filterRow.setSpacing(6)
+        filterRow.addWidget(self.eventChannelFilter)
+        filterRow.addWidget(self.eventSearchEdit)
+        annotationLayout.addLayout(filterRow)
+        annotationLayout.addWidget(self.eventList)
         eventNav = QtWidgets.QHBoxLayout()
+        eventNav.setSpacing(8)
         eventNav.addWidget(self.eventPrevBtn)
         eventNav.addWidget(self.eventNextBtn)
-        controlLayout.addLayout(eventNav)
-        prefetchBox = QtWidgets.QGroupBox("Prefetch")
-        prefetchLayout = QtWidgets.QGridLayout(prefetchBox)
+        annotationLayout.addLayout(eventNav)
+
+        controlLayout.addWidget(primaryControls)
+        controlLayout.addWidget(self.channelSection)
+        controlLayout.addWidget(telemetryBar)
+        controlLayout.addWidget(self.sourceLabel)
+        controlLayout.addWidget(annotationSection)
+
+        appearanceContent = QtWidgets.QWidget()
+        appearanceLayout = QtWidgets.QVBoxLayout(appearanceContent)
+        appearanceLayout.setContentsMargins(0, 0, 0, 0)
+        appearanceLayout.setSpacing(10)
+        themeRow = QtWidgets.QHBoxLayout()
+        themeRow.setSpacing(6)
+        themeLabel = QtWidgets.QLabel("Theme")
+        self.themeCombo = QtWidgets.QComboBox()
+        self.themeCombo.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToContents)
+        for key, theme_def in THEMES.items():
+            self.themeCombo.addItem(theme_def.name, userData=key)
+        with QtCore.QSignalBlocker(self.themeCombo):
+            idx = self.themeCombo.findData(self._active_theme_key)
+            if idx < 0:
+                idx = 0
+            if idx >= 0:
+                self.themeCombo.setCurrentIndex(idx)
+        themeRow.addWidget(themeLabel)
+        themeRow.addWidget(self.themeCombo, 1)
+        appearanceLayout.addLayout(themeRow)
+
+        self.themePreviewWidget = QtWidgets.QWidget()
+        previewLayout = QtWidgets.QHBoxLayout(self.themePreviewWidget)
+        previewLayout.setContentsMargins(0, 0, 0, 0)
+        previewLayout.setSpacing(6)
+        appearanceLayout.addWidget(self.themePreviewWidget)
+        appearanceLayout.addStretch(1)
+
+        self.appearanceSection = CollapsibleSection(
+            "Appearance",
+            appearanceContent,
+            expanded=False,
+        )
+        self.appearanceSection.setObjectName("appearanceSection")
+        controlLayout.addWidget(self.appearanceSection)
+
+        prefetchContent = QtWidgets.QWidget()
+        prefetchLayout = QtWidgets.QGridLayout(prefetchContent)
+        prefetchLayout.setContentsMargins(0, 0, 0, 0)
         prefetchLayout.setHorizontalSpacing(8)
         prefetchLayout.setVerticalSpacing(6)
         self.prefetchTileSpin = QtWidgets.QDoubleSpinBox()
@@ -331,7 +464,13 @@ class MainWindow(QtWidgets.QMainWindow):
         prefetchLayout.addWidget(QtWidgets.QLabel("Max MB"), 2, 0)
         prefetchLayout.addWidget(self.prefetchMaxMbSpin, 2, 1)
         prefetchLayout.addWidget(self.prefetchApplyBtn, 3, 0, 1, 2)
-        controlLayout.addWidget(prefetchBox)
+        self.prefetchSection = CollapsibleSection(
+            "Prefetch",
+            prefetchContent,
+            expanded=not getattr(self._config, "prefetch_collapsed", False),
+        )
+        self.prefetchSection.setObjectName("prefetchSection")
+        controlLayout.addWidget(self.prefetchSection)
         self.ingestBar = QtWidgets.QProgressBar()
         self.ingestBar.setObjectName("ingestBar")
         self.ingestBar.setRange(0, 100)
@@ -343,6 +482,11 @@ class MainWindow(QtWidgets.QMainWindow):
         controlLayout.addStretch(1)
 
         self.plotLayout = pg.GraphicsLayoutWidget()
+        self.plotLayout.setMinimumSize(0, 0)
+        self.plotLayout.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding,
+            QtWidgets.QSizePolicy.Expanding,
+        )
         self.plotLayout.ci.layout.setSpacing(0)
         self.plotLayout.ci.layout.setContentsMargins(0, 0, 0, 0)
 
@@ -356,14 +500,101 @@ class MainWindow(QtWidgets.QMainWindow):
         scroll = QtWidgets.QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        scroll.setMinimumSize(0, 0)
+        scroll.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding,
+            QtWidgets.QSizePolicy.Expanding,
+        )
         scroll.setWidget(self.plotLayout)
 
+        control_scroll = QtWidgets.QScrollArea()
+        control_scroll.setWidgetResizable(True)
+        control_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        control_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        control_scroll.setSizePolicy(
+            QtWidgets.QSizePolicy.Minimum,
+            QtWidgets.QSizePolicy.Expanding,
+        )
+        control_scroll.setMinimumWidth(control.minimumWidth())
+        control_scroll.setWidget(control)
+        self._control_scroll = control_scroll
+
+        self._control_rail = QtWidgets.QFrame()
+        self._control_rail.setObjectName("controlRail")
+        self._control_rail.setSizePolicy(
+            QtWidgets.QSizePolicy.Fixed,
+            QtWidgets.QSizePolicy.Expanding,
+        )
+        self._control_rail.setMinimumWidth(48)
+        self._control_rail.setMaximumWidth(48)
+        railLayout = QtWidgets.QVBoxLayout(self._control_rail)
+        railLayout.setContentsMargins(4, 8, 4, 8)
+        railLayout.setSpacing(6)
+
+        def _make_icon_button(pixmap: QtWidgets.QStyle.StandardPixmap, tooltip: str) -> QtWidgets.QToolButton:
+            btn = QtWidgets.QToolButton()
+            btn.setToolButtonStyle(QtCore.Qt.ToolButtonIconOnly)
+            btn.setIcon(self.style().standardIcon(pixmap))
+            btn.setIconSize(QtCore.QSize(20, 20))
+            btn.setAutoRaise(True)
+            btn.setCursor(QtCore.Qt.PointingHandCursor)
+            btn.setToolTip(tooltip)
+            return btn
+
+        self.railOpenBtn = _make_icon_button(QtWidgets.QStyle.SP_DialogOpenButton, "Open EDF…")
+        self.railOpenBtn.clicked.connect(self._prompt_open_file)
+        railLayout.addWidget(self.railOpenBtn)
+
+        self.railAnnotationBtn = _make_icon_button(QtWidgets.QStyle.SP_DialogYesButton, "Toggle annotations")
+        self.railAnnotationBtn.setCheckable(True)
+        self.railAnnotationBtn.setChecked(self.annotationToggle.isChecked())
+        self.railAnnotationBtn.toggled.connect(self.annotationToggle.setChecked)
+        self.annotationToggle.toggled.connect(self.railAnnotationBtn.setChecked)
+        railLayout.addWidget(self.railAnnotationBtn)
+
+        railLayout.addSpacing(12)
+
+        self.railPanLeftBtn = _make_icon_button(QtWidgets.QStyle.SP_ArrowBack, "Pan window left")
+        self.railPanLeftBtn.clicked.connect(self.panLeftBtn.click)
+        railLayout.addWidget(self.railPanLeftBtn)
+
+        self.railPanRightBtn = _make_icon_button(QtWidgets.QStyle.SP_ArrowForward, "Pan window right")
+        self.railPanRightBtn.clicked.connect(self.panRightBtn.click)
+        railLayout.addWidget(self.railPanRightBtn)
+
+        self.railZoomInBtn = _make_icon_button(QtWidgets.QStyle.SP_ArrowUp, "Zoom in")
+        self.railZoomInBtn.clicked.connect(self.zoomInBtn.click)
+        railLayout.addWidget(self.railZoomInBtn)
+
+        self.railZoomOutBtn = _make_icon_button(QtWidgets.QStyle.SP_ArrowDown, "Zoom out")
+        self.railZoomOutBtn.clicked.connect(self.zoomOutBtn.click)
+        railLayout.addWidget(self.railZoomOutBtn)
+
+        railLayout.addStretch(1)
+
+        self.controlToggleBtn = QtWidgets.QToolButton()
+        self.controlToggleBtn.setAutoRaise(True)
+        self.controlToggleBtn.setCheckable(True)
+        self.controlToggleBtn.setToolButtonStyle(QtCore.Qt.ToolButtonIconOnly)
+        self.controlToggleBtn.setCursor(QtCore.Qt.PointingHandCursor)
+        self.controlToggleBtn.setToolTip("Collapse controls")
+        railLayout.addWidget(self.controlToggleBtn)
+
+        control_wrapper = QtWidgets.QWidget()
+        wrapperLayout = QtWidgets.QHBoxLayout(control_wrapper)
+        wrapperLayout.setContentsMargins(0, 0, 0, 0)
+        wrapperLayout.setSpacing(0)
+        wrapperLayout.addWidget(self._control_rail)
+        wrapperLayout.addWidget(control_scroll)
+        self._control_wrapper = control_wrapper
+
         splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
-        splitter.addWidget(control)
+        splitter.addWidget(control_wrapper)
         splitter.addWidget(scroll)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([260, 940])
+        splitter.setSizes([220, 980])
+        self._splitter = splitter
 
         central = QtWidgets.QWidget()
         centralLayout = QtWidgets.QVBoxLayout(central)
@@ -372,95 +603,11 @@ class MainWindow(QtWidgets.QMainWindow):
         centralLayout.addWidget(splitter)
         self.setCentralWidget(central)
 
-        self.setStyleSheet(
-            """
-            QMainWindow { background-color: #0b111c; color: #e6ebf5; }
-            QLabel { font-size: 13px; color: #e6ebf5; }
-            QLabel#panelTitle { font-size: 15px; font-weight: 600; color: #f3f6ff; }
-            QLabel#absoluteRange, QLabel#windowSummary { color: #9ba9bf; }
-            QLabel#sourceLabel { color: #9ba9bf; font-style: italic; }
-            QDoubleSpinBox {
-                background-color: #121a2a;
-                border: 1px solid #1f2a3d;
-                border-radius: 6px;
-                padding: 6px 8px;
-                color: #f0f4ff;
-            }
-            QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
-                background-color: transparent;
-                border: none;
-            }
-            QFrame#controlPanel {
-                background-color: #131b2b;
-                border-right: 1px solid #1f2a3d;
-            }
-            QPushButton#fileSelectButton {
-                background-color: #1a2436;
-                border: 1px solid #27324a;
-                border-radius: 6px;
-                padding: 8px 12px;
-                color: #f3f6ff;
-                font-weight: 600;
-            }
-            QPushButton#fileSelectButton:hover {
-                background-color: #22304a;
-                border-color: #39507a;
-            }
-           QPushButton#fileSelectButton:pressed {
-               background-color: #182235;
-           }
-            QGroupBox QPushButton {
-                background-color: #1c273a;
-                border: 1px solid #2b3850;
-                border-radius: 6px;
-                padding: 6px 10px;
-                color: #e1e9ff;
-            }
-            QGroupBox QPushButton:hover {
-                background-color: #263755;
-            }
-            QGroupBox QPushButton:pressed {
-                background-color: #142033;
-            }
-            QGroupBox {
-                margin-top: 10px;
-                border: 1px solid #1f2a3d;
-                border-radius: 6px;
-                padding: 8px;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 12px;
-                padding: 0 4px;
-                color: #a7b4cf;
-            }
-            QToolButton {
-                background-color: #1a2333;
-                border: 1px solid #263247;
-                border-radius: 4px;
-                padding: 4px 8px;
-                color: #dfe7ff;
-            }
-            QToolButton:hover {
-                background-color: #25314a;
-            }
-            QToolButton:pressed {
-                background-color: #172132;
-            }
-            QProgressBar#ingestBar {
-                background-color: #121a24;
-                border: 1px solid #1f2a3d;
-                border-radius: 6px;
-                padding: 3px;
-                color: #e6ebf5;
-            }
-            QProgressBar#ingestBar::chunk {
-                background-color: #3d6dff;
-                border-radius: 4px;
-            }
-            QScrollArea { background-color: #0b111c; }
-        """
-        )
+        with QtCore.QSignalBlocker(self.controlToggleBtn):
+            self.controlToggleBtn.setChecked(self._controls_collapsed)
+        self._update_control_toggle_icon(self._controls_collapsed)
+        self._apply_control_panel_state(self._controls_collapsed)
+        QtCore.QTimer.singleShot(0, lambda: self._apply_control_panel_state(self._controls_collapsed))
 
     def _connect_signals(self):
         self.startSpin.valueChanged.connect(self._on_start_spin_changed)
@@ -473,12 +620,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self.fullViewBtn.clicked.connect(self._full_view)
         self.resetViewBtn.clicked.connect(self._reset_view)
         self.prefetchApplyBtn.clicked.connect(self._apply_prefetch_settings)
+        self.prefetchSection.toggled.connect(self._on_prefetch_section_toggled)
+        self.themeCombo.currentIndexChanged.connect(self._on_theme_changed)
         self.annotationToggle.toggled.connect(self._on_annotation_toggle)
+        self.annotationFocusOnly.toggled.connect(self._on_annotation_focus_only_changed)
         self.annotationImportBtn.clicked.connect(self._prompt_import_annotations)
+        self.eventChannelFilter.currentIndexChanged.connect(self._on_event_channel_changed)
+        self.eventSearchEdit.textChanged.connect(self._on_event_search_changed)
         self.eventList.itemSelectionChanged.connect(self._on_event_selection_changed)
         self.eventList.itemDoubleClicked.connect(self._on_event_activated)
         self.eventPrevBtn.clicked.connect(lambda: self._step_event(-1))
         self.eventNextBtn.clicked.connect(lambda: self._step_event(1))
+        self.controlToggleBtn.toggled.connect(self._on_control_toggle)
+        self.panelCollapseBtn.clicked.connect(
+            lambda: self._set_controls_collapsed(True, persist=True)
+        )
 
         self._shortcuts: list[QtGui.QShortcut] = []
         self._shortcuts.append(QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_Left), self, activated=lambda: self._pan_fraction(-0.1)))
@@ -487,6 +643,181 @@ class MainWindow(QtWidgets.QMainWindow):
         self._shortcuts.append(QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_Equal), self, activated=lambda: self._zoom_factor(0.5)))
         self._shortcuts.append(QtGui.QShortcut(QtGui.QKeySequence("F"), self, activated=self._full_view))
         self._shortcuts.append(QtGui.QShortcut(QtGui.QKeySequence("R"), self, activated=self._reset_view))
+        self._shortcuts.append(
+            QtGui.QShortcut(
+                QtGui.QKeySequence("Ctrl+Shift+C"),
+                self,
+                activated=lambda: self._set_controls_collapsed(not self._controls_collapsed, persist=True),
+            )
+        )
+
+    def _on_control_toggle(self, collapsed: bool) -> None:
+        self._set_controls_collapsed(bool(collapsed), persist=True)
+
+    def _set_controls_collapsed(self, collapsed: bool, *, persist: bool) -> None:
+        collapsed = bool(collapsed)
+        if self._controls_collapsed == collapsed:
+            self._apply_control_panel_state(collapsed)
+        else:
+            self._controls_collapsed = collapsed
+            self._apply_control_panel_state(collapsed)
+        if persist:
+            self._config.controls_collapsed = collapsed
+            self._config.save()
+
+    def _apply_control_panel_state(self, collapsed: bool) -> None:
+        if self._control_wrapper is None or self._control_scroll is None or self._control_rail is None:
+            return
+        collapsed = bool(collapsed)
+        self._control_scroll.setVisible(not collapsed)
+        rail_width = self._control_rail.sizeHint().width()
+        self._control_rail.setVisible(collapsed)
+        self.controlToggleBtn.setVisible(collapsed)
+        if self.panelCollapseBtn is not None:
+            self.panelCollapseBtn.setVisible(not collapsed)
+        panel_min = (
+            self.controlPanel.minimumWidth() if hasattr(self, "controlPanel") else 200
+        )
+        if collapsed:
+            self._control_wrapper.setMinimumWidth(rail_width)
+            self._control_wrapper.setMaximumWidth(rail_width)
+        else:
+            scroll_hint = (
+                self._control_scroll.sizeHint().width()
+                if self._control_scroll is not None
+                else panel_min
+            )
+            expanded_width = max(panel_min, scroll_hint)
+            self._control_wrapper.setMinimumWidth(expanded_width)
+            self._control_wrapper.setMaximumWidth(16777215)
+        if self.controlToggleBtn.isChecked() != collapsed:
+            with QtCore.QSignalBlocker(self.controlToggleBtn):
+                self.controlToggleBtn.setChecked(collapsed)
+        self._update_control_toggle_icon(collapsed)
+        if self._splitter is not None:
+            sizes = self._splitter.sizes()
+            total = sum(sizes)
+            if total <= 0:
+                total = max(self.width(), rail_width + 600)
+            if collapsed:
+                first = rail_width
+            else:
+                first = max(self._control_wrapper.sizeHint().width(), panel_min)
+            second = max(1, total - first)
+            self._splitter.setSizes([first, second])
+
+    def _update_control_toggle_icon(self, collapsed: bool) -> None:
+        arrow = QtCore.Qt.RightArrow if collapsed else QtCore.Qt.LeftArrow
+        self.controlToggleBtn.setArrowType(arrow)
+        self.controlToggleBtn.setToolTip("Expand controls" if collapsed else "Collapse controls")
+
+    def _on_theme_changed(self, index: int) -> None:
+        data = self.themeCombo.itemData(index)
+        if not data:
+            return
+        self._apply_theme(str(data), persist=True)
+
+    def _apply_theme(self, key: str, *, persist: bool) -> None:
+        resolved_key = key if key in THEMES else DEFAULT_THEME
+        theme = THEMES.get(resolved_key, THEMES[DEFAULT_THEME])
+        self._active_theme_key = resolved_key
+        self._theme = theme
+
+        if hasattr(self, "themeCombo"):
+            idx = self.themeCombo.findData(resolved_key)
+            if idx >= 0 and self.themeCombo.currentIndex() != idx:
+                with QtCore.QSignalBlocker(self.themeCombo):
+                    self.themeCombo.setCurrentIndex(idx)
+
+        self._config.theme = resolved_key
+
+        pg.setConfigOption("background", theme.pg_background)
+        pg.setConfigOption("foreground", theme.pg_foreground)
+
+        self.setStyleSheet(theme.stylesheet)
+        self.plotLayout.setBackground(theme.pg_background)
+        for plot in self.plots:
+            for axis_name in ("bottom", "left"):
+                axis = plot.getAxis(axis_name)
+                if axis is not None:
+                    pen = pg.mkPen(theme.pg_foreground)
+                    axis.setPen(pen)
+                    axis.setTextPen(theme.pg_foreground)
+
+        self.time_axis.setPen(pg.mkPen(theme.pg_foreground))
+        self.time_axis.setTextPen(theme.pg_foreground)
+
+        if self.stage_plot is not None:
+            for axis_name in ("left", "bottom"):
+                axis = self.stage_plot.getAxis(axis_name)
+                if axis is not None:
+                    pen = pg.mkPen(theme.pg_foreground)
+                    axis.setPen(pen)
+                    axis.setTextPen(theme.pg_foreground)
+        if self._stage_curve is not None:
+            self._stage_curve.setPen(pg.mkPen(theme.stage_curve_color, width=2))
+
+        self._apply_curve_pens()
+        self._refresh_channel_label_styles()
+        self._update_stage_label_style()
+        self._update_theme_preview(resolved_key)
+
+        if persist:
+            self._write_persistent_state()
+
+    def _curve_color(self, idx: int) -> str:
+        colors = self._theme.curve_colors or ("#5f8bff",)
+        return colors[idx % len(colors)]
+
+    def _apply_curve_pens(self) -> None:
+        for idx, curve in enumerate(self.curves):
+            color = self._curve_color(idx)
+            curve.setPen(pg.mkPen(color, width=1.2))
+
+    def _refresh_channel_label_styles(self) -> None:
+        if not self.channel_labels:
+            return
+        n = self.loader.n_channels
+        for idx, label_item in enumerate(self.channel_labels):
+            if idx >= n:
+                continue
+            meta = self.loader.info[idx]
+            hidden = idx in self._hidden_channels
+            label_item.setText(self._format_label(meta, hidden=hidden))
+
+    def _update_stage_label_style(self) -> None:
+        if self._stage_label_item is not None:
+            self._stage_label_item.setText(self._stage_label_markup())
+
+    def _stage_label_markup(self) -> str:
+        color = getattr(self._theme, "channel_label_active", "#ffffff")
+        return (
+            "<span style='color:" + color + ";font-weight:600;font-size:11pt;padding-right:12px;'>Stage</span>"
+        )
+
+    def _update_theme_preview(self, key: str) -> None:
+        if not hasattr(self, "themePreviewWidget"):
+            return
+        layout = self.themePreviewWidget.layout()
+        if layout is None:
+            return
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        theme = THEMES.get(key, THEMES[DEFAULT_THEME])
+        colors = theme.preview_colors or theme.curve_colors[:3]
+        for color in colors:
+            swatch = QtWidgets.QFrame()
+            swatch.setFixedSize(18, 18)
+            swatch.setStyleSheet(
+                "QFrame { background-color: %s; border: 1px solid rgba(0, 0, 0, 70); border-radius: 4px; }"
+                % color
+            )
+            layout.addWidget(swatch)
+        layout.addStretch(1)
+        self.themePreviewWidget.setVisible(bool(colors))
 
     def _init_overscan_worker(self):
         self._shutdown_overscan_worker()
@@ -594,6 +925,9 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self._current_tile_id = None
             for i in range(self.loader.n_channels):
+                if i in self._hidden_channels:
+                    self.curves[i].setData([], [])
+                    continue
                 t, x = self.loader.read(i, t0, t1)
                 if pixels and x.size > pixels * 2:
                     t, x = min_max_bins(t, x, pixels)
@@ -796,9 +1130,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self._pending_loader = None
 
         old_loader = self.loader
+        carried_annotations = None
+        if hasattr(old_loader, "annotations"):
+            try:
+                carried = old_loader.annotations()
+            except Exception:
+                carried = None
+            else:
+                if carried and getattr(carried, "size", 0):
+                    carried_annotations = carried
         self.loader = pending
         if isinstance(self.loader, ZarrLoader):
             setattr(self.loader, "max_window_s", self.loader.duration_s)
+            if carried_annotations is not None:
+                try:
+                    self.loader.set_annotations(carried_annotations)
+                except Exception:
+                    pass
         self._update_limits_from_loader()
         self._view_start, self._view_duration = clamp_window(
             self._view_start,
@@ -873,13 +1221,17 @@ class MainWindow(QtWidgets.QMainWindow):
         max_mb = max_mb_val if max_mb_val > 0 else None
         self._config.prefetch_tile_s = tile
         self._config.prefetch_max_tiles = max_tiles
-        self._config.prefetch_max_mb = max_mb_val if max_mb_val > 0 else None
+        self._config.prefetch_max_mb = max_mb
         prefetch_service.configure(tile_duration=tile, max_tiles=max_tiles, max_mb=max_mb)
         if self._prefetch is not None:
             self._prefetch.stop()
         self._prefetch = prefetch_service.create_cache(self._fetch_tile)
         self._prefetch.start()
         self._schedule_prefetch()
+        self._config.save()
+
+    def _on_prefetch_section_toggled(self, expanded: bool) -> None:
+        self._config.prefetch_collapsed = not expanded
         self._config.save()
 
     def _on_annotation_toggle(self, checked: bool):
@@ -889,9 +1241,29 @@ class MainWindow(QtWidgets.QMainWindow):
             min(self.loader.duration_s, self._view_start + self._view_duration),
         )
 
+    def _on_annotation_focus_only_changed(self, checked: bool):
+        self._write_persistent_state()
+        self._update_annotation_overlays(
+            self._view_start,
+            min(self.loader.duration_s, self._view_start + self._view_duration),
+        )
+
+    def _write_persistent_state(self) -> None:
+        if not hasattr(self, "annotationFocusOnly"):
+            return
+        self._config.annotation_focus_only = bool(self.annotationFocusOnly.isChecked())
+        if hasattr(self, "themeCombo"):
+            data = self.themeCombo.currentData()
+            if isinstance(data, str):
+                self._config.theme = data
+        self._config.controls_collapsed = bool(self._controls_collapsed)
+        self._config.save()
+
     def _schedule_prefetch(self):
         total = self.loader.duration_s
         for ch in range(self.loader.n_channels):
+            if ch in self._hidden_channels:
+                continue
             start = max(0.0, self._view_start - self._view_duration)
             start = min(start, total)
             duration = min(self._view_duration * 3, max(0.0, total - start))
@@ -922,6 +1294,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _schedule_prefetch(self):
         for ch in range(self.loader.n_channels):
+            if ch in self._hidden_channels:
+                continue
             start = max(0.0, self._view_start - self._view_duration)
             duration = self._view_duration * 3
             self._prefetch.prefetch_window(ch, start, duration)
@@ -1015,6 +1389,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _load_companion_annotations(self):
         self._annotations_index = None
         self.annotationToggle.setEnabled(False)
+        self.annotationFocusOnly.setEnabled(False)
         self._annotations_enabled = False
         self.stageSummaryLabel.setText("Stage: --")
         self._clear_annotation_lines()
@@ -1031,6 +1406,16 @@ class MainWindow(QtWidgets.QMainWindow):
         found = annotation_core.discover_annotation_files(path)
         found.update(self._manual_annotation_paths)
         start_dt = getattr(getattr(self.loader, "timebase", None), "start_dt", None)
+
+        loader_ann: annotation_core.Annotations | None = None
+        if hasattr(self.loader, "annotations"):
+            try:
+                loader_ann = self.loader.annotations()
+            except Exception as exc:  # pragma: no cover - defensive logging
+                LOG.warning("Failed to load EDF+ annotations: %s", exc)
+            else:
+                if loader_ann.size:
+                    ann_sets.append(loader_ann)
 
         events_path = found.get("events")
         if events_path:
@@ -1055,6 +1440,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._annotations_index = annotation_core.AnnotationIndex(ann_sets)
         self.annotationToggle.setEnabled(True)
         self._annotations_enabled = self.annotationToggle.isChecked()
+        self._rebuild_all_event_records()
+        self._update_event_channel_options()
+        self._reset_event_filters()
         self._populate_event_list()
         self._update_annotation_summary()
         self._update_stage_plot_data()
@@ -1144,12 +1532,69 @@ class MainWindow(QtWidgets.QMainWindow):
         self._manual_annotation_paths[key] = path_obj
         self._load_companion_annotations()
 
-    def _update_annotation_summary(self):
-        total_events = len(self._event_records)
-        if not self._annotations_index or self._annotations_index.is_empty():
-            self.stageSummaryLabel.setText(f"Stage: -- | Events: {total_events}")
+    def _schedule_event_filter_refresh(self):
+        if self._event_filter_timer.isActive():
+            self._event_filter_timer.stop()
+        self._event_filter_timer.start()
+
+    def _apply_event_filters(self):
+        self._populate_event_list()
+
+    def _on_event_channel_changed(self):
+        data = self.eventChannelFilter.currentData()
+        self._selected_event_channel = str(data) if data else None
+        self._schedule_event_filter_refresh()
+
+    def _on_event_search_changed(self, text: str):
+        normalized = text.strip().lower()
+        if normalized == self._event_label_filter:
             return
-        self.stageSummaryLabel.setText(f"Stage: -- | Events: {total_events}")
+        self._event_label_filter = normalized
+        self._schedule_event_filter_refresh()
+
+    def _reset_event_filters(self):
+        if self._event_filter_timer.isActive():
+            self._event_filter_timer.stop()
+        self._selected_event_channel = None
+        self._event_label_filter = ""
+        self.eventChannelFilter.blockSignals(True)
+        self.eventChannelFilter.setCurrentIndex(0)
+        self.eventChannelFilter.blockSignals(False)
+        self.eventSearchEdit.blockSignals(True)
+        self.eventSearchEdit.clear()
+        self.eventSearchEdit.blockSignals(False)
+
+    def _update_event_channel_options(self):
+        channels = sorted({str(rec["chan"]) for rec in self._all_event_records if rec.get("chan")})
+        current = self._selected_event_channel
+        self.eventChannelFilter.blockSignals(True)
+        self.eventChannelFilter.clear()
+        self.eventChannelFilter.addItem("All channels", userData=None)
+        for chan in channels:
+            self.eventChannelFilter.addItem(chan, userData=chan)
+        if current and current in channels:
+            index = self.eventChannelFilter.findData(current)
+            if index >= 0:
+                self.eventChannelFilter.setCurrentIndex(index)
+            else:
+                self.eventChannelFilter.setCurrentIndex(0)
+                self._selected_event_channel = None
+        else:
+            self.eventChannelFilter.setCurrentIndex(0)
+            self._selected_event_channel = None
+        self.eventChannelFilter.setEnabled(bool(self._all_event_records))
+        self.eventChannelFilter.blockSignals(False)
+
+    def _event_count_summary(self) -> str:
+        total = len(self._all_event_records)
+        filtered = len(self._event_records)
+        if total and filtered != total:
+            return f"Events: {filtered}/{total}"
+        return f"Events: {filtered}"
+
+    def _update_annotation_summary(self):
+        summary = self._event_count_summary()
+        self.stageSummaryLabel.setText(f"Stage: -- | {summary}")
 
     def _ensure_annotation_line_pool(self, count: int):
         if not self._primary_plot:
@@ -1180,17 +1625,9 @@ class MainWindow(QtWidgets.QMainWindow):
         for rect in self._annotation_rects:
             rect.setVisible(False)
 
-    def _populate_event_list(self, clear: bool = False):
-        self.eventList.blockSignals(True)
-        self.eventList.clear()
-        if clear or not self._annotations_index or self._annotations_index.is_empty():
-            self.eventList.setEnabled(False)
-            self.eventPrevBtn.setEnabled(False)
-            self.eventNextBtn.setEnabled(False)
-            self._event_records = []
-            self._current_event_index = -1
-            self._current_event_id = None
-            self.eventList.blockSignals(False)
+    def _rebuild_all_event_records(self):
+        self._all_event_records = []
+        if not self._annotations_index or self._annotations_index.is_empty():
             return
 
         duration = getattr(self.loader, "duration_s", 0.0)
@@ -1200,21 +1637,18 @@ class MainWindow(QtWidgets.QMainWindow):
             channels=None,
             return_indices=True,
         )
+
         data = np.array(events, copy=False)
         ids = np.asarray(ids, dtype=int)
-        if data.size == 0:
-            self.eventList.setEnabled(False)
-            self.eventPrevBtn.setEnabled(False)
-            self.eventNextBtn.setEnabled(False)
-            self._event_records = []
-            self._current_event_index = -1
-            self._current_event_id = None
-            self.eventList.blockSignals(False)
+        if data.size == 0 or ids.size == 0:
             return
 
         mask = np.array([str(chan) != "stage" for chan in data["chan"]], dtype=bool)
         data = data[mask]
         ids = ids[mask]
+        if data.size == 0:
+            return
+
         records: list[dict[str, float | str | int]] = []
         for entry, idx in zip(data, ids):
             start = float(entry["start_s"])
@@ -1229,14 +1663,75 @@ class MainWindow(QtWidgets.QMainWindow):
                 }
             )
 
-        records.sort(key=lambda r: r["start"])
-        self._event_records = records
-        total = len(records)
+        records.sort(key=lambda r: (r["start"], r["end"], r["label"]))
+        self._all_event_records = records
+
+    def _populate_event_list(self, clear: bool = False):
+        self.eventList.blockSignals(True)
+        self.eventList.clear()
+        if clear or not self._annotations_index or self._annotations_index.is_empty():
+            self.eventList.setEnabled(False)
+            self.eventPrevBtn.setEnabled(False)
+            self.eventNextBtn.setEnabled(False)
+            self.annotationFocusOnly.setEnabled(False)
+            self._all_event_records = []
+            self._event_records = []
+            self._current_event_index = -1
+            self._current_event_id = None
+            self.eventChannelFilter.blockSignals(True)
+            self.eventChannelFilter.clear()
+            self.eventChannelFilter.addItem("All channels", userData=None)
+            self.eventChannelFilter.setEnabled(False)
+            self.eventChannelFilter.blockSignals(False)
+            self.eventSearchEdit.blockSignals(True)
+            self.eventSearchEdit.clear()
+            self.eventSearchEdit.setEnabled(False)
+            self.eventSearchEdit.blockSignals(False)
+            self.eventList.blockSignals(False)
+            self._update_annotation_summary()
+            return
+
+        if not self._all_event_records:
+            self.eventList.setEnabled(False)
+            self.eventPrevBtn.setEnabled(False)
+            self.eventNextBtn.setEnabled(False)
+            self.annotationFocusOnly.setEnabled(False)
+            self._event_records = []
+            self._current_event_index = -1
+            self._current_event_id = None
+            self.eventChannelFilter.setEnabled(False)
+            self.eventSearchEdit.setEnabled(False)
+            self.eventList.blockSignals(False)
+            self._update_annotation_summary()
+            return
+
+        channel_filter = self._selected_event_channel
+        label_filter = self._event_label_filter
+        previous_id = self._current_event_id
+        filtered: list[dict[str, float | str | int]] = []
+        restored_index = -1
+        for record in self._all_event_records:
+            if channel_filter and str(record.get("chan")) != channel_filter:
+                continue
+            if label_filter:
+                label = str(record.get("label", "")).lower()
+                if label_filter not in label:
+                    continue
+            idx = len(filtered)
+            filtered.append(record)
+            if previous_id is not None and int(record.get("id", -1)) == previous_id:
+                restored_index = idx
+
+        self._event_records = filtered
+        total = len(filtered)
         self.eventList.setEnabled(total > 0)
         self.eventPrevBtn.setEnabled(total > 0)
         self.eventNextBtn.setEnabled(total > 0)
+        self.annotationFocusOnly.setEnabled(total > 0)
+        self.eventSearchEdit.setEnabled(bool(self._all_event_records))
+        self.eventChannelFilter.setEnabled(bool(self._all_event_records))
 
-        for rec in records:
+        for rec in filtered:
             label = rec["label"]
             chan = rec["chan"]
             ts = self._format_clock(rec["start"])
@@ -1246,9 +1741,14 @@ class MainWindow(QtWidgets.QMainWindow):
             item.setData(QtCore.Qt.UserRole, rec)
             self.eventList.addItem(item)
 
-        self._current_event_index = -1
-        self._current_event_id = None
-        self.eventList.clearSelection()
+        if restored_index >= 0:
+            self.eventList.setCurrentRow(restored_index)
+            self._current_event_index = restored_index
+            self._current_event_id = previous_id
+        else:
+            self._current_event_index = -1
+            self._current_event_id = None
+            self.eventList.clearSelection()
         self.eventList.blockSignals(False)
         self._update_annotation_summary()
 
@@ -1318,8 +1818,8 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         if not self._annotations_index or not self._annotations_enabled:
             self._clear_annotation_lines()
-            if self._annotations_index is None:
-                self.stageSummaryLabel.setText("Stage: --")
+            summary = self._event_count_summary()
+            self.stageSummaryLabel.setText(f"Stage: -- | {summary}")
             return
 
         for line in self._annotation_lines:
@@ -1333,14 +1833,25 @@ class MainWindow(QtWidgets.QMainWindow):
             return_indices=True,
         )
 
+        focus_only_checkbox = getattr(self, "annotationFocusOnly", None)
+        focus_only = bool(focus_only_checkbox and focus_only_checkbox.isChecked())
+        selected_id = self._current_event_id
+
         events = np.array(events, copy=False)
         ids = np.asarray(ids, dtype=int)
+        if focus_only:
+            if selected_id is None or ids.size == 0:
+                mask = np.zeros_like(ids, dtype=bool)
+            else:
+                mask = ids == int(selected_id)
+            events = events[mask]
+            ids = ids[mask]
+
         self._clear_annotation_rects()
         if events.size:
             self._ensure_annotation_rect_pool(len(events))
             scene_rect = self.plotLayout.ci.mapRectToScene(self.plotLayout.ci.boundingRect())
             vb = self._primary_plot.getViewBox()
-            selected_id = self._current_event_id
             for idx, (ev, ev_id) in enumerate(zip(events, ids)):
                 start = float(ev["start_s"])
                 end = float(ev["end_s"])
@@ -1365,13 +1876,18 @@ class MainWindow(QtWidgets.QMainWindow):
         stage_events = self._annotations_index.between(t0, t1, channels=["stage"])
         if isinstance(stage_events, tuple):
             stage_events = stage_events[0]
-        total_events = len(self._event_records)
+        summary = self._event_count_summary()
+        include_summary = (not focus_only) or bool(events.size)
         if stage_events.size:
             counts = Counter(stage_events["label"])
             dominant, count = counts.most_common(1)[0]
-            self.stageSummaryLabel.setText(f"Stage: {dominant} ({count}) | Events: {total_events}")
+            text = f"Stage: {dominant} ({count})"
         else:
-            self.stageSummaryLabel.setText(f"Stage: -- | Events: {total_events}")
+            text = "Stage: --"
+
+        if include_summary and summary:
+            text = f"{text} | {summary}"
+        self.stageSummaryLabel.setText(text)
 
     def _prepare_tile(self, tile: _OverscanTile) -> bool:
         pixels = self._estimate_pixels() or 0
@@ -1391,6 +1907,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._prepare_tile(tile)
         for idx, (t_arr, x_arr) in enumerate(tile.channel_data):
             if idx < len(self.curves):
+                if idx in self._hidden_channels:
+                    self.curves[idx].setData([], [])
+                    continue
                 self.curves[idx].setData(t_arr, x_arr)
         self._current_tile_id = tile.request_id
 
@@ -1502,7 +2021,8 @@ class MainWindow(QtWidgets.QMainWindow):
             plot.setMenuEnabled(False)
             plot.setMouseEnabled(x=True, y=False)
             plot.showGrid(x=False, y=True, alpha=0.15)
-            curve = plot.plot([], [], pen=pg.mkPen(pg.intColor(idx, values=220), width=1.2))
+            curve_color = self._curve_color(idx)
+            curve = plot.plot([], [], pen=pg.mkPen(curve_color, width=1.2))
             curve.setClipToView(True)
             curve.setDownsampling(auto=True, method="peak")
 
@@ -1514,6 +2034,10 @@ class MainWindow(QtWidgets.QMainWindow):
         old_primary = self._primary_plot
         self._ensure_plot_rows(n)
 
+        # Trim hidden channels to valid range
+        self._hidden_channels = {idx for idx in self._hidden_channels if 0 <= idx < n}
+        self._sync_channel_controls()
+
         # Reset previous primary axis if needed
         if self._primary_plot and self._primary_plot not in self.plots[:n]:
             self._primary_plot.setAxisItems({"bottom": pg.AxisItem(orientation="bottom")})
@@ -1524,15 +2048,20 @@ class MainWindow(QtWidgets.QMainWindow):
             if not active:
                 plot.hide()
                 self.channel_labels[idx].setText("")
+                self.channel_labels[idx].setVisible(False)
                 self.curves[idx].setData([], [])
                 continue
 
-            plot.show()
             meta = self.loader.info[idx]
-            self.channel_labels[idx].setText(self._format_label(meta))
+            visible = idx not in self._hidden_channels
+            self._apply_channel_visible(
+                idx,
+                visible,
+                sync_checkbox=False,
+                persist=False,
+            )
 
-            pen = pg.mkPen(pg.intColor(idx, hues=max(1, n), values=220), width=1.2)
-            self.curves[idx].setPen(pen)
+            self.curves[idx].setPen(pg.mkPen(self._curve_color(idx), width=1.2))
 
         if n == 0:
             self._primary_plot = None
@@ -1574,12 +2103,106 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._ensure_stage_plot()
 
-    @staticmethod
-    def _format_label(meta) -> str:
+    def _sync_channel_controls(self) -> None:
+        if not hasattr(self, "channelSection"):
+            return
+        n = self.loader.n_channels
+        self.channelSection.setVisible(n > 0)
+        layout = getattr(self, "_channel_list_layout", None)
+        if layout is None:
+            return
+
+        while len(self.channel_checkboxes) < n:
+            checkbox = QtWidgets.QCheckBox()
+            checkbox.setCursor(QtCore.Qt.PointingHandCursor)
+            idx = len(self.channel_checkboxes)
+            checkbox.toggled.connect(partial(self._on_channel_checkbox_toggled, idx))
+            layout.insertWidget(max(0, layout.count() - 1), checkbox)
+            self.channel_checkboxes.append(checkbox)
+
+        while len(self.channel_checkboxes) > n:
+            checkbox = self.channel_checkboxes.pop()
+            checkbox.hide()
+            checkbox.deleteLater()
+
+        hidden = self._hidden_channels
+        for idx, checkbox in enumerate(self.channel_checkboxes):
+            meta = self.loader.info[idx]
+            label = meta.name
+            if getattr(meta, "unit", ""):
+                label = f"{label} [{meta.unit}]"
+            checkbox.blockSignals(True)
+            checkbox.setText(label)
+            checkbox.setChecked(idx not in hidden)
+            checkbox.blockSignals(False)
+
+    def _apply_channel_visible(
+        self,
+        idx: int,
+        visible: bool,
+        *,
+        sync_checkbox: bool,
+        persist: bool,
+    ) -> None:
+        if idx >= len(self.plots):
+            return
+
+        n = self.loader.n_channels
+        plot = self.plots[idx]
+        label_item = self.channel_labels[idx]
+        curve = self.curves[idx]
+        meta = self.loader.info[idx] if idx < n else None
+
+        if idx >= n:
+            plot.hide()
+            label_item.setVisible(False)
+            curve.setData([], [])
+            self._hidden_channels.discard(idx)
+            return
+
+        if visible:
+            plot.show()
+            self._hidden_channels.discard(idx)
+        else:
+            plot.hide()
+            self._hidden_channels.add(idx)
+            curve.setData([], [])
+
+        if meta is not None:
+            label_item.setVisible(visible)
+            label_item.setText(self._format_label(meta, hidden=not visible))
+
+        if sync_checkbox and idx < len(self.channel_checkboxes):
+            checkbox = self.channel_checkboxes[idx]
+            checkbox.blockSignals(True)
+            checkbox.setChecked(visible)
+            checkbox.blockSignals(False)
+
+        if persist:
+            self._config.hidden_channels = tuple(sorted(self._hidden_channels))
+            self._config.save()
+
+    def _on_channel_checkbox_toggled(self, idx: int, checked: bool) -> None:
+        self._set_channel_visible(idx, bool(checked))
+
+    @QtCore.Slot(int, bool)
+    def _set_channel_visible(self, idx: int, visible: bool) -> None:
+        self._apply_channel_visible(idx, bool(visible), sync_checkbox=True, persist=True)
+        self.refresh()
+
+    def _format_label(self, meta, *, hidden: bool = False) -> str:
         unit = f" [{meta.unit}]" if getattr(meta, "unit", "") else ""
         text = f"{meta.name}{unit}"
+        theme = getattr(self, "_theme", THEMES[DEFAULT_THEME])
+        if hidden:
+            color = theme.channel_label_hidden
+            extra = "font-style: italic; opacity:0.7;"
+            text = f"{text} (hidden)"
+        else:
+            color = theme.channel_label_active
+            extra = "font-weight:600;"
         return (
-            "<span style='color:#dfe7ff;font-weight:600;font-size:11pt;padding-right:12px;'>"
+            "<span style='color:" + color + ";" + extra + "font-size:11pt;padding-right:12px;'>"
             f"{text}"
             "</span>"
         )
@@ -1590,6 +2213,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._stage_label_item = self.plotLayout.addLabel(
                 row=row, col=0, text="Stage", justify="right"
             )
+            self._stage_label_item.setText(self._stage_label_markup())
             plot = self.plotLayout.addPlot(row=row, col=1)
             plot.setMaximumHeight(90)
             plot.setMenuEnabled(False)
@@ -1608,8 +2232,16 @@ class MainWindow(QtWidgets.QMainWindow):
             plot.setYRange(-0.5, 4.5)
             plot.getAxis("left").setTicks([ticks])
             plot.showAxis("bottom", show=True)
+            for axis_name in ("left", "bottom"):
+                axis = plot.getAxis(axis_name)
+                if axis is not None:
+                    pen = pg.mkPen(self._theme.pg_foreground)
+                    axis.setPen(pen)
+                    axis.setTextPen(self._theme.pg_foreground)
             self.stage_plot = plot
-            self._stage_curve = plot.plot([], [], stepMode=True, fillLevel=None, pen=pg.mkPen("#5f8bff", width=2))
+            self._stage_curve = plot.plot(
+                [], [], stepMode=True, fillLevel=None, pen=pg.mkPen(self._theme.stage_curve_color, width=2)
+            )
 
         if self._primary_plot is not None and self.stage_plot is not None:
             self.stage_plot.setXLink(self._primary_plot)

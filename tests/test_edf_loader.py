@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 import core.edf_loader as edf_module
+import core.annotations as annotations_module
 
 
 class FakeEdfReader:
@@ -14,14 +15,15 @@ class FakeEdfReader:
         self.path = path
         self.file_duration = 5.0
         self._start = datetime(2024, 1, 1, 0, 0, 0)
-        self.signals_in_file = 2
-        self._labels = ["chan_a", "chan_b"]
-        self._fs = [100.0, 50.0]
+        self.signals_in_file = 3
+        self._labels = ["chan_a", "chan_b", "EDF Annotations"]
+        self._fs = [100.0, 50.0, 0.0]
         self._data = [
             np.arange(int(self._fs[0] * self.file_duration), dtype=np.float64) / self._fs[0],
             np.linspace(-1.0, 1.0, int(self._fs[1] * self.file_duration), endpoint=False, dtype=np.float64),
+            np.zeros(0, dtype=np.float64),
         ]
-        self._units = ["uV", "a.u."]
+        self._units = ["uV", "a.u.", ""]
         self._closed = False
         self._read_signal_calls = 0
         self._read_digital_calls = 0
@@ -31,11 +33,19 @@ class FakeEdfReader:
         self._digital_max = []
         self._physical_min = []
         self._physical_max = []
-        self._slope = [0.01, 0.02]
-        self._offset = [0.0, -1.0]
+        self._slope = [0.01, 0.02, 1.0]
+        self._offset = [0.0, -1.0, 0.0]
         for idx, arr in enumerate(self._data):
             slope = self._slope[idx]
             offset = self._offset[idx]
+            if arr.size == 0:
+                digital = np.zeros(0, dtype=np.int16)
+                self._digital.append(digital)
+                self._digital_min.append(0)
+                self._digital_max.append(0)
+                self._physical_min.append(0.0)
+                self._physical_max.append(0.0)
+                continue
             digital = np.round((arr - offset) / slope).astype(np.int16)
             self._digital.append(digital)
             self._digital_min.append(int(digital.min()))
@@ -120,6 +130,8 @@ def test_loader_metadata_and_timebase():
         assert loader.fs(0) == 100.0
         assert loader.timebase.duration_s == 5.0
         assert loader.timebase.start_dt == loader.start_dt
+        assert loader.info[0].raw_index == 0
+        assert loader.info[1].raw_index == 1
     finally:
         loader.close()
 
@@ -161,9 +173,14 @@ def test_read_after_end_returns_empty():
     assert x.size == 0
 
 
-def test_read_annotations_passthrough():
+def test_read_annotations_from_edfplus():
     loader = edf_module.EdfLoader("dummy.edf")
     try:
+        annotations = loader.annotations()
+        assert isinstance(annotations, annotations_module.Annotations)
+        assert annotations.size == 2
+        assert annotations.data["start_s"].tolist() == [0.0, 2.5]
+        assert loader.annotations() is annotations
         onsets, durations, labels = loader.read_annotations()
     finally:
         loader.close()
