@@ -164,8 +164,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._primary_viewbox = None
         self._splitter: QtWidgets.QSplitter | None = None
         self._control_wrapper: QtWidgets.QWidget | None = None
-        self._sidebar_stack: QtWidgets.QStackedWidget | None = None
-        self.sidebarList: QtWidgets.QListWidget | None = None
+        self._control_scroll: QtWidgets.QScrollArea | None = None
+        self._control_rail: QtWidgets.QWidget | None = None
         self._limits = WindowLimits(
             duration_min=0.25,
             duration_max=float(getattr(loader, "max_window_s", 120.0)),
@@ -313,6 +313,32 @@ class MainWindow(QtWidgets.QMainWindow):
         self.eventNextBtn = QtWidgets.QPushButton("Next")
         self.eventNextBtn.setEnabled(False)
 
+        control = QtWidgets.QFrame()
+        control.setObjectName("controlPanel")
+        control.setMinimumWidth(200)
+        control.setSizePolicy(
+            QtWidgets.QSizePolicy.Preferred,
+            QtWidgets.QSizePolicy.Expanding,
+        )
+        controlLayout = QtWidgets.QVBoxLayout(control)
+        controlLayout.setContentsMargins(18, 18, 18, 18)
+        controlLayout.setSpacing(14)
+
+        self.panelCollapseBtn = QtWidgets.QToolButton()
+        self.panelCollapseBtn.setObjectName("panelCollapseBtn")
+        self.panelCollapseBtn.setAutoRaise(True)
+        self.panelCollapseBtn.setToolButtonStyle(QtCore.Qt.ToolButtonIconOnly)
+        self.panelCollapseBtn.setArrowType(QtCore.Qt.LeftArrow)
+        self.panelCollapseBtn.setCursor(QtCore.Qt.PointingHandCursor)
+        self.panelCollapseBtn.setToolTip("Collapse controls")
+        headerLayout = QtWidgets.QHBoxLayout()
+        headerLayout.setContentsMargins(0, 0, 0, 0)
+        headerLayout.setSpacing(6)
+        headerLayout.addStretch(1)
+        headerLayout.addWidget(self.panelCollapseBtn)
+        controlLayout.addLayout(headerLayout)
+        self.controlPanel = control
+
         navLayout = QtWidgets.QHBoxLayout()
         navLayout.setSpacing(6)
         self.panLeftBtn = QtWidgets.QToolButton()
@@ -340,21 +366,22 @@ class MainWindow(QtWidgets.QMainWindow):
         form.addWidget(QtWidgets.QLabel("Duration"), 1, 0)
         form.addWidget(self.windowSpin, 1, 1)
 
+        self.fileButton = QtWidgets.QPushButton("Open EDF…")
+        self.fileButton.setObjectName("fileSelectButton")
+        self.fileButton.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_DialogOpenButton))
+        self.fileButton.setCursor(QtCore.Qt.PointingHandCursor)
+
         primaryControls = QtWidgets.QGroupBox("Viewing Controls")
         primaryControls.setObjectName("primaryControls")
         primaryLayout = QtWidgets.QVBoxLayout(primaryControls)
         primaryLayout.setContentsMargins(14, 16, 14, 12)
         primaryLayout.setSpacing(12)
         primaryLayout.addLayout(navLayout)
+        fileRow = QtWidgets.QHBoxLayout()
+        fileRow.addWidget(self.fileButton)
+        fileRow.addStretch(1)
+        primaryLayout.addLayout(fileRow)
         primaryLayout.addLayout(form)
-
-        self.fileButton = QtWidgets.QPushButton("Open EDF…")
-        self.fileButton.setObjectName("fileSelectButton")
-        self.fileButton.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_DialogOpenButton))
-        self.fileButton.setCursor(QtCore.Qt.PointingHandCursor)
-        self.exportButton = QtWidgets.QPushButton("Export…")
-        self.exportButton.setObjectName("exportButton")
-        self.exportButton.setCursor(QtCore.Qt.PointingHandCursor)
 
         channelContent = QtWidgets.QWidget()
         channelContentLayout = QtWidgets.QVBoxLayout(channelContent)
@@ -400,6 +427,12 @@ class MainWindow(QtWidgets.QMainWindow):
         eventNav.addWidget(self.eventNextBtn)
         annotationLayout.addLayout(eventNav)
 
+        controlLayout.addWidget(primaryControls)
+        controlLayout.addWidget(self.channelSection)
+        controlLayout.addWidget(telemetryBar)
+        controlLayout.addWidget(self.sourceLabel)
+        controlLayout.addWidget(annotationSection)
+
         self._annotation_channel_toggles = {
             annotation_core.STAGE_CHANNEL: self.annotationStageToggle,
             annotation_core.POSITION_CHANNEL: self.annotationPositionToggle,
@@ -439,6 +472,7 @@ class MainWindow(QtWidgets.QMainWindow):
             expanded=False,
         )
         self.appearanceSection.setObjectName("appearanceSection")
+        controlLayout.addWidget(self.appearanceSection)
 
         prefetchContent = QtWidgets.QWidget()
         prefetchLayout = QtWidgets.QGridLayout(prefetchContent)
@@ -470,6 +504,7 @@ class MainWindow(QtWidgets.QMainWindow):
             expanded=not getattr(self._config, "prefetch_collapsed", False),
         )
         self.prefetchSection.setObjectName("prefetchSection")
+        controlLayout.addWidget(self.prefetchSection)
         self.ingestBar = QtWidgets.QProgressBar()
         self.ingestBar.setObjectName("ingestBar")
         self.ingestBar.setRange(0, 100)
@@ -477,77 +512,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ingestBar.setFormat("Caching EDF → Zarr: %p%")
         self.ingestBar.setTextVisible(True)
         self.ingestBar.hide()
-
-        viewingPage = QtWidgets.QWidget()
-        viewingLayout = QtWidgets.QVBoxLayout(viewingPage)
-        viewingLayout.setContentsMargins(18, 18, 18, 18)
-        viewingLayout.setSpacing(14)
-        viewingLayout.addWidget(primaryControls)
-        viewingLayout.addWidget(telemetryBar)
-        viewingLayout.addWidget(self.sourceLabel)
-        viewingLayout.addStretch(1)
-
-        channelsPage = QtWidgets.QWidget()
-        channelsLayout = QtWidgets.QVBoxLayout(channelsPage)
-        channelsLayout.setContentsMargins(18, 18, 18, 18)
-        channelsLayout.setSpacing(14)
-        channelsLayout.addWidget(self.channelSection)
-        channelsLayout.addStretch(1)
-
-        annotationsPage = QtWidgets.QWidget()
-        annotationsLayout = QtWidgets.QVBoxLayout(annotationsPage)
-        annotationsLayout.setContentsMargins(18, 18, 18, 18)
-        annotationsLayout.setSpacing(14)
-        annotationsLayout.addWidget(annotationSection)
-        annotationsLayout.addStretch(1)
-
-        appearancePage = QtWidgets.QWidget()
-        appearancePageLayout = QtWidgets.QVBoxLayout(appearancePage)
-        appearancePageLayout.setContentsMargins(18, 18, 18, 18)
-        appearancePageLayout.setSpacing(14)
-        appearancePageLayout.addWidget(self.appearanceSection)
-        appearancePageLayout.addStretch(1)
-
-        prefetchPage = QtWidgets.QWidget()
-        prefetchPageLayout = QtWidgets.QVBoxLayout(prefetchPage)
-        prefetchPageLayout.setContentsMargins(18, 18, 18, 18)
-        prefetchPageLayout.setSpacing(14)
-        prefetchPageLayout.addWidget(self.prefetchSection)
-        prefetchPageLayout.addWidget(self.ingestBar)
-        prefetchPageLayout.addStretch(1)
-
-        self.sidebarList = QtWidgets.QListWidget()
-        self.sidebarList.setObjectName("sidebarList")
-        self.sidebarList.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
-        self.sidebarList.addItem("Viewing")
-        self.sidebarList.addItem("Channels")
-        self.sidebarList.addItem("Annotations")
-        self.sidebarList.addItem("Appearance")
-        self.sidebarList.addItem("Prefetch")
-        self.sidebarList.setCurrentRow(0)
-
-        sidebarStack = QtWidgets.QStackedWidget()
-        sidebarStack.addWidget(viewingPage)
-        sidebarStack.addWidget(channelsPage)
-        sidebarStack.addWidget(annotationsPage)
-        sidebarStack.addWidget(appearancePage)
-        sidebarStack.addWidget(prefetchPage)
-        sidebarStack.setCurrentIndex(0)
-        self._sidebar_stack = sidebarStack
-
-        sidebarFrame = QtWidgets.QFrame()
-        sidebarFrame.setObjectName("controlPanel")
-        sidebarFrame.setMinimumWidth(220)
-        sidebarFrame.setSizePolicy(
-            QtWidgets.QSizePolicy.Preferred,
-            QtWidgets.QSizePolicy.Expanding,
-        )
-        sidebarLayout = QtWidgets.QVBoxLayout(sidebarFrame)
-        sidebarLayout.setContentsMargins(0, 0, 0, 0)
-        sidebarLayout.setSpacing(0)
-        sidebarLayout.addWidget(self.sidebarList)
-        sidebarLayout.addWidget(sidebarStack)
-        self._control_wrapper = sidebarFrame
+        controlLayout.addWidget(self.ingestBar)
+        controlLayout.addStretch(1)
 
         self.plotLayout = pg.GraphicsLayoutWidget()
         self.plotLayout.setMinimumSize(0, 0)
@@ -574,37 +540,100 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QSizePolicy.Expanding,
         )
         scroll.setWidget(self.plotLayout)
+
+        control_scroll = QtWidgets.QScrollArea()
+        control_scroll.setWidgetResizable(True)
+        control_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        control_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        control_scroll.setSizePolicy(
+            QtWidgets.QSizePolicy.Minimum,
+            QtWidgets.QSizePolicy.Expanding,
+        )
+        control_scroll.setMinimumWidth(control.minimumWidth())
+        control_scroll.setWidget(control)
+        self._control_scroll = control_scroll
+
+        self._control_rail = QtWidgets.QFrame()
+        self._control_rail.setObjectName("controlRail")
+        self._control_rail.setSizePolicy(
+            QtWidgets.QSizePolicy.Fixed,
+            QtWidgets.QSizePolicy.Expanding,
+        )
+        self._control_rail.setMinimumWidth(48)
+        self._control_rail.setMaximumWidth(48)
+        railLayout = QtWidgets.QVBoxLayout(self._control_rail)
+        railLayout.setContentsMargins(4, 8, 4, 8)
+        railLayout.setSpacing(6)
+
+        def _make_icon_button(pixmap: QtWidgets.QStyle.StandardPixmap, tooltip: str) -> QtWidgets.QToolButton:
+            btn = QtWidgets.QToolButton()
+            btn.setToolButtonStyle(QtCore.Qt.ToolButtonIconOnly)
+            btn.setIcon(self.style().standardIcon(pixmap))
+            btn.setIconSize(QtCore.QSize(20, 20))
+            btn.setAutoRaise(True)
+            btn.setCursor(QtCore.Qt.PointingHandCursor)
+            btn.setToolTip(tooltip)
+            return btn
+
+        self.railOpenBtn = _make_icon_button(QtWidgets.QStyle.SP_DialogOpenButton, "Open EDF…")
+        self.railOpenBtn.clicked.connect(self._prompt_open_file)
+        railLayout.addWidget(self.railOpenBtn)
+
+        self.railAnnotationBtn = _make_icon_button(QtWidgets.QStyle.SP_DialogYesButton, "Toggle annotations")
+        self.railAnnotationBtn.setCheckable(True)
+        self.railAnnotationBtn.setChecked(self.annotationToggle.isChecked())
+        self.railAnnotationBtn.toggled.connect(self.annotationToggle.setChecked)
+        self.annotationToggle.toggled.connect(self.railAnnotationBtn.setChecked)
+        railLayout.addWidget(self.railAnnotationBtn)
+
+        railLayout.addSpacing(12)
+
+        self.railPanLeftBtn = _make_icon_button(QtWidgets.QStyle.SP_ArrowBack, "Pan window left")
+        self.railPanLeftBtn.clicked.connect(self.panLeftBtn.click)
+        railLayout.addWidget(self.railPanLeftBtn)
+
+        self.railPanRightBtn = _make_icon_button(QtWidgets.QStyle.SP_ArrowForward, "Pan window right")
+        self.railPanRightBtn.clicked.connect(self.panRightBtn.click)
+        railLayout.addWidget(self.railPanRightBtn)
+
+        self.railZoomInBtn = _make_icon_button(QtWidgets.QStyle.SP_ArrowUp, "Zoom in")
+        self.railZoomInBtn.clicked.connect(self.zoomInBtn.click)
+        railLayout.addWidget(self.railZoomInBtn)
+
+        self.railZoomOutBtn = _make_icon_button(QtWidgets.QStyle.SP_ArrowDown, "Zoom out")
+        self.railZoomOutBtn.clicked.connect(self.zoomOutBtn.click)
+        railLayout.addWidget(self.railZoomOutBtn)
+
+        railLayout.addStretch(1)
+
+        self.controlToggleBtn = QtWidgets.QToolButton()
+        self.controlToggleBtn.setAutoRaise(True)
+        self.controlToggleBtn.setCheckable(True)
+        self.controlToggleBtn.setToolButtonStyle(QtCore.Qt.ToolButtonIconOnly)
+        self.controlToggleBtn.setCursor(QtCore.Qt.PointingHandCursor)
+        self.controlToggleBtn.setToolTip("Collapse controls")
+        railLayout.addWidget(self.controlToggleBtn)
+
+        control_wrapper = QtWidgets.QWidget()
+        wrapperLayout = QtWidgets.QHBoxLayout(control_wrapper)
+        wrapperLayout.setContentsMargins(0, 0, 0, 0)
+        wrapperLayout.setSpacing(0)
+        wrapperLayout.addWidget(self._control_rail)
+        wrapperLayout.addWidget(control_scroll)
+        self._control_wrapper = control_wrapper
+
         splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
-        splitter.addWidget(sidebarFrame)
+        splitter.addWidget(control_wrapper)
         splitter.addWidget(scroll)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setSizes([220, 980])
         self._splitter = splitter
 
-        self.controlToggleBtn = QtWidgets.QToolButton()
-        self.controlToggleBtn.setObjectName("sidebarToggleBtn")
-        self.controlToggleBtn.setAutoRaise(True)
-        self.controlToggleBtn.setCheckable(True)
-        self.controlToggleBtn.setToolButtonStyle(QtCore.Qt.ToolButtonIconOnly)
-        self.controlToggleBtn.setCursor(QtCore.Qt.PointingHandCursor)
-        self.controlToggleBtn.setToolTip("Hide controls")
-
-        header = QtWidgets.QWidget()
-        header.setObjectName("mainHeader")
-        headerLayout = QtWidgets.QHBoxLayout(header)
-        headerLayout.setContentsMargins(12, 10, 12, 10)
-        headerLayout.setSpacing(8)
-        headerLayout.addWidget(self.fileButton)
-        headerLayout.addWidget(self.exportButton)
-        headerLayout.addStretch(1)
-        headerLayout.addWidget(self.controlToggleBtn)
-
         central = QtWidgets.QWidget()
         centralLayout = QtWidgets.QVBoxLayout(central)
         centralLayout.setContentsMargins(0, 0, 0, 0)
         centralLayout.setSpacing(0)
-        centralLayout.addWidget(header)
         centralLayout.addWidget(splitter)
         self.setCentralWidget(central)
 
@@ -618,7 +647,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.startSpin.valueChanged.connect(self._on_start_spin_changed)
         self.windowSpin.valueChanged.connect(self._on_duration_spin_changed)
         self.fileButton.clicked.connect(self._prompt_open_file)
-        self.exportButton.clicked.connect(self._on_export_clicked)
         self.panLeftBtn.clicked.connect(lambda: self._pan_fraction(-0.25))
         self.panRightBtn.clicked.connect(lambda: self._pan_fraction(0.25))
         self.zoomInBtn.clicked.connect(lambda: self._zoom_factor(0.5))
@@ -638,8 +666,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.eventPrevBtn.clicked.connect(lambda: self._step_event(-1))
         self.eventNextBtn.clicked.connect(lambda: self._step_event(1))
         self.controlToggleBtn.toggled.connect(self._on_control_toggle)
-        if self.sidebarList is not None:
-            self.sidebarList.currentRowChanged.connect(self._on_sidebar_page_changed)
+        self.panelCollapseBtn.clicked.connect(
+            lambda: self._set_controls_collapsed(True, persist=True)
+        )
 
         for channel, checkbox in self._annotation_channel_toggles.items():
             if checkbox is not None:
@@ -677,52 +706,50 @@ class MainWindow(QtWidgets.QMainWindow):
             self._config.save()
 
     def _apply_control_panel_state(self, collapsed: bool) -> None:
-        if self._control_wrapper is None or self._splitter is None:
+        if self._control_wrapper is None or self._control_scroll is None or self._control_rail is None:
             return
         collapsed = bool(collapsed)
-        if self._sidebar_stack is not None:
-            self._sidebar_stack.setVisible(not collapsed)
-        if self.sidebarList is not None:
-            self.sidebarList.setVisible(not collapsed)
-        self._control_wrapper.setVisible(not collapsed)
-        panel_min = 220
+        self._control_scroll.setVisible(not collapsed)
+        rail_width = self._control_rail.sizeHint().width()
+        self._control_rail.setVisible(collapsed)
+        self.controlToggleBtn.setVisible(collapsed)
+        if self.panelCollapseBtn is not None:
+            self.panelCollapseBtn.setVisible(not collapsed)
+        panel_min = (
+            self.controlPanel.minimumWidth() if hasattr(self, "controlPanel") else 200
+        )
         if collapsed:
-            self._control_wrapper.setMinimumWidth(0)
-            self._control_wrapper.setMaximumWidth(0)
+            self._control_wrapper.setMinimumWidth(rail_width)
+            self._control_wrapper.setMaximumWidth(rail_width)
         else:
-            expanded_width = max(panel_min, self._control_wrapper.sizeHint().width())
+            scroll_hint = (
+                self._control_scroll.sizeHint().width()
+                if self._control_scroll is not None
+                else panel_min
+            )
+            expanded_width = max(panel_min, scroll_hint)
             self._control_wrapper.setMinimumWidth(expanded_width)
             self._control_wrapper.setMaximumWidth(16777215)
         if self.controlToggleBtn.isChecked() != collapsed:
             with QtCore.QSignalBlocker(self.controlToggleBtn):
                 self.controlToggleBtn.setChecked(collapsed)
         self._update_control_toggle_icon(collapsed)
-
-        sizes = self._splitter.sizes()
-        total = sum(sizes)
-        if total <= 0:
-            total = max(self.width(), panel_min + 600)
-        if collapsed:
-            self._splitter.setSizes([0, max(1, total)])
-        else:
-            panel_width = max(panel_min, self._control_wrapper.sizeHint().width())
-            second = max(1, total - panel_width)
-            self._splitter.setSizes([panel_width, second])
+        if self._splitter is not None:
+            sizes = self._splitter.sizes()
+            total = sum(sizes)
+            if total <= 0:
+                total = max(self.width(), rail_width + 600)
+            if collapsed:
+                first = rail_width
+            else:
+                first = max(self._control_wrapper.sizeHint().width(), panel_min)
+            second = max(1, total - first)
+            self._splitter.setSizes([first, second])
 
     def _update_control_toggle_icon(self, collapsed: bool) -> None:
         arrow = QtCore.Qt.RightArrow if collapsed else QtCore.Qt.LeftArrow
         self.controlToggleBtn.setArrowType(arrow)
-        self.controlToggleBtn.setToolTip("Show controls" if collapsed else "Hide controls")
-
-    def _on_sidebar_page_changed(self, index: int) -> None:
-        if self._sidebar_stack is None:
-            return
-        if index < 0 or index >= self._sidebar_stack.count():
-            return
-        self._sidebar_stack.setCurrentIndex(index)
-
-    def _on_export_clicked(self) -> None:
-        LOG.info("Export requested (placeholder)")
+        self.controlToggleBtn.setToolTip("Expand controls" if collapsed else "Collapse controls")
 
     def _on_theme_changed(self, index: int) -> None:
         data = self.themeCombo.itemData(index)
