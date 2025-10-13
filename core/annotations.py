@@ -17,6 +17,9 @@ ANNOT_DTYPE = np.dtype([
     ("chan",    "U32"),   # optional: channel name/id or "" if global
 ])
 
+STAGE_CHANNEL = "stage"
+POSITION_CHANNEL = "position"
+
 @dataclass
 class Annotations:
     """
@@ -293,7 +296,7 @@ def from_csv_stages(
                 label = stage_map.get(code, code)
             start_s = idx * epoch_length_s + offset_s
             end_s = start_s + epoch_length_s
-            records.append((start_s, end_s, label, "stage"))
+            records.append((start_s, end_s, label, STAGE_CHANNEL))
 
     if not records:
         return Annotations.empty()
@@ -308,12 +311,168 @@ def from_csv_stages(
     return Annotations(arr, meta, None)
 
 
+def _match_column(fieldnames: Iterable[str], *candidates: str) -> Optional[str]:
+    """Return the first column name matching any of the candidate labels."""
+    normalized = {}
+    for name in fieldnames:
+        if not name:
+            continue
+        key = re.sub(r"\s+", "", name).strip().lower()
+        normalized[key] = name
+
+    for candidate in candidates:
+        if not candidate:
+            continue
+        key = re.sub(r"\s+", "", candidate).strip().lower()
+        if key in normalized:
+            return normalized[key]
+
+    lowered = {name.strip().lower(): name for name in fieldnames if name}
+    for candidate in candidates:
+        if not candidate:
+            continue
+        key = candidate.strip().lower()
+        if key in lowered:
+            return lowered[key]
+
+    for name in fieldnames:
+        lowered_name = name.strip().lower()
+        for candidate in candidates:
+            if not candidate:
+                continue
+            candidate_lower = candidate.strip().lower()
+            if candidate_lower in lowered_name:
+                return name
+    return None
+
+
+def _normalise_position_label(value: Any) -> str:
+    if value is None:
+        return "Unknown"
+    text = str(value).strip()
+    if not text:
+        return "Unknown"
+
+    cleaned = re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+    if not cleaned:
+        return "Unknown"
+
+    tokens = cleaned.split()
+    token_set = set(tokens)
+
+    unknown_markers = {"unknown", "unk", "na", "n/a", "none", "null"}
+    if token_set & unknown_markers:
+        return "Unknown"
+
+    if "upright" in token_set or token_set & {"sitting", "sit", "standing", "stand", "up", "vertical"}:
+        return "Upright"
+
+    if token_set & {"supine", "sup", "back"}:
+        return "Supine"
+
+    if token_set & {"prone", "stomach", "abdomen", "ventral"}:
+        return "Prone"
+
+    if "left" in token_set and "right" not in token_set:
+        return "Left lateral"
+
+    if "right" in token_set and "left" not in token_set:
+        return "Right lateral"
+
+    if "lateral" in token_set:
+        if "left" in cleaned:
+            return "Left lateral"
+        if "right" in cleaned:
+            return "Right lateral"
+
+    if token_set & {"other", "misc", "varied"}:
+        return "Other"
+
+    return text.strip().title()
+
+
+def from_csv_positions(
+    path: str | Path,
+    *,
+    epoch_length_s: float = 30.0,
+    epoch_base: float = 1.0,
+    label_field: str = "Position",
+    epoch_field: str = "Epoch",
+    offset_s: float = 0.0,
+    channel: str = POSITION_CHANNEL,
+) -> Annotations:
+    """Parse body position CSV exported alongside the recording."""
+
+    path = Path(path)
+    records: list[tuple[float, float, str, str]] = []
+    counts: Dict[str, int] = {}
+
+    with path.open("r", newline="") as f:
+        reader = csv.DictReader(f)
+        fieldnames = reader.fieldnames or []
+        label_key = _match_column(fieldnames, label_field, "BodyPosition", "Body Position", "Posture")
+        epoch_key = _match_column(fieldnames, epoch_field, "Epoch", "Epoch#", "EpochIndex", "Index")
+
+        def _append_record(idx: float, raw_label: Any):
+            norm = _normalise_position_label(raw_label)
+            start_s = float(idx) * float(epoch_length_s) + float(offset_s)
+            end_s = start_s + float(epoch_length_s)
+            records.append((start_s, end_s, norm, channel))
+            counts[norm] = counts.get(norm, 0) + 1
+
+        if label_key:
+            for row_idx, row in enumerate(reader):
+                raw_label = row.get(label_key)
+                if raw_label is None and not epoch_key:
+                    continue
+                if epoch_key:
+                    epoch_val = _extract_first_float(row.get(epoch_key))
+                    if epoch_val is not None:
+                        idx = epoch_val - float(epoch_base)
+                    else:
+                        idx = row_idx
+                else:
+                    idx = row_idx
+                if idx < 0:
+                    idx = 0
+                _append_record(idx, raw_label)
+        else:
+            f.seek(0)
+            simple_reader = csv.reader(f)
+            for row_idx, row in enumerate(simple_reader):
+                if not row:
+                    continue
+                if row_idx == 0 and len(row) > 1:
+                    header = " ".join(cell.strip().lower() for cell in row)
+                    if "position" in header or "posture" in header:
+                        continue
+                raw_label = row[0]
+                _append_record(float(row_idx), raw_label)
+
+    if not records:
+        return Annotations.empty()
+
+    arr = np.array(records, dtype=ANNOT_DTYPE)
+    order = np.argsort(arr["start_s"], kind="mergesort")
+    meta = {
+        "source": str(path),
+        "type": "csv_positions",
+        "epoch_length_s": float(epoch_length_s),
+        "epoch_base": float(epoch_base),
+        "offset_s": float(offset_s),
+        "channel": channel,
+        "label_counts": counts,
+    }
+    return Annotations(arr[order], meta, None)
+
+
 def discover_annotation_files(edf_path: str | Path) -> Dict[str, Path]:
     base = Path(edf_path)
     stem = base.with_suffix("")
     candidates = {
         "events": stem.with_suffix(".csv"),
         "stages": stem.with_name(stem.name + "STAGE.csv"),
+        "positions": stem.with_name(stem.name + "POSITION.csv"),
     }
     found: Dict[str, Path] = {}
     for key, candidate in candidates.items():
