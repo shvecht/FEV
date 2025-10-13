@@ -24,6 +24,7 @@ class FakeEdfReader:
         self._units = ["uV", "a.u."]
         self._closed = False
         self._read_signal_calls = 0
+        self._read_digital_calls = 0
 
         self._digital = []
         self._digital_min = []
@@ -67,6 +68,7 @@ class FakeEdfReader:
         return arr[start:end]
 
     def read_digital_signal(self, idx: int):
+        self._read_digital_calls += 1
         return self._digital[idx]
 
     def getDigitalMinimum(self, idx: int) -> int:
@@ -95,6 +97,10 @@ class FakeEdfReader:
     @property
     def read_signal_calls(self):
         return self._read_signal_calls
+
+    @property
+    def read_digital_calls(self):
+        return self._read_digital_calls
 
 
 @pytest.fixture(autouse=True)
@@ -179,36 +185,107 @@ def test_read_respects_max_window():
     assert t[-1] - t[0] <= 0.5 + 1 / loader.fs(0)
 
 
-def test_build_int16_cache_and_read_uses_cache():
+def test_build_int16_cache_and_cached_reads_bypass_pyedflib(monkeypatch):
     loader = edf_module.EdfLoader("dummy.edf")
     try:
         reader = loader._r
-        # Prime without cache
-        loader.read(0, 0.0, 0.1)
+        baseline_t, baseline_x = loader.read(0, 1.0, 1.2)
         assert reader.read_signal_calls > 0
         reader._read_signal_calls = 0
 
         built = loader.build_int16_cache(max_mb=1.0, prefer_memmap=False)
         assert built is True
-        assert loader.has_cache() is True
-        assert loader.cache_bytes() > 0
+        assert reader.read_digital_calls == reader.signals_in_file
+
+        def boom(*_args, **_kwargs):  # pragma: no cover - we want this unused
+            raise AssertionError("pyedflib readSignal should not be called when cache is present")
+
+        monkeypatch.setattr(reader, "readSignal", boom)
 
         t, x = loader.read(0, 1.0, 1.2)
         assert reader.read_signal_calls == 0
-        assert t.size == x.size
         assert x.dtype == np.float32
-        expected = reader._data[0][100:120]
-        np.testing.assert_allclose(x[: expected.size], expected.astype(np.float32), atol=2e-2)
+        np.testing.assert_allclose(t, baseline_t, atol=1e-6)
+        np.testing.assert_allclose(x, baseline_x, atol=1e-6)
     finally:
         loader.close()
 
 
-def test_build_int16_cache_respects_limit():
+def test_build_int16_cache_size_guard_and_streaming():
     loader = edf_module.EdfLoader("dummy.edf")
     try:
-        built = loader.build_int16_cache(max_mb=0.0001, prefer_memmap=False)
+        reader = loader._r
+        needed_bytes = sum(arr.nbytes for arr in reader._digital)
+        max_mb = (needed_bytes - 1) / (1024 * 1024)
+
+        built = loader.build_int16_cache(max_mb=max_mb, prefer_memmap=False)
         assert built is False
         assert loader.has_cache() is False
         assert loader.cache_bytes() == 0
+        # Only the first channel is materialized before the guard fails
+        assert reader.read_digital_calls == 1
+
+        reader._read_signal_calls = 0
+        t, x = loader.read(0, 0.0, 0.25)
+        assert t.size == x.size
+        assert x.dtype == np.float32
+        assert reader.read_signal_calls > 0
+    finally:
+        loader.close()
+
+
+def test_prefetch_cache_tiles_use_cached_loader(monkeypatch):
+    from core.prefetch import PrefetchCache, PrefetchConfig
+
+    loader = edf_module.EdfLoader("dummy.edf")
+    try:
+        reader = loader._r
+        assert loader.build_int16_cache(max_mb=1.0, prefer_memmap=False) is True
+
+        def boom(*_args, **_kwargs):  # pragma: no cover - should be bypassed
+            raise AssertionError("readSignal should not run while cache is active")
+
+        reader._read_signal_calls = 0
+        monkeypatch.setattr(reader, "readSignal", boom)
+
+        calls: list[tuple[int, float, float]] = []
+        original_read = loader.read
+
+        def tracking_read(channel: int, start: float, end: float):
+            calls.append((channel, start, end))
+            return original_read(channel, start, end)
+
+        monkeypatch.setattr(loader, "read", tracking_read)
+
+        cache = PrefetchCache(loader.read, PrefetchConfig(tile_duration=0.25, max_tiles=4))
+
+        tile_t, tile_x = cache.get_tile(0, 0.75, 0.25)
+        assert calls == [(0, 0.75, 1.0)]
+        assert tile_x.dtype == np.float32
+        expected = reader._data[0][75:100].astype(np.float32)
+        np.testing.assert_allclose(tile_x, expected, atol=1e-6)
+        expected_t = np.arange(75, 100, dtype=np.float64) / reader._fs[0]
+        np.testing.assert_allclose(tile_t, expected_t, atol=1e-6)
+
+        calls.clear()
+        tile_t2, tile_x2 = cache.get_tile(1, 2.0, 0.5)
+        assert calls == [(1, 2.0, 2.5)]
+        assert tile_x2.dtype == np.float32
+        expected2 = (
+            reader._digital[1][100:125].astype(np.float32) * reader._slope[1]
+            + reader._offset[1]
+        )
+        np.testing.assert_allclose(tile_x2, expected2, atol=1e-6)
+        # time vector for channel 1 uses 50 Hz
+        expected_t2 = np.arange(100, 125) / reader._fs[1]
+        np.testing.assert_allclose(tile_t2, expected_t2, atol=1e-6)
+
+        # Second request should hit PrefetchCache without invoking loader.read again
+        calls.clear()
+        tile_t_cached, tile_x_cached = cache.get_tile(0, 0.75, 0.25)
+        assert calls == []
+        np.testing.assert_allclose(tile_t_cached, tile_t, atol=1e-6)
+        np.testing.assert_allclose(tile_x_cached, tile_x, atol=1e-6)
+        assert reader.read_signal_calls == 0
     finally:
         loader.close()
