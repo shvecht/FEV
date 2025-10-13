@@ -796,9 +796,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self._pending_loader = None
 
         old_loader = self.loader
+        carried_annotations = None
+        if hasattr(old_loader, "annotations"):
+            try:
+                carried = old_loader.annotations()
+            except Exception:
+                carried = None
+            else:
+                if carried and getattr(carried, "size", 0):
+                    carried_annotations = carried
         self.loader = pending
         if isinstance(self.loader, ZarrLoader):
             setattr(self.loader, "max_window_s", self.loader.duration_s)
+            if carried_annotations is not None:
+                try:
+                    self.loader.set_annotations(carried_annotations)
+                except Exception:
+                    pass
         self._update_limits_from_loader()
         self._view_start, self._view_duration = clamp_window(
             self._view_start,
@@ -1031,6 +1045,16 @@ class MainWindow(QtWidgets.QMainWindow):
         found = annotation_core.discover_annotation_files(path)
         found.update(self._manual_annotation_paths)
         start_dt = getattr(getattr(self.loader, "timebase", None), "start_dt", None)
+
+        loader_ann: annotation_core.Annotations | None = None
+        if hasattr(self.loader, "annotations"):
+            try:
+                loader_ann = self.loader.annotations()
+            except Exception as exc:  # pragma: no cover - defensive logging
+                LOG.warning("Failed to load EDF+ annotations: %s", exc)
+            else:
+                if loader_ann.size:
+                    ann_sets.append(loader_ann)
 
         events_path = found.get("events")
         if events_path:

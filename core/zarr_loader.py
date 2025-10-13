@@ -9,6 +9,7 @@ import numpy as np
 import zarr
 
 from core.timebase import Timebase
+from core import annotations as annotations_core
 
 
 @dataclass(frozen=True)
@@ -20,7 +21,13 @@ class ChannelMeta:
 
 
 class ZarrLoader:
-    def __init__(self, store_path: str | Path, *, max_window_s: float | None = None):
+    def __init__(
+        self,
+        store_path: str | Path,
+        *,
+        max_window_s: float | None = None,
+        annotations: annotations_core.Annotations | None = None,
+    ):
         path = Path(store_path)
         self.path = str(path)
         self._root = zarr.open_group(str(path), mode="r")
@@ -55,6 +62,7 @@ class ZarrLoader:
             start_dt=self.start_dt or datetime.fromtimestamp(0),
             duration_s=self.duration_s,
         )
+        self._annotations = annotations
 
     # ------------------------------------------------------------------
 
@@ -76,6 +84,14 @@ class ZarrLoader:
             data = data.astype(np.float32)
         t = Timebase.time_vector(s0, data.size, meta.fs)
         return t, data
+
+    def annotations(self) -> annotations_core.Annotations:
+        if self._annotations is None:
+            return annotations_core.Annotations.empty()
+        return self._annotations
+
+    def set_annotations(self, annotations: annotations_core.Annotations | None):
+        self._annotations = annotations
 
     def close(self):
         pass

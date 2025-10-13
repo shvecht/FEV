@@ -9,6 +9,7 @@ import zarr
 
 import core.zarr_cache as zc
 from core.zarr_loader import ZarrLoader
+from core import annotations as annotations_module
 
 
 class FakeEdfLoader:
@@ -181,3 +182,28 @@ def test_zarr_loader_respects_window_cap(tmp_path):
 
     assert t.size == x.size
     assert t[-1] - t[0] <= 0.5 + 1 / zarr_loader.fs(0)
+
+
+def test_zarr_loader_annotation_roundtrip(tmp_path):
+    store_path = tmp_path / "study.zarr"
+    builder = zc.EdfToZarr(
+        "study.edf",
+        out_path=str(store_path),
+    )
+    builder.build()
+
+    arr = np.zeros(2, dtype=annotations_module.ANNOT_DTYPE)
+    arr["start_s"] = [1.0, 2.0]
+    arr["end_s"] = [1.5, 3.0]
+    arr["label"] = ["A", "B"]
+    arr["chan"] = ["", ""]
+    annotations = annotations_module.Annotations(arr, {"source": "test"}, None)
+
+    loader = ZarrLoader(store_path, annotations=annotations)
+    try:
+        ann_out = loader.annotations()
+        assert ann_out is annotations
+        loader.set_annotations(annotations_module.Annotations.empty())
+        assert loader.annotations().size == 0
+    finally:
+        loader.close()
