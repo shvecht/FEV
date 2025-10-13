@@ -14,6 +14,7 @@ import pyqtgraph as pg
 from PySide6 import QtCore, QtWidgets, QtGui
 
 from ui.time_axis import TimeAxis
+from ui.widgets import CollapsibleSection
 from config import ViewerConfig
 from core.decimate import min_max_bins
 from core.overscan import slice_and_decimate
@@ -331,9 +332,9 @@ class MainWindow(QtWidgets.QMainWindow):
         controlLayout.addWidget(telemetryBar)
         controlLayout.addWidget(self.sourceLabel)
         controlLayout.addWidget(annotationSection)
-        prefetchBox = QtWidgets.QGroupBox("Prefetch")
-        prefetchBox.setObjectName("prefetchBox")
-        prefetchLayout = QtWidgets.QGridLayout(prefetchBox)
+        prefetchContent = QtWidgets.QWidget()
+        prefetchLayout = QtWidgets.QGridLayout(prefetchContent)
+        prefetchLayout.setContentsMargins(0, 0, 0, 0)
         prefetchLayout.setHorizontalSpacing(8)
         prefetchLayout.setVerticalSpacing(6)
         self.prefetchTileSpin = QtWidgets.QDoubleSpinBox()
@@ -355,7 +356,13 @@ class MainWindow(QtWidgets.QMainWindow):
         prefetchLayout.addWidget(QtWidgets.QLabel("Max MB"), 2, 0)
         prefetchLayout.addWidget(self.prefetchMaxMbSpin, 2, 1)
         prefetchLayout.addWidget(self.prefetchApplyBtn, 3, 0, 1, 2)
-        controlLayout.addWidget(prefetchBox)
+        self.prefetchSection = CollapsibleSection(
+            "Prefetch",
+            prefetchContent,
+            expanded=not getattr(self._config, "prefetch_collapsed", False),
+        )
+        self.prefetchSection.setObjectName("prefetchSection")
+        controlLayout.addWidget(self.prefetchSection)
         self.ingestBar = QtWidgets.QProgressBar()
         self.ingestBar.setObjectName("ingestBar")
         self.ingestBar.setRange(0, 100)
@@ -441,8 +448,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 background-color: #182235;
             }
             QGroupBox#primaryControls,
-            QGroupBox#annotationSection,
-            QGroupBox#prefetchBox {
+            QGroupBox#annotationSection {
                 background-color: #141e30;
                 border: 1px solid #24324b;
                 border-radius: 10px;
@@ -450,37 +456,40 @@ class MainWindow(QtWidgets.QMainWindow):
                 padding: 18px 16px 14px 16px;
             }
             QGroupBox#primaryControls::title,
-            QGroupBox#annotationSection::title,
-            QGroupBox#prefetchBox::title {
+            QGroupBox#annotationSection::title {
                 subcontrol-origin: margin;
                 left: 18px;
                 padding: 0 6px;
                 color: #a7b4cf;
                 font-weight: 600;
             }
-            QGroupBox#primaryControls QPushButton,
-            QGroupBox#annotationSection QPushButton,
-            QGroupBox#prefetchBox QPushButton {
+            QGroupBox#primaryControls PushButton,
+            QGroupBox#annotationSection PushButton {
                 background-color: #1c273a;
                 border: 1px solid #2b3850;
                 border-radius: 6px;
                 padding: 6px 10px;
                 color: #e1e9ff;
             }
-            QGroupBox#primaryControls QPushButton:hover,
-            QGroupBox#annotationSection QPushButton:hover,
-            QGroupBox#prefetchBox QPushButton:hover {
+            QGroupBox#primaryControls PushButton:hover,
+            QGroupBox#annotationSection PushButton:hover {
                 background-color: #263755;
             }
-            QGroupBox#primaryControls QPushButton:pressed,
-            QGroupBox#annotationSection QPushButton:pressed,
-            QGroupBox#prefetchBox QPushButton:pressed {
+            QGroupBox#primaryControls PushButton:pressed,
+            QGroupBox#annotationSection PushButton:pressed {
                 background-color: #142033;
             }
             QGroupBox#annotationSection QListWidget {
                 background-color: #0f1724;
                 border: 1px solid #1f2a3d;
                 border-radius: 6px;
+            }
+            QFrame#prefetchSection {
+                background-color: #141e30;
+                border: 1px solid #24324b;
+                border-radius: 10px;
+                margin-top: 12px;
+                padding: 16px 16px 12px 16px;
             }
             QToolButton {
                 background-color: #1a2333;
@@ -494,6 +503,18 @@ class MainWindow(QtWidgets.QMainWindow):
             }
             QToolButton:pressed {
                 background-color: #172132;
+            }
+            QFrame#prefetchSection QToolButton {
+                background-color: transparent;
+                border: none;
+                border-radius: 0px;
+                padding: 0px;
+                color: #a7b4cf;
+                font-weight: 600;
+            }
+            QFrame#prefetchSection QToolButton:hover {
+                color: #d0dcf5;
+                background-color: transparent;
             }
             QProgressBar#ingestBar {
                 background-color: #121a24;
@@ -521,6 +542,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.fullViewBtn.clicked.connect(self._full_view)
         self.resetViewBtn.clicked.connect(self._reset_view)
         self.prefetchApplyBtn.clicked.connect(self._apply_prefetch_settings)
+        self.prefetchSection.toggled.connect(self._on_prefetch_section_toggled)
         self.annotationToggle.toggled.connect(self._on_annotation_toggle)
         self.annotationImportBtn.clicked.connect(self._prompt_import_annotations)
         self.eventList.itemSelectionChanged.connect(self._on_event_selection_changed)
@@ -935,13 +957,17 @@ class MainWindow(QtWidgets.QMainWindow):
         max_mb = max_mb_val if max_mb_val > 0 else None
         self._config.prefetch_tile_s = tile
         self._config.prefetch_max_tiles = max_tiles
-        self._config.prefetch_max_mb = max_mb_val if max_mb_val > 0 else None
+        self._config.prefetch_max_mb = max_mb
         prefetch_service.configure(tile_duration=tile, max_tiles=max_tiles, max_mb=max_mb)
         if self._prefetch is not None:
             self._prefetch.stop()
         self._prefetch = prefetch_service.create_cache(self._fetch_tile)
         self._prefetch.start()
         self._schedule_prefetch()
+        self._config.save()
+
+    def _on_prefetch_section_toggled(self, expanded: bool) -> None:
+        self._config.prefetch_collapsed = not expanded
         self._config.save()
 
     def _on_annotation_toggle(self, checked: bool):
