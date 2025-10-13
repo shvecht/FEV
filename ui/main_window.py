@@ -235,6 +235,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.windowSummary.setObjectName("windowSummary")
         self.stageSummaryLabel = QtWidgets.QLabel("Stage: --")
         self.stageSummaryLabel.setObjectName("stageSummary")
+        self.stageSummaryLabel.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
         self.sourceLabel = QtWidgets.QLabel("Source: EDF (live)")
         self.sourceLabel.setObjectName("sourceLabel")
         self.annotationToggle = QtWidgets.QCheckBox("Show annotations")
@@ -242,8 +243,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.annotationToggle.setEnabled(False)
         self.annotationImportBtn = QtWidgets.QPushButton("Import annotations…")
         self.annotationImportBtn.setEnabled(True)
-        eventHeader = QtWidgets.QLabel("Annotations")
-        eventHeader.setObjectName("annotationsHeader")
         self.eventList = QtWidgets.QListWidget()
         self.eventList.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
         self.eventList.setEnabled(False)
@@ -256,10 +255,7 @@ class MainWindow(QtWidgets.QMainWindow):
         control.setObjectName("controlPanel")
         controlLayout = QtWidgets.QVBoxLayout(control)
         controlLayout.setContentsMargins(18, 18, 18, 18)
-        controlLayout.setSpacing(16)
-
-        header = QtWidgets.QLabel("Viewing Window")
-        header.setObjectName("panelTitle")
+        controlLayout.setSpacing(14)
 
         navLayout = QtWidgets.QHBoxLayout()
         navLayout.setSpacing(6)
@@ -288,27 +284,55 @@ class MainWindow(QtWidgets.QMainWindow):
         form.addWidget(QtWidgets.QLabel("Duration"), 1, 0)
         form.addWidget(self.windowSpin, 1, 1)
 
-        controlLayout.addWidget(header)
-        controlLayout.addLayout(navLayout)
         self.fileButton = QtWidgets.QPushButton("Open EDF…")
         self.fileButton.setObjectName("fileSelectButton")
         self.fileButton.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_DialogOpenButton))
         self.fileButton.setCursor(QtCore.Qt.PointingHandCursor)
-        controlLayout.addWidget(self.fileButton)
-        controlLayout.addLayout(form)
-        controlLayout.addWidget(self.absoluteRange)
-        controlLayout.addWidget(self.windowSummary)
-        controlLayout.addWidget(self.stageSummaryLabel)
-        controlLayout.addWidget(self.sourceLabel)
-        controlLayout.addWidget(self.annotationToggle)
-        controlLayout.addWidget(self.annotationImportBtn)
-        controlLayout.addWidget(eventHeader)
-        controlLayout.addWidget(self.eventList)
+
+        primaryControls = QtWidgets.QGroupBox("Viewing Controls")
+        primaryControls.setObjectName("primaryControls")
+        primaryLayout = QtWidgets.QVBoxLayout(primaryControls)
+        primaryLayout.setContentsMargins(14, 16, 14, 12)
+        primaryLayout.setSpacing(12)
+        primaryLayout.addLayout(navLayout)
+        fileRow = QtWidgets.QHBoxLayout()
+        fileRow.addWidget(self.fileButton)
+        fileRow.addStretch(1)
+        primaryLayout.addLayout(fileRow)
+        primaryLayout.addLayout(form)
+
+        telemetryBar = QtWidgets.QFrame()
+        telemetryBar.setObjectName("telemetryBar")
+        telemetryBar.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
+        telemetryLayout = QtWidgets.QHBoxLayout(telemetryBar)
+        telemetryLayout.setContentsMargins(12, 6, 12, 6)
+        telemetryLayout.setSpacing(8)
+        telemetryLayout.addWidget(self.absoluteRange)
+        telemetryLayout.addWidget(self.windowSummary)
+        telemetryLayout.addStretch(1)
+        telemetryLayout.addWidget(self.stageSummaryLabel)
+
+        annotationSection = QtWidgets.QGroupBox("Annotations")
+        annotationSection.setObjectName("annotationSection")
+        annotationSection.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Expanding)
+        annotationLayout = QtWidgets.QVBoxLayout(annotationSection)
+        annotationLayout.setContentsMargins(14, 16, 14, 12)
+        annotationLayout.setSpacing(10)
+        annotationLayout.addWidget(self.annotationToggle)
+        annotationLayout.addWidget(self.annotationImportBtn)
+        annotationLayout.addWidget(self.eventList)
         eventNav = QtWidgets.QHBoxLayout()
+        eventNav.setSpacing(8)
         eventNav.addWidget(self.eventPrevBtn)
         eventNav.addWidget(self.eventNextBtn)
-        controlLayout.addLayout(eventNav)
+        annotationLayout.addLayout(eventNav)
+
+        controlLayout.addWidget(primaryControls)
+        controlLayout.addWidget(telemetryBar)
+        controlLayout.addWidget(self.sourceLabel)
+        controlLayout.addWidget(annotationSection)
         prefetchBox = QtWidgets.QGroupBox("Prefetch")
+        prefetchBox.setObjectName("prefetchBox")
         prefetchLayout = QtWidgets.QGridLayout(prefetchBox)
         prefetchLayout.setHorizontalSpacing(8)
         prefetchLayout.setVerticalSpacing(6)
@@ -376,9 +400,20 @@ class MainWindow(QtWidgets.QMainWindow):
             """
             QMainWindow { background-color: #0b111c; color: #e6ebf5; }
             QLabel { font-size: 13px; color: #e6ebf5; }
-            QLabel#panelTitle { font-size: 15px; font-weight: 600; color: #f3f6ff; }
             QLabel#absoluteRange, QLabel#windowSummary { color: #9ba9bf; }
+            QLabel#stageSummary { color: #d2def6; font-weight: 600; }
             QLabel#sourceLabel { color: #9ba9bf; font-style: italic; }
+            QFrame#controlPanel {
+                background-color: #131b2b;
+                border-right: 1px solid #1f2a3d;
+            }
+            QFrame#telemetryBar {
+                background-color: #121a24;
+                border: 1px solid #1f2a3d;
+                border-radius: 8px;
+                padding: 8px 12px;
+            }
+            QFrame#telemetryBar QLabel { color: #c5d1ec; }
             QDoubleSpinBox {
                 background-color: #121a2a;
                 border: 1px solid #1f2a3d;
@@ -389,10 +424,6 @@ class MainWindow(QtWidgets.QMainWindow):
             QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
                 background-color: transparent;
                 border: none;
-            }
-            QFrame#controlPanel {
-                background-color: #131b2b;
-                border-right: 1px solid #1f2a3d;
             }
             QPushButton#fileSelectButton {
                 background-color: #1a2436;
@@ -406,33 +437,50 @@ class MainWindow(QtWidgets.QMainWindow):
                 background-color: #22304a;
                 border-color: #39507a;
             }
-           QPushButton#fileSelectButton:pressed {
-               background-color: #182235;
-           }
-            QGroupBox QPushButton {
+            QPushButton#fileSelectButton:pressed {
+                background-color: #182235;
+            }
+            QGroupBox#primaryControls,
+            QGroupBox#annotationSection,
+            QGroupBox#prefetchBox {
+                background-color: #141e30;
+                border: 1px solid #24324b;
+                border-radius: 10px;
+                margin-top: 12px;
+                padding: 18px 16px 14px 16px;
+            }
+            QGroupBox#primaryControls::title,
+            QGroupBox#annotationSection::title,
+            QGroupBox#prefetchBox::title {
+                subcontrol-origin: margin;
+                left: 18px;
+                padding: 0 6px;
+                color: #a7b4cf;
+                font-weight: 600;
+            }
+            QGroupBox#primaryControls QPushButton,
+            QGroupBox#annotationSection QPushButton,
+            QGroupBox#prefetchBox QPushButton {
                 background-color: #1c273a;
                 border: 1px solid #2b3850;
                 border-radius: 6px;
                 padding: 6px 10px;
                 color: #e1e9ff;
             }
-            QGroupBox QPushButton:hover {
+            QGroupBox#primaryControls QPushButton:hover,
+            QGroupBox#annotationSection QPushButton:hover,
+            QGroupBox#prefetchBox QPushButton:hover {
                 background-color: #263755;
             }
-            QGroupBox QPushButton:pressed {
+            QGroupBox#primaryControls QPushButton:pressed,
+            QGroupBox#annotationSection QPushButton:pressed,
+            QGroupBox#prefetchBox QPushButton:pressed {
                 background-color: #142033;
             }
-            QGroupBox {
-                margin-top: 10px;
+            QGroupBox#annotationSection QListWidget {
+                background-color: #0f1724;
                 border: 1px solid #1f2a3d;
                 border-radius: 6px;
-                padding: 8px;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 12px;
-                padding: 0 4px;
-                color: #a7b4cf;
             }
             QToolButton {
                 background-color: #1a2333;
