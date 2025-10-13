@@ -212,9 +212,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._event_color_cache: dict[str, QtGui.QColor] = {}
         self._selected_event_channel: str | None = None
         self._event_label_filter: str = ""
-        self.stage_plot: pg.PlotItem | None = None
-        self._stage_curve: pg.PlotDataItem | None = None
         self._stage_label_item: pg.LabelItem | None = None
+        self._stage_info_widget: QtWidgets.QTableWidget | None = None
+        self._stage_info_proxy: QtWidgets.QGraphicsProxyWidget | None = None
 
         self._build_ui()
         self._apply_theme(self._active_theme_key, persist=False)
@@ -747,15 +747,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.time_axis.setPen(pg.mkPen(theme.pg_foreground))
         self.time_axis.setTextPen(theme.pg_foreground)
 
-        if self.stage_plot is not None:
-            for axis_name in ("left", "bottom"):
-                axis = self.stage_plot.getAxis(axis_name)
-                if axis is not None:
-                    pen = pg.mkPen(theme.pg_foreground)
-                    axis.setPen(pen)
-                    axis.setTextPen(theme.pg_foreground)
-        if self._stage_curve is not None:
-            self._stage_curve.setPen(pg.mkPen(theme.stage_curve_color, width=2))
+        if self._stage_info_widget is not None:
+            self._stage_info_widget.viewport().setAutoFillBackground(False)
+            header = self._stage_info_widget.horizontalHeader()
+            header.setStyleSheet("")
 
         self._apply_curve_pens()
         self._refresh_channel_label_styles()
@@ -941,6 +936,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._ensure_overscan_for_view()
 
         self._update_annotation_overlays(t0, t1)
+        self._update_stage_info()
 
     def _update_time_labels(self, t0, t1):
         tb = self.loader.timebase
@@ -1395,7 +1391,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._clear_annotation_lines()
         self._clear_annotation_rects()
         self._populate_event_list(clear=True)
-        self._update_stage_plot_data()
+        self._update_stage_info()
         self._update_annotation_summary()
 
         path = getattr(self.loader, "path", None)
@@ -1445,76 +1441,100 @@ class MainWindow(QtWidgets.QMainWindow):
         self._reset_event_filters()
         self._populate_event_list()
         self._update_annotation_summary()
-        self._update_stage_plot_data()
+        self._update_stage_info()
         self._update_annotation_overlays(
             self._view_start,
             min(self.loader.duration_s, self._view_start + self._view_duration),
         )
 
-    def _update_stage_plot_data(self):
-        if self.stage_plot is None:
-            self._ensure_stage_plot()
-        if self._stage_curve is None:
+    def _update_stage_info(self):
+        if self._stage_info_widget is None:
+            self._ensure_stage_info_widget()
+        table = self._stage_info_widget
+        proxy = self._stage_info_proxy
+        label_item = self._stage_label_item
+        if table is None:
             return
+        if table.rowCount() != 3:
+            table.setRowCount(3)
+        entries = [None, None, None]
         if not self._annotations_index or self._annotations_index.is_empty():
-            self._stage_curve.setData([], [])
-            self.stage_plot.hide()
+            if proxy is not None:
+                proxy.setVisible(False)
+            if label_item is not None:
+                label_item.setVisible(False)
+            for row in range(3):
+                for col in range(table.columnCount()):
+                    self._set_stage_table_item(table, row, col, "--")
+            table.clearSelection()
             return
 
-        stage_data = self._annotations_index.between(
-            0.0,
-            self.loader.duration_s,
-            channels=["stage"],
-        )
-        if isinstance(stage_data, tuple):
-            stage_data = stage_data[0]
-        if stage_data.size == 0:
-            self._stage_curve.setData([], [])
-            self.stage_plot.hide()
+        stages = self._stage_annotations()
+        if stages.size == 0:
+            if proxy is not None:
+                proxy.setVisible(False)
+            if label_item is not None:
+                label_item.setVisible(False)
+            for row in range(3):
+                for col in range(table.columnCount()):
+                    self._set_stage_table_item(table, row, col, "--")
+            table.clearSelection()
             return
 
-        mapping = {
-            "N3": 0.0,
-            "N4": 0.0,  # treat legacy N4 like N3
-            "N2": 1.0,
-            "N1": 2.0,
-            "REM": 3.0,
-            "Wake": 4.0,
-        }
+        center_time = self._view_start + self._view_duration * 0.5
+        starts = stages["start_s"]
+        idx = int(np.searchsorted(starts, center_time, side="right") - 1)
+        current_idx = idx if idx >= 0 and stages[idx]["end_s"] > center_time else -1
+        prev_idx = current_idx - 1 if current_idx >= 0 else idx
+        next_idx = current_idx + 1 if current_idx >= 0 else idx + 1
 
-        # Build step-mode arrays: for stepMode=True, pyqtgraph expects
-        # len(x) == len(y) + 1, where x are edge times and y are bin values.
-        xs: list[float] = []
-        ys: list[float] = []
+        current_entry = stages[current_idx] if current_idx >= 0 else None
+        prev_entry = stages[prev_idx] if prev_idx is not None and prev_idx >= 0 else None
+        next_entry = stages[next_idx] if next_idx is not None and next_idx < stages.size else None
 
-        # Optionally fill a gap before the first stage with the first value
-        first_edge: float | None = None
-        for idx, entry in enumerate(stage_data):
-            start = float(entry["start_s"])
-            end = float(entry["end_s"])
-            label = str(entry["label"])  # e.g., N2, REM, Wake
-            value = mapping.get(label, 2.0)
+        entries = [prev_entry, current_entry, next_entry]
 
-            if idx == 0:
-                # first edge
-                first_edge = start
-                xs.append(start)
+        if proxy is not None:
+            proxy.setVisible(True)
+        if label_item is not None:
+            label_item.setVisible(True)
+
+        for row, entry in enumerate(entries):
+            if entry is None:
+                self._set_stage_table_item(table, row, 0, "--")
+                self._set_stage_table_item(table, row, 1, "--")
+                self._set_stage_table_item(table, row, 2, "--")
             else:
-                # if there is a gap from the previous edge, extend edges but keep last value
-                prev_end = xs[-1]
-                if start > prev_end:
-                    xs.append(start)  # gap edge; y stays the same (implicit)
-            # push the end edge of this stage and its value
-            xs.append(end)
-            ys.append(value)
+                label = str(entry["label"]) or "--"
+                start_text = self._format_clock(float(entry["start_s"]))
+                end_text = self._format_clock(float(entry["end_s"]))
+                self._set_stage_table_item(table, row, 0, label)
+                self._set_stage_table_item(table, row, 1, start_text)
+                self._set_stage_table_item(table, row, 2, end_text)
 
-        # Safety: ensure the invariant for stepMode=True
-        if not xs or len(xs) != len(ys) + 1:
-            # Fallback to hiding the curve if shapes are inconsistent
-            self._stage_curve.setData([], [])
+        if entries[1] is not None:
+            table.selectRow(1)
         else:
-            self._stage_curve.setData(xs, ys)
-        self.stage_plot.show()
+            table.clearSelection()
+
+    def _set_stage_table_item(
+        self, table: QtWidgets.QTableWidget, row: int, column: int, text: str
+    ) -> None:
+        item = table.item(row, column)
+        if item is None:
+            item = QtWidgets.QTableWidgetItem()
+            item.setFlags(QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsSelectable)
+            table.setItem(row, column, item)
+        item.setText(text)
+
+    def _stage_annotations(self) -> np.ndarray:
+        if not self._annotations_index or self._annotations_index.is_empty():
+            return np.zeros(0, dtype=annotation_core.ANNOT_DTYPE)
+        data = self._annotations_index.data
+        if data.size == 0:
+            return data
+        mask = np.array([str(chan) == "stage" for chan in data["chan"]], dtype=bool)
+        return data[mask]
 
     def _prompt_import_annotations(self):
         options = QtWidgets.QFileDialog.Options()
@@ -2101,7 +2121,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if plot.getAxis("bottom") is self.time_axis:
                 plot.setAxisItems({"bottom": pg.AxisItem(orientation="bottom")})
 
-        self._ensure_stage_plot()
+        self._ensure_stage_info_widget()
 
     def _sync_channel_controls(self) -> None:
         if not hasattr(self, "channelSection"):
@@ -2207,44 +2227,34 @@ class MainWindow(QtWidgets.QMainWindow):
             "</span>"
         )
 
-    def _ensure_stage_plot(self):
-        if self.stage_plot is None:
+    def _ensure_stage_info_widget(self):
+        if self._stage_info_widget is None:
             row = len(self.plots)
             self._stage_label_item = self.plotLayout.addLabel(
                 row=row, col=0, text="Stage", justify="right"
             )
             self._stage_label_item.setText(self._stage_label_markup())
-            plot = self.plotLayout.addPlot(row=row, col=1)
-            plot.setMaximumHeight(90)
-            plot.setMenuEnabled(False)
-            plot.setMouseEnabled(x=False, y=False)
-            plot.showGrid(x=False, y=True, alpha=0.15)
-            plot.hideAxis("right")
-            plot.hideAxis("top")
-            plot.getAxis("left").setStyle(showValues=True)
-            ticks = [
-                (0.0, "N3"),
-                (1.0, "N2"),
-                (2.0, "N1"),
-                (3.0, "REM"),
-                (4.0, "Wake"),
-            ]
-            plot.setYRange(-0.5, 4.5)
-            plot.getAxis("left").setTicks([ticks])
-            plot.showAxis("bottom", show=True)
-            for axis_name in ("left", "bottom"):
-                axis = plot.getAxis(axis_name)
-                if axis is not None:
-                    pen = pg.mkPen(self._theme.pg_foreground)
-                    axis.setPen(pen)
-                    axis.setTextPen(self._theme.pg_foreground)
-            self.stage_plot = plot
-            self._stage_curve = plot.plot(
-                [], [], stepMode=True, fillLevel=None, pen=pg.mkPen(self._theme.stage_curve_color, width=2)
-            )
+            self._stage_label_item.setVisible(False)
+            table = QtWidgets.QTableWidget(3, 3)
+            table.setHorizontalHeaderLabels(["Stage", "Start", "End"])
+            table.setVerticalHeaderLabels(["Previous", "Current", "Next"])
+            table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+            table.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+            table.setFocusPolicy(QtCore.Qt.NoFocus)
+            table.horizontalHeader().setStretchLastSection(True)
+            table.verticalHeader().setDefaultSectionSize(26)
+            table.setAlternatingRowColors(True)
+            table.setMaximumHeight(140)
+            table.setMinimumHeight(110)
+            proxy = QtWidgets.QGraphicsProxyWidget()
+            proxy.setWidget(table)
+            proxy.setVisible(False)
+            self.plotLayout.addItem(proxy, row=row, col=1)
+            self._stage_info_widget = table
+            self._stage_info_proxy = proxy
 
-        if self._primary_plot is not None and self.stage_plot is not None:
-            self.stage_plot.setXLink(self._primary_plot)
+        if self._stage_label_item is not None:
+            self._stage_label_item.setText(self._stage_label_markup())
 
     def _connect_primary_viewbox(self):
         if self._primary_viewbox is not None:
