@@ -17,6 +17,7 @@ class ViewerConfig:
     int16_cache_memmap: bool = False
     hidden_channels: tuple[int, ...] = ()
     annotation_focus_only: bool = False
+    theme: str = "Midnight"
     ini_path: Path | None = None
 
     @classmethod
@@ -42,6 +43,7 @@ class ViewerConfig:
                 cfg.annotation_focus_only = ui_section.getboolean(
                     "annotation_focus_only", fallback=cfg.annotation_focus_only
                 )
+                cfg.theme = ui_section.get("theme", fallback=cfg.theme)
                 hidden_raw = ui_section.get("hidden_channels", fallback="")
                 if hidden_raw:
                     indices: set[int] = set()
@@ -95,6 +97,7 @@ class ViewerConfig:
             "prefetch_collapsed": "true" if self.prefetch_collapsed else "false",
             "hidden_channels": hidden_serialized,
             "annotation_focus_only": "true" if self.annotation_focus_only else "false",
+            "theme": self.theme,
         }
         parser["cache"] = {
             "enabled": "true" if self.int16_cache_enabled else "false",

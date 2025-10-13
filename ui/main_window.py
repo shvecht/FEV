@@ -16,6 +16,7 @@ from PySide6 import QtCore, QtWidgets, QtGui
 
 from ui.time_axis import TimeAxis
 from ui.widgets import CollapsibleSection
+from ui.themes import DEFAULT_THEME, THEMES, ThemeDefinition
 from config import ViewerConfig
 from core.decimate import min_max_bins
 from core.overscan import slice_and_decimate
@@ -169,9 +170,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._prefetch = prefetch_service.create_cache(self._fetch_tile)
         self._prefetch.start()
 
+        theme_key = getattr(self._config, "theme", DEFAULT_THEME)
+        if theme_key not in THEMES:
+            theme_key = DEFAULT_THEME
+        self._active_theme_key = theme_key
+        self._theme: ThemeDefinition = THEMES[theme_key]
+        self._config.theme = theme_key
+
         pg.setConfigOptions(antialias=True)
-        pg.setConfigOption("background", "#10131d")
-        pg.setConfigOption("foreground", "#e3e7f3")
 
         self.setWindowTitle("EDF Viewer — Multi-channel")
         self.time_axis = TimeAxis(orientation="bottom", timebase=loader.timebase)
@@ -206,6 +212,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._stage_label_item: pg.LabelItem | None = None
 
         self._build_ui()
+        self._apply_theme(self._active_theme_key, persist=False)
         focus_only_pref = bool(getattr(self._config, "annotation_focus_only", False))
         self.annotationFocusOnly.setChecked(focus_only_pref)
         self._connect_signals()
@@ -376,6 +383,43 @@ class MainWindow(QtWidgets.QMainWindow):
         controlLayout.addWidget(telemetryBar)
         controlLayout.addWidget(self.sourceLabel)
         controlLayout.addWidget(annotationSection)
+
+        appearanceContent = QtWidgets.QWidget()
+        appearanceLayout = QtWidgets.QVBoxLayout(appearanceContent)
+        appearanceLayout.setContentsMargins(0, 0, 0, 0)
+        appearanceLayout.setSpacing(10)
+        themeRow = QtWidgets.QHBoxLayout()
+        themeRow.setSpacing(6)
+        themeLabel = QtWidgets.QLabel("Theme")
+        self.themeCombo = QtWidgets.QComboBox()
+        self.themeCombo.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToContents)
+        for key, theme_def in THEMES.items():
+            self.themeCombo.addItem(theme_def.name, userData=key)
+        with QtCore.QSignalBlocker(self.themeCombo):
+            idx = self.themeCombo.findData(self._active_theme_key)
+            if idx < 0:
+                idx = 0
+            if idx >= 0:
+                self.themeCombo.setCurrentIndex(idx)
+        themeRow.addWidget(themeLabel)
+        themeRow.addWidget(self.themeCombo, 1)
+        appearanceLayout.addLayout(themeRow)
+
+        self.themePreviewWidget = QtWidgets.QWidget()
+        previewLayout = QtWidgets.QHBoxLayout(self.themePreviewWidget)
+        previewLayout.setContentsMargins(0, 0, 0, 0)
+        previewLayout.setSpacing(6)
+        appearanceLayout.addWidget(self.themePreviewWidget)
+        appearanceLayout.addStretch(1)
+
+        self.appearanceSection = CollapsibleSection(
+            "Appearance",
+            appearanceContent,
+            expanded=False,
+        )
+        self.appearanceSection.setObjectName("appearanceSection")
+        controlLayout.addWidget(self.appearanceSection)
+
         prefetchContent = QtWidgets.QWidget()
         prefetchLayout = QtWidgets.QGridLayout(prefetchContent)
         prefetchLayout.setContentsMargins(0, 0, 0, 0)
@@ -468,144 +512,6 @@ class MainWindow(QtWidgets.QMainWindow):
         centralLayout.addWidget(splitter)
         self.setCentralWidget(central)
 
-        self.setStyleSheet(
-            """
-            QMainWindow { background-color: #0b111c; color: #e6ebf5; }
-            QLabel { font-size: 13px; color: #e6ebf5; }
-            QLabel#absoluteRange, QLabel#windowSummary { color: #9ba9bf; }
-            QLabel#stageSummary { color: #d2def6; font-weight: 600; }
-            QLabel#sourceLabel { color: #9ba9bf; font-style: italic; }
-            QFrame#controlPanel {
-                background-color: #131b2b;
-                border-right: 1px solid #1f2a3d;
-            }
-            QFrame#telemetryBar {
-                background-color: #121a24;
-                border: 1px solid #1f2a3d;
-                border-radius: 8px;
-                padding: 8px 12px;
-            }
-            QFrame#telemetryBar QLabel { color: #c5d1ec; }
-            QDoubleSpinBox {
-                background-color: #121a2a;
-                border: 1px solid #1f2a3d;
-                border-radius: 6px;
-                padding: 6px 8px;
-                color: #f0f4ff;
-            }
-            QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
-                background-color: transparent;
-                border: none;
-            }
-            QPushButton#fileSelectButton {
-                background-color: #1a2436;
-                border: 1px solid #27324a;
-                border-radius: 6px;
-                padding: 8px 12px;
-                color: #f3f6ff;
-                font-weight: 600;
-            }
-            QPushButton#fileSelectButton:hover {
-                background-color: #22304a;
-                border-color: #39507a;
-            }
-            QPushButton#fileSelectButton:pressed {
-                background-color: #182235;
-            }
-            QGroupBox#primaryControls,
-            QGroupBox#annotationSection {
-                background-color: #141e30;
-                border: 1px solid #24324b;
-                border-radius: 10px;
-                margin-top: 12px;
-                padding: 18px 16px 14px 16px;
-            }
-            QGroupBox#primaryControls::title,
-            QGroupBox#annotationSection::title {
-                subcontrol-origin: margin;
-                left: 18px;
-                padding: 0 6px;
-                color: #a7b4cf;
-                font-weight: 600;
-            }
-            QGroupBox#primaryControls PushButton,
-            QGroupBox#annotationSection PushButton {
-                background-color: #1c273a;
-                border: 1px solid #2b3850;
-                border-radius: 6px;
-                padding: 6px 10px;
-                color: #e1e9ff;
-            }
-            QGroupBox#primaryControls PushButton:hover,
-            QGroupBox#annotationSection PushButton:hover {
-                background-color: #263755;
-            }
-            QGroupBox#primaryControls PushButton:pressed,
-            QGroupBox#annotationSection PushButton:pressed {
-                background-color: #142033;
-            }
-            QFrame#channelSection {
-                background-color: #141e30;
-                border: 1px solid #24324b;
-                border-radius: 10px;
-                margin-top: 12px;
-                padding: 16px 16px 12px 16px;
-            }
-            QFrame#channelSection QCheckBox {
-                color: #dfe7ff;
-            }
-            QGroupBox#annotationSection QListWidget {
-                background-color: #0f1724;
-                border: 1px solid #1f2a3d;
-                border-radius: 6px;
-            }
-            QFrame#prefetchSection {
-                background-color: #141e30;
-                border: 1px solid #24324b;
-                border-radius: 10px;
-                margin-top: 12px;
-                padding: 16px 16px 12px 16px;
-            }
-            QToolButton {
-                background-color: #1a2333;
-                border: 1px solid #263247;
-                border-radius: 4px;
-                padding: 4px 8px;
-                color: #dfe7ff;
-            }
-            QToolButton:hover {
-                background-color: #25314a;
-            }
-            QToolButton:pressed {
-                background-color: #172132;
-            }
-            QFrame#prefetchSection QToolButton {
-                background-color: transparent;
-                border: none;
-                border-radius: 0px;
-                padding: 0px;
-                color: #a7b4cf;
-                font-weight: 600;
-            }
-            QFrame#prefetchSection QToolButton:hover {
-                color: #d0dcf5;
-                background-color: transparent;
-            }
-            QProgressBar#ingestBar {
-                background-color: #121a24;
-                border: 1px solid #1f2a3d;
-                border-radius: 6px;
-                padding: 3px;
-                color: #e6ebf5;
-            }
-            QProgressBar#ingestBar::chunk {
-                background-color: #3d6dff;
-                border-radius: 4px;
-            }
-            QScrollArea { background-color: #0b111c; }
-        """
-        )
-
     def _connect_signals(self):
         self.startSpin.valueChanged.connect(self._on_start_spin_changed)
         self.windowSpin.valueChanged.connect(self._on_duration_spin_changed)
@@ -618,6 +524,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.resetViewBtn.clicked.connect(self._reset_view)
         self.prefetchApplyBtn.clicked.connect(self._apply_prefetch_settings)
         self.prefetchSection.toggled.connect(self._on_prefetch_section_toggled)
+        self.themeCombo.currentIndexChanged.connect(self._on_theme_changed)
         self.annotationToggle.toggled.connect(self._on_annotation_toggle)
         self.annotationFocusOnly.toggled.connect(self._on_annotation_focus_only_changed)
         self.annotationImportBtn.clicked.connect(self._prompt_import_annotations)
@@ -635,6 +542,116 @@ class MainWindow(QtWidgets.QMainWindow):
         self._shortcuts.append(QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_Equal), self, activated=lambda: self._zoom_factor(0.5)))
         self._shortcuts.append(QtGui.QShortcut(QtGui.QKeySequence("F"), self, activated=self._full_view))
         self._shortcuts.append(QtGui.QShortcut(QtGui.QKeySequence("R"), self, activated=self._reset_view))
+
+    def _on_theme_changed(self, index: int) -> None:
+        data = self.themeCombo.itemData(index)
+        if not data:
+            return
+        self._apply_theme(str(data), persist=True)
+
+    def _apply_theme(self, key: str, *, persist: bool) -> None:
+        resolved_key = key if key in THEMES else DEFAULT_THEME
+        theme = THEMES.get(resolved_key, THEMES[DEFAULT_THEME])
+        self._active_theme_key = resolved_key
+        self._theme = theme
+
+        if hasattr(self, "themeCombo"):
+            idx = self.themeCombo.findData(resolved_key)
+            if idx >= 0 and self.themeCombo.currentIndex() != idx:
+                with QtCore.QSignalBlocker(self.themeCombo):
+                    self.themeCombo.setCurrentIndex(idx)
+
+        self._config.theme = resolved_key
+
+        pg.setConfigOption("background", theme.pg_background)
+        pg.setConfigOption("foreground", theme.pg_foreground)
+
+        self.setStyleSheet(theme.stylesheet)
+        self.plotLayout.setBackground(theme.pg_background)
+        for plot in self.plots:
+            plot.setBackground(theme.pg_background)
+            for axis_name in ("bottom", "left"):
+                axis = plot.getAxis(axis_name)
+                if axis is not None:
+                    pen = pg.mkPen(theme.pg_foreground)
+                    axis.setPen(pen)
+                    axis.setTextPen(theme.pg_foreground)
+
+        self.time_axis.setPen(pg.mkPen(theme.pg_foreground))
+        self.time_axis.setTextPen(theme.pg_foreground)
+
+        if self.stage_plot is not None:
+            self.stage_plot.setBackground(theme.pg_background)
+            for axis_name in ("left", "bottom"):
+                axis = self.stage_plot.getAxis(axis_name)
+                if axis is not None:
+                    pen = pg.mkPen(theme.pg_foreground)
+                    axis.setPen(pen)
+                    axis.setTextPen(theme.pg_foreground)
+        if self._stage_curve is not None:
+            self._stage_curve.setPen(pg.mkPen(theme.stage_curve_color, width=2))
+
+        self._apply_curve_pens()
+        self._refresh_channel_label_styles()
+        self._update_stage_label_style()
+        self._update_theme_preview(resolved_key)
+
+        if persist:
+            self._write_persistent_state()
+
+    def _curve_color(self, idx: int) -> str:
+        colors = self._theme.curve_colors or ("#5f8bff",)
+        return colors[idx % len(colors)]
+
+    def _apply_curve_pens(self) -> None:
+        for idx, curve in enumerate(self.curves):
+            color = self._curve_color(idx)
+            curve.setPen(pg.mkPen(color, width=1.2))
+
+    def _refresh_channel_label_styles(self) -> None:
+        if not self.channel_labels:
+            return
+        n = self.loader.n_channels
+        for idx, label_item in enumerate(self.channel_labels):
+            if idx >= n:
+                continue
+            meta = self.loader.info[idx]
+            hidden = idx in self._hidden_channels
+            label_item.setText(self._format_label(meta, hidden=hidden))
+
+    def _update_stage_label_style(self) -> None:
+        if self._stage_label_item is not None:
+            self._stage_label_item.setText(self._stage_label_markup())
+
+    def _stage_label_markup(self) -> str:
+        color = getattr(self._theme, "channel_label_active", "#ffffff")
+        return (
+            "<span style='color:" + color + ";font-weight:600;font-size:11pt;padding-right:12px;'>Stage</span>"
+        )
+
+    def _update_theme_preview(self, key: str) -> None:
+        if not hasattr(self, "themePreviewWidget"):
+            return
+        layout = self.themePreviewWidget.layout()
+        if layout is None:
+            return
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        theme = THEMES.get(key, THEMES[DEFAULT_THEME])
+        colors = theme.preview_colors or theme.curve_colors[:3]
+        for color in colors:
+            swatch = QtWidgets.QFrame()
+            swatch.setFixedSize(18, 18)
+            swatch.setStyleSheet(
+                "QFrame { background-color: %s; border: 1px solid rgba(0, 0, 0, 70); border-radius: 4px; }"
+                % color
+            )
+            layout.addWidget(swatch)
+        layout.addStretch(1)
+        self.themePreviewWidget.setVisible(bool(colors))
 
     def _init_overscan_worker(self):
         self._shutdown_overscan_worker()
@@ -1069,6 +1086,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if not hasattr(self, "annotationFocusOnly"):
             return
         self._config.annotation_focus_only = bool(self.annotationFocusOnly.isChecked())
+        if hasattr(self, "themeCombo"):
+            data = self.themeCombo.currentData()
+            if isinstance(data, str):
+                self._config.theme = data
         self._config.save()
 
     def _schedule_prefetch(self):
@@ -1833,7 +1854,9 @@ class MainWindow(QtWidgets.QMainWindow):
             plot.setMenuEnabled(False)
             plot.setMouseEnabled(x=True, y=False)
             plot.showGrid(x=False, y=True, alpha=0.15)
-            curve = plot.plot([], [], pen=pg.mkPen(pg.intColor(idx, values=220), width=1.2))
+            plot.setBackground(self._theme.pg_background)
+            curve_color = self._curve_color(idx)
+            curve = plot.plot([], [], pen=pg.mkPen(curve_color, width=1.2))
             curve.setClipToView(True)
             curve.setDownsampling(auto=True, method="peak")
 
@@ -1865,6 +1888,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
             meta = self.loader.info[idx]
             visible = idx not in self._hidden_channels
+            plot.setBackground(self._theme.pg_background)
             self._apply_channel_visible(
                 idx,
                 visible,
@@ -1872,8 +1896,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 persist=False,
             )
 
-            pen = pg.mkPen(pg.intColor(idx, hues=max(1, n), values=220), width=1.2)
-            self.curves[idx].setPen(pen)
+            self.curves[idx].setPen(pg.mkPen(self._curve_color(idx), width=1.2))
 
         if n == 0:
             self._primary_plot = None
@@ -1982,7 +2005,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if meta is not None:
             label_item.setVisible(visible)
-            label_item.setText(self._format_label(meta, hidden=False))
+            label_item.setText(self._format_label(meta, hidden=not visible))
 
         if sync_checkbox and idx < len(self.channel_checkboxes):
             checkbox = self.channel_checkboxes[idx]
@@ -2002,16 +2025,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self._apply_channel_visible(idx, bool(visible), sync_checkbox=True, persist=True)
         self.refresh()
 
-    @staticmethod
-    def _format_label(meta, *, hidden: bool = False) -> str:
+    def _format_label(self, meta, *, hidden: bool = False) -> str:
         unit = f" [{meta.unit}]" if getattr(meta, "unit", "") else ""
         text = f"{meta.name}{unit}"
+        theme = getattr(self, "_theme", THEMES[DEFAULT_THEME])
         if hidden:
-            color = "#6c788f"
+            color = theme.channel_label_hidden
             extra = "font-style: italic; opacity:0.7;"
             text = f"{text} (hidden)"
         else:
-            color = "#dfe7ff"
+            color = theme.channel_label_active
             extra = "font-weight:600;"
         return (
             "<span style='color:" + color + ";" + extra + "font-size:11pt;padding-right:12px;'>"
@@ -2025,6 +2048,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._stage_label_item = self.plotLayout.addLabel(
                 row=row, col=0, text="Stage", justify="right"
             )
+            self._stage_label_item.setText(self._stage_label_markup())
             plot = self.plotLayout.addPlot(row=row, col=1)
             plot.setMaximumHeight(90)
             plot.setMenuEnabled(False)
@@ -2033,6 +2057,7 @@ class MainWindow(QtWidgets.QMainWindow):
             plot.hideAxis("right")
             plot.hideAxis("top")
             plot.getAxis("left").setStyle(showValues=True)
+            plot.setBackground(self._theme.pg_background)
             ticks = [
                 (0.0, "N3"),
                 (1.0, "N2"),
@@ -2043,8 +2068,16 @@ class MainWindow(QtWidgets.QMainWindow):
             plot.setYRange(-0.5, 4.5)
             plot.getAxis("left").setTicks([ticks])
             plot.showAxis("bottom", show=True)
+            for axis_name in ("left", "bottom"):
+                axis = plot.getAxis(axis_name)
+                if axis is not None:
+                    pen = pg.mkPen(self._theme.pg_foreground)
+                    axis.setPen(pen)
+                    axis.setTextPen(self._theme.pg_foreground)
             self.stage_plot = plot
-            self._stage_curve = plot.plot([], [], stepMode=True, fillLevel=None, pen=pg.mkPen("#5f8bff", width=2))
+            self._stage_curve = plot.plot(
+                [], [], stepMode=True, fillLevel=None, pen=pg.mkPen(self._theme.stage_curve_color, width=2)
+            )
 
         if self._primary_plot is not None and self.stage_plot is not None:
             self.stage_plot.setXLink(self._primary_plot)
