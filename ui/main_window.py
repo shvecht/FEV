@@ -150,6 +150,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._zarr_path: Path | None = None
         self._pending_loader: object | None = None
         self._primary_viewbox = None
+        self._splitter: QtWidgets.QSplitter | None = None
+        self._control_wrapper: QtWidgets.QWidget | None = None
+        self._control_scroll: QtWidgets.QScrollArea | None = None
+        self._control_rail: QtWidgets.QWidget | None = None
         self._limits = WindowLimits(
             duration_min=0.25,
             duration_max=float(getattr(loader, "max_window_s", 120.0)),
@@ -176,6 +180,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._active_theme_key = theme_key
         self._theme: ThemeDefinition = THEMES[theme_key]
         self._config.theme = theme_key
+        self._controls_collapsed = bool(getattr(self._config, "controls_collapsed", False))
 
         pg.setConfigOptions(antialias=True)
 
@@ -291,6 +296,7 @@ class MainWindow(QtWidgets.QMainWindow):
         controlLayout = QtWidgets.QVBoxLayout(control)
         controlLayout.setContentsMargins(18, 18, 18, 18)
         controlLayout.setSpacing(14)
+        self.controlPanel = control
 
         navLayout = QtWidgets.QHBoxLayout()
         navLayout.setSpacing(6)
@@ -497,13 +503,84 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         control_scroll.setMinimumWidth(control.minimumWidth())
         control_scroll.setWidget(control)
+        self._control_scroll = control_scroll
+
+        self._control_rail = QtWidgets.QFrame()
+        self._control_rail.setObjectName("controlRail")
+        self._control_rail.setSizePolicy(
+            QtWidgets.QSizePolicy.Fixed,
+            QtWidgets.QSizePolicy.Expanding,
+        )
+        self._control_rail.setMinimumWidth(48)
+        self._control_rail.setMaximumWidth(48)
+        railLayout = QtWidgets.QVBoxLayout(self._control_rail)
+        railLayout.setContentsMargins(4, 8, 4, 8)
+        railLayout.setSpacing(6)
+
+        def _make_icon_button(pixmap: QtWidgets.QStyle.StandardPixmap, tooltip: str) -> QtWidgets.QToolButton:
+            btn = QtWidgets.QToolButton()
+            btn.setToolButtonStyle(QtCore.Qt.ToolButtonIconOnly)
+            btn.setIcon(self.style().standardIcon(pixmap))
+            btn.setIconSize(QtCore.QSize(20, 20))
+            btn.setAutoRaise(True)
+            btn.setCursor(QtCore.Qt.PointingHandCursor)
+            btn.setToolTip(tooltip)
+            return btn
+
+        self.railOpenBtn = _make_icon_button(QtWidgets.QStyle.SP_DialogOpenButton, "Open EDF…")
+        self.railOpenBtn.clicked.connect(self._prompt_open_file)
+        railLayout.addWidget(self.railOpenBtn)
+
+        self.railAnnotationBtn = _make_icon_button(QtWidgets.QStyle.SP_DialogYesButton, "Toggle annotations")
+        self.railAnnotationBtn.setCheckable(True)
+        self.railAnnotationBtn.setChecked(self.annotationToggle.isChecked())
+        self.railAnnotationBtn.toggled.connect(self.annotationToggle.setChecked)
+        self.annotationToggle.toggled.connect(self.railAnnotationBtn.setChecked)
+        railLayout.addWidget(self.railAnnotationBtn)
+
+        railLayout.addSpacing(12)
+
+        self.railPanLeftBtn = _make_icon_button(QtWidgets.QStyle.SP_ArrowBack, "Pan window left")
+        self.railPanLeftBtn.clicked.connect(self.panLeftBtn.click)
+        railLayout.addWidget(self.railPanLeftBtn)
+
+        self.railPanRightBtn = _make_icon_button(QtWidgets.QStyle.SP_ArrowForward, "Pan window right")
+        self.railPanRightBtn.clicked.connect(self.panRightBtn.click)
+        railLayout.addWidget(self.railPanRightBtn)
+
+        self.railZoomInBtn = _make_icon_button(QtWidgets.QStyle.SP_ArrowUp, "Zoom in")
+        self.railZoomInBtn.clicked.connect(self.zoomInBtn.click)
+        railLayout.addWidget(self.railZoomInBtn)
+
+        self.railZoomOutBtn = _make_icon_button(QtWidgets.QStyle.SP_ArrowDown, "Zoom out")
+        self.railZoomOutBtn.clicked.connect(self.zoomOutBtn.click)
+        railLayout.addWidget(self.railZoomOutBtn)
+
+        railLayout.addStretch(1)
+
+        self.controlToggleBtn = QtWidgets.QToolButton()
+        self.controlToggleBtn.setAutoRaise(True)
+        self.controlToggleBtn.setCheckable(True)
+        self.controlToggleBtn.setToolButtonStyle(QtCore.Qt.ToolButtonIconOnly)
+        self.controlToggleBtn.setCursor(QtCore.Qt.PointingHandCursor)
+        self.controlToggleBtn.setToolTip("Collapse controls")
+        railLayout.addWidget(self.controlToggleBtn)
+
+        control_wrapper = QtWidgets.QWidget()
+        wrapperLayout = QtWidgets.QHBoxLayout(control_wrapper)
+        wrapperLayout.setContentsMargins(0, 0, 0, 0)
+        wrapperLayout.setSpacing(0)
+        wrapperLayout.addWidget(self._control_rail)
+        wrapperLayout.addWidget(control_scroll)
+        self._control_wrapper = control_wrapper
 
         splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
-        splitter.addWidget(control_scroll)
+        splitter.addWidget(control_wrapper)
         splitter.addWidget(scroll)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setSizes([220, 980])
+        self._splitter = splitter
 
         central = QtWidgets.QWidget()
         centralLayout = QtWidgets.QVBoxLayout(central)
@@ -511,6 +588,12 @@ class MainWindow(QtWidgets.QMainWindow):
         centralLayout.setSpacing(0)
         centralLayout.addWidget(splitter)
         self.setCentralWidget(central)
+
+        with QtCore.QSignalBlocker(self.controlToggleBtn):
+            self.controlToggleBtn.setChecked(self._controls_collapsed)
+        self._update_control_toggle_icon(self._controls_collapsed)
+        self._apply_control_panel_state(self._controls_collapsed)
+        QtCore.QTimer.singleShot(0, lambda: self._apply_control_panel_state(self._controls_collapsed))
 
     def _connect_signals(self):
         self.startSpin.valueChanged.connect(self._on_start_spin_changed)
@@ -534,6 +617,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.eventList.itemDoubleClicked.connect(self._on_event_activated)
         self.eventPrevBtn.clicked.connect(lambda: self._step_event(-1))
         self.eventNextBtn.clicked.connect(lambda: self._step_event(1))
+        self.controlToggleBtn.toggled.connect(self._on_control_toggle)
 
         self._shortcuts: list[QtGui.QShortcut] = []
         self._shortcuts.append(QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_Left), self, activated=lambda: self._pan_fraction(-0.1)))
@@ -542,6 +626,64 @@ class MainWindow(QtWidgets.QMainWindow):
         self._shortcuts.append(QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_Equal), self, activated=lambda: self._zoom_factor(0.5)))
         self._shortcuts.append(QtGui.QShortcut(QtGui.QKeySequence("F"), self, activated=self._full_view))
         self._shortcuts.append(QtGui.QShortcut(QtGui.QKeySequence("R"), self, activated=self._reset_view))
+        self._shortcuts.append(
+            QtGui.QShortcut(
+                QtGui.QKeySequence("Ctrl+Shift+C"),
+                self,
+                activated=lambda: self._set_controls_collapsed(not self._controls_collapsed, persist=True),
+            )
+        )
+
+    def _on_control_toggle(self, collapsed: bool) -> None:
+        self._set_controls_collapsed(bool(collapsed), persist=True)
+
+    def _set_controls_collapsed(self, collapsed: bool, *, persist: bool) -> None:
+        collapsed = bool(collapsed)
+        if self._controls_collapsed == collapsed:
+            self._apply_control_panel_state(collapsed)
+        else:
+            self._controls_collapsed = collapsed
+            self._apply_control_panel_state(collapsed)
+        if persist:
+            self._config.controls_collapsed = collapsed
+            self._config.save()
+
+    def _apply_control_panel_state(self, collapsed: bool) -> None:
+        if self._control_wrapper is None or self._control_scroll is None or self._control_rail is None:
+            return
+        collapsed = bool(collapsed)
+        self._control_scroll.setVisible(not collapsed)
+        rail_width = self._control_rail.sizeHint().width()
+        if collapsed:
+            self._control_wrapper.setMinimumWidth(rail_width)
+            self._control_wrapper.setMaximumWidth(rail_width)
+        else:
+            expanded_width = max(
+                rail_width + (self.controlPanel.minimumWidth() if hasattr(self, "controlPanel") else 200),
+                self._control_wrapper.sizeHint().width(),
+            )
+            self._control_wrapper.setMinimumWidth(expanded_width)
+            self._control_wrapper.setMaximumWidth(16777215)
+        if self.controlToggleBtn.isChecked() != collapsed:
+            with QtCore.QSignalBlocker(self.controlToggleBtn):
+                self.controlToggleBtn.setChecked(collapsed)
+        self._update_control_toggle_icon(collapsed)
+        if self._splitter is not None:
+            sizes = self._splitter.sizes()
+            total = sum(sizes)
+            if total <= 0:
+                total = max(self.width(), rail_width + 600)
+            if collapsed:
+                first = rail_width
+            else:
+                first = max(self._control_wrapper.sizeHint().width(), rail_width + 200)
+            second = max(1, total - first)
+            self._splitter.setSizes([first, second])
+
+    def _update_control_toggle_icon(self, collapsed: bool) -> None:
+        arrow = QtCore.Qt.RightArrow if collapsed else QtCore.Qt.LeftArrow
+        self.controlToggleBtn.setArrowType(arrow)
+        self.controlToggleBtn.setToolTip("Expand controls" if collapsed else "Collapse controls")
 
     def _on_theme_changed(self, index: int) -> None:
         data = self.themeCombo.itemData(index)
@@ -1090,6 +1232,7 @@ class MainWindow(QtWidgets.QMainWindow):
             data = self.themeCombo.currentData()
             if isinstance(data, str):
                 self._config.theme = data
+        self._config.controls_collapsed = bool(self._controls_collapsed)
         self._config.save()
 
     def _schedule_prefetch(self):
