@@ -5,6 +5,7 @@ import logging
 import os
 from dataclasses import dataclass
 from collections import Counter
+from functools import partial
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, Sequence
@@ -187,6 +188,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._overscan_worker: _OverscanWorker | None = None
         self._init_overscan_worker()
 
+        self._hidden_channels: set[int] = set(getattr(self._config, "hidden_channels", ()))
         self._manual_annotation_paths: dict[str, Path] = {}
         self._annotations_index: annotation_core.AnnotationIndex | None = None
         self._annotation_lines: list[pg.InfiniteLine] = []
@@ -302,6 +304,16 @@ class MainWindow(QtWidgets.QMainWindow):
         primaryLayout.addLayout(fileRow)
         primaryLayout.addLayout(form)
 
+        channelContent = QtWidgets.QWidget()
+        channelContentLayout = QtWidgets.QVBoxLayout(channelContent)
+        channelContentLayout.setContentsMargins(0, 0, 0, 0)
+        channelContentLayout.setSpacing(6)
+        self.channel_checkboxes: list[QtWidgets.QCheckBox] = []
+        self._channel_list_layout = channelContentLayout
+        channelContentLayout.addStretch(1)
+        self.channelSection = CollapsibleSection("Channels", channelContent, expanded=True)
+        self.channelSection.setObjectName("channelSection")
+
         telemetryBar = QtWidgets.QFrame()
         telemetryBar.setObjectName("telemetryBar")
         telemetryBar.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
@@ -329,6 +341,7 @@ class MainWindow(QtWidgets.QMainWindow):
         annotationLayout.addLayout(eventNav)
 
         controlLayout.addWidget(primaryControls)
+        controlLayout.addWidget(self.channelSection)
         controlLayout.addWidget(telemetryBar)
         controlLayout.addWidget(self.sourceLabel)
         controlLayout.addWidget(annotationSection)
@@ -478,6 +491,16 @@ class MainWindow(QtWidgets.QMainWindow):
             QGroupBox#primaryControls PushButton:pressed,
             QGroupBox#annotationSection PushButton:pressed {
                 background-color: #142033;
+            }
+            QFrame#channelSection {
+                background-color: #141e30;
+                border: 1px solid #24324b;
+                border-radius: 10px;
+                margin-top: 12px;
+                padding: 16px 16px 12px 16px;
+            }
+            QFrame#channelSection QCheckBox {
+                color: #dfe7ff;
             }
             QGroupBox#annotationSection QListWidget {
                 background-color: #0f1724;
@@ -664,6 +687,9 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self._current_tile_id = None
             for i in range(self.loader.n_channels):
+                if i in self._hidden_channels:
+                    self.curves[i].setData([], [])
+                    continue
                 t, x = self.loader.read(i, t0, t1)
                 if pixels and x.size > pixels * 2:
                     t, x = min_max_bins(t, x, pixels)
@@ -980,6 +1006,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _schedule_prefetch(self):
         total = self.loader.duration_s
         for ch in range(self.loader.n_channels):
+            if ch in self._hidden_channels:
+                continue
             start = max(0.0, self._view_start - self._view_duration)
             start = min(start, total)
             duration = min(self._view_duration * 3, max(0.0, total - start))
@@ -1010,6 +1038,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _schedule_prefetch(self):
         for ch in range(self.loader.n_channels):
+            if ch in self._hidden_channels:
+                continue
             start = max(0.0, self._view_start - self._view_duration)
             duration = self._view_duration * 3
             self._prefetch.prefetch_window(ch, start, duration)
@@ -1489,6 +1519,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._prepare_tile(tile)
         for idx, (t_arr, x_arr) in enumerate(tile.channel_data):
             if idx < len(self.curves):
+                if idx in self._hidden_channels:
+                    self.curves[idx].setData([], [])
+                    continue
                 self.curves[idx].setData(t_arr, x_arr)
         self._current_tile_id = tile.request_id
 
@@ -1612,6 +1645,10 @@ class MainWindow(QtWidgets.QMainWindow):
         old_primary = self._primary_plot
         self._ensure_plot_rows(n)
 
+        # Trim hidden channels to valid range
+        self._hidden_channels = {idx for idx in self._hidden_channels if 0 <= idx < n}
+        self._sync_channel_controls()
+
         # Reset previous primary axis if needed
         if self._primary_plot and self._primary_plot not in self.plots[:n]:
             self._primary_plot.setAxisItems({"bottom": pg.AxisItem(orientation="bottom")})
@@ -1622,12 +1659,18 @@ class MainWindow(QtWidgets.QMainWindow):
             if not active:
                 plot.hide()
                 self.channel_labels[idx].setText("")
+                self.channel_labels[idx].setVisible(False)
                 self.curves[idx].setData([], [])
                 continue
 
-            plot.show()
             meta = self.loader.info[idx]
-            self.channel_labels[idx].setText(self._format_label(meta))
+            visible = idx not in self._hidden_channels
+            self._apply_channel_visible(
+                idx,
+                visible,
+                sync_checkbox=False,
+                persist=False,
+            )
 
             pen = pg.mkPen(pg.intColor(idx, hues=max(1, n), values=220), width=1.2)
             self.curves[idx].setPen(pen)
@@ -1672,12 +1715,106 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._ensure_stage_plot()
 
+    def _sync_channel_controls(self) -> None:
+        if not hasattr(self, "channelSection"):
+            return
+        n = self.loader.n_channels
+        self.channelSection.setVisible(n > 0)
+        layout = getattr(self, "_channel_list_layout", None)
+        if layout is None:
+            return
+
+        while len(self.channel_checkboxes) < n:
+            checkbox = QtWidgets.QCheckBox()
+            checkbox.setCursor(QtCore.Qt.PointingHandCursor)
+            idx = len(self.channel_checkboxes)
+            checkbox.toggled.connect(partial(self._on_channel_checkbox_toggled, idx))
+            layout.insertWidget(max(0, layout.count() - 1), checkbox)
+            self.channel_checkboxes.append(checkbox)
+
+        while len(self.channel_checkboxes) > n:
+            checkbox = self.channel_checkboxes.pop()
+            checkbox.hide()
+            checkbox.deleteLater()
+
+        hidden = self._hidden_channels
+        for idx, checkbox in enumerate(self.channel_checkboxes):
+            meta = self.loader.info[idx]
+            label = meta.name
+            if getattr(meta, "unit", ""):
+                label = f"{label} [{meta.unit}]"
+            checkbox.blockSignals(True)
+            checkbox.setText(label)
+            checkbox.setChecked(idx not in hidden)
+            checkbox.blockSignals(False)
+
+    def _apply_channel_visible(
+        self,
+        idx: int,
+        visible: bool,
+        *,
+        sync_checkbox: bool,
+        persist: bool,
+    ) -> None:
+        if idx >= len(self.plots):
+            return
+
+        n = self.loader.n_channels
+        plot = self.plots[idx]
+        label_item = self.channel_labels[idx]
+        curve = self.curves[idx]
+        meta = self.loader.info[idx] if idx < n else None
+
+        if idx >= n:
+            plot.hide()
+            label_item.setVisible(False)
+            curve.setData([], [])
+            self._hidden_channels.discard(idx)
+            return
+
+        if visible:
+            plot.show()
+            self._hidden_channels.discard(idx)
+        else:
+            plot.hide()
+            self._hidden_channels.add(idx)
+            curve.setData([], [])
+
+        if meta is not None:
+            label_item.setVisible(True)
+            label_item.setText(self._format_label(meta, hidden=not visible))
+
+        if sync_checkbox and idx < len(self.channel_checkboxes):
+            checkbox = self.channel_checkboxes[idx]
+            checkbox.blockSignals(True)
+            checkbox.setChecked(visible)
+            checkbox.blockSignals(False)
+
+        if persist:
+            self._config.hidden_channels = tuple(sorted(self._hidden_channels))
+            self._config.save()
+
+    def _on_channel_checkbox_toggled(self, idx: int, checked: bool) -> None:
+        self._set_channel_visible(idx, bool(checked))
+
+    @QtCore.Slot(int, bool)
+    def _set_channel_visible(self, idx: int, visible: bool) -> None:
+        self._apply_channel_visible(idx, bool(visible), sync_checkbox=True, persist=True)
+        self.refresh()
+
     @staticmethod
-    def _format_label(meta) -> str:
+    def _format_label(meta, *, hidden: bool = False) -> str:
         unit = f" [{meta.unit}]" if getattr(meta, "unit", "") else ""
         text = f"{meta.name}{unit}"
+        if hidden:
+            color = "#6c788f"
+            extra = "font-style: italic; opacity:0.7;"
+            text = f"{text} (hidden)"
+        else:
+            color = "#dfe7ff"
+            extra = "font-weight:600;"
         return (
-            "<span style='color:#dfe7ff;font-weight:600;font-size:11pt;padding-right:12px;'>"
+            "<span style='color:" + color + ";" + extra + "font-size:11pt;padding-right:12px;'>"
             f"{text}"
             "</span>"
         )
