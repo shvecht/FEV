@@ -12,6 +12,7 @@ class ViewerConfig:
     prefetch_max_tiles: int | None = 64
     prefetch_max_mb: float | None = 16.0
     prefetch_collapsed: bool = False
+    controls_collapsed: bool = False
     int16_cache_enabled: bool = False
     int16_cache_max_mb: float = 512.0
     int16_cache_memmap: bool = False
@@ -39,6 +40,9 @@ class ViewerConfig:
             if ui_section:
                 cfg.prefetch_collapsed = ui_section.getboolean(
                     "prefetch_collapsed", fallback=cfg.prefetch_collapsed
+                )
+                cfg.controls_collapsed = ui_section.getboolean(
+                    "controls_collapsed", fallback=cfg.controls_collapsed
                 )
                 cfg.annotation_focus_only = ui_section.getboolean(
                     "annotation_focus_only", fallback=cfg.annotation_focus_only
@@ -95,6 +99,7 @@ class ViewerConfig:
         hidden_serialized = ",".join(str(idx) for idx in sorted(set(self.hidden_channels)))
         parser["ui"] = {
             "prefetch_collapsed": "true" if self.prefetch_collapsed else "false",
+            "controls_collapsed": "true" if self.controls_collapsed else "false",
             "hidden_channels": hidden_serialized,
             "annotation_focus_only": "true" if self.annotation_focus_only else "false",
             "theme": self.theme,
