@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from dataclasses import dataclass
 from collections import Counter
 from functools import partial
@@ -28,6 +29,17 @@ from core import annotations as annotation_core
 
 
 LOG = logging.getLogger(__name__)
+
+STAGE_COLORS: dict[str, str] = {
+    "Wake": "#f6c87c",
+    "N1": "#f3dda3",
+    "N2": "#9fd7a5",
+    "N3": "#6ec2d0",
+    "REM": "#f59db7",
+}
+DEFAULT_STAGE_COLOR = "#b9c1cf"
+STAGE_LABEL_COLOR = "#0f1a2b"
+STAGE_TEXT_MARGIN = 26.0
 
 
 class _ZarrIngestWorker(QtCore.QObject):
@@ -200,6 +212,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._init_overscan_worker()
 
         self._hidden_channels: set[int] = set(getattr(self._config, "hidden_channels", ()))
+        self._auto_hide_annotation_channels()
         hidden_ann = getattr(self._config, "hidden_annotation_channels", ("stage", "position"))
         self._hidden_annotation_channels: set[str] = {
             str(name).strip() for name in hidden_ann if str(name).strip()
@@ -209,6 +222,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._annotation_lines: list[pg.InfiniteLine] = []
         self._annotations_enabled = False
         self._annotation_rects: list[QtWidgets.QGraphicsRectItem] = []
+        self._stage_rects: list[QtWidgets.QGraphicsRectItem] = []
+        self._stage_label_items: list[QtWidgets.QGraphicsSimpleTextItem] = []
         self._all_event_records: list[dict[str, float | str | int]] = []
         self._event_records: list[dict[str, float | str | int]] = []
         self._current_event_index: int = -1
@@ -1746,14 +1761,113 @@ class MainWindow(QtWidgets.QMainWindow):
             scene.addItem(rect_item)
             self._annotation_rects.append(rect_item)
 
+    def _ensure_stage_rect_pool(self, count: int):
+        scene = self.plotLayout.scene()
+        while len(self._stage_rects) < count:
+            rect_item = QtWidgets.QGraphicsRectItem()
+            rect_item.setPen(QtGui.QPen(QtCore.Qt.NoPen))
+            rect_item.setZValue(-40)
+            rect_item.setVisible(False)
+            scene.addItem(rect_item)
+
+            label_item = QtWidgets.QGraphicsSimpleTextItem("")
+            font = label_item.font()
+            font.setBold(True)
+            label_item.setFont(font)
+            label_item.setBrush(QtGui.QBrush(QtGui.QColor(STAGE_LABEL_COLOR)))
+            label_item.setZValue(-39)
+            label_item.setVisible(False)
+            scene.addItem(label_item)
+
+            self._stage_rects.append(rect_item)
+            self._stage_label_items.append(label_item)
+
+    def _stage_color_for_label(self, label: str) -> QtGui.QColor:
+        base = STAGE_COLORS.get(label, DEFAULT_STAGE_COLOR)
+        color = QtGui.QColor(base)
+        color.setAlpha(90)
+        return color
+
+    def _clear_stage_rects(self):
+        for rect in self._stage_rects:
+            rect.setVisible(False)
+        for label_item in self._stage_label_items:
+            label_item.setVisible(False)
+
     def _clear_annotation_lines(self):
         for line in self._annotation_lines:
             line.setVisible(False)
         self._clear_annotation_rects()
+        self._clear_stage_rects()
 
     def _clear_annotation_rects(self):
         for rect in self._annotation_rects:
             rect.setVisible(False)
+
+    def _update_stage_background(self, stage_events: np.ndarray, t0: float, t1: float):
+        if not self._primary_plot:
+            self._clear_stage_rects()
+            return
+        if stage_events is None or getattr(stage_events, "size", 0) == 0:
+            self._clear_stage_rects()
+            return
+
+        vb = self._primary_plot.getViewBox()
+        if vb is None:
+            self._clear_stage_rects()
+            return
+
+        scene_rect = self.plotLayout.ci.mapRectToScene(self.plotLayout.ci.boundingRect())
+        if scene_rect is None:
+            self._clear_stage_rects()
+            return
+
+        segments: list[tuple[float, float, str]] = []
+        for ev in stage_events:
+            start = max(float(ev["start_s"]), t0)
+            end = min(float(ev["end_s"]), t1)
+            if end <= start:
+                continue
+            label = str(ev["label"]) or "--"
+            segments.append((start, end, label))
+
+        if not segments:
+            self._clear_stage_rects()
+            return
+
+        self._ensure_stage_rect_pool(len(segments))
+        height = scene_rect.height()
+
+        for idx, (start, end, label) in enumerate(segments):
+            p1 = vb.mapViewToScene(QtCore.QPointF(start, 0))
+            p2 = vb.mapViewToScene(QtCore.QPointF(end, 0))
+            x1, x2 = p1.x(), p2.x()
+            left = min(x1, x2)
+            width = max(2.0, abs(x2 - x1))
+            rect = QtCore.QRectF(left, scene_rect.top(), width, height)
+
+            rect_item = self._stage_rects[idx]
+            rect_item.setRect(rect)
+            rect_item.setBrush(QtGui.QBrush(self._stage_color_for_label(label)))
+            rect_item.setVisible(True)
+
+            label_item = self._stage_label_items[idx]
+            label_item.setText(label)
+            text_rect = label_item.boundingRect()
+            label_width = text_rect.width()
+            label_height = text_rect.height()
+            if width < label_width + 12:
+                label_item.setVisible(False)
+                continue
+            x_mid = left + (width - label_width) * 0.5
+            y_pos = scene_rect.bottom() - STAGE_TEXT_MARGIN - label_height * 0.5
+            label_item.setPos(x_mid, y_pos)
+            label_item.setVisible(True)
+
+        for idx in range(len(segments), len(self._stage_rects)):
+            self._stage_rects[idx].setVisible(False)
+        for idx in range(len(segments), len(self._stage_label_items)):
+            self._stage_label_items[idx].setVisible(False)
 
     def _set_annotation_channel_visible(
         self, channel: str, visible: bool, *, persist: bool = True
@@ -1993,11 +2107,20 @@ class MainWindow(QtWidgets.QMainWindow):
     def _update_annotation_overlays(self, t0: float, t1: float):
         if not self._primary_plot:
             return
-        if not self._annotations_index or not self._annotations_enabled:
+        if not self._annotations_index or self._annotations_index.is_empty():
             self._clear_annotation_lines()
             summary = self._event_count_summary()
             self.stageSummaryLabel.setText(
                 self._compose_status_text(None, None, summary)
+            )
+            return
+
+        if not self._annotations_enabled:
+            self._clear_annotation_lines()
+            summary = self._event_count_summary()
+            stage_label, position_label = self._current_stage_position_labels()
+            self.stageSummaryLabel.setText(
+                self._compose_status_text(stage_label, position_label, summary)
             )
             return
 
@@ -2055,14 +2178,17 @@ class MainWindow(QtWidgets.QMainWindow):
             for idx in range(len(events), len(self._annotation_rects)):
                 self._annotation_rects[idx].setVisible(False)
 
-        if annotation_core.STAGE_CHANNEL in hidden_channels:
-            stage_events = np.zeros(0, dtype=annotation_core.ANNOT_DTYPE)
+            self._clear_stage_rects()
         else:
             stage_events = self._annotations_index.between(
                 t0, t1, channels=[annotation_core.STAGE_CHANNEL]
             )
             if isinstance(stage_events, tuple):
                 stage_events = stage_events[0]
+            stage_events = np.array(stage_events, copy=False)
+            self._update_stage_background(stage_events, t0, t1)
+        if annotation_core.STAGE_CHANNEL in hidden_channels:
+            stage_events = np.zeros(0, dtype=annotation_core.ANNOT_DTYPE)
 
         if annotation_core.POSITION_CHANNEL in hidden_channels:
             position_events = np.zeros(0, dtype=annotation_core.ANNOT_DTYPE)
@@ -2412,6 +2538,35 @@ class MainWindow(QtWidgets.QMainWindow):
             f"{text}"
             "</span>"
         )
+
+    def _auto_hide_annotation_channels(self) -> None:
+        info = getattr(self.loader, "info", None)
+        if not info:
+            return
+        for idx, meta in enumerate(info):
+            name = getattr(meta, "name", "")
+            if not name:
+                continue
+            lowered = str(name).strip().lower()
+            if not lowered:
+                continue
+            sanitized = re.sub(r"[^a-z0-9]", "", lowered)
+            tokens = [tok for tok in re.split(r"[^a-z0-9]+", lowered) if tok]
+            token_set = set(tokens)
+
+            stage_hit = (
+                "hypnogram" in token_set
+                or ("sleep" in token_set and "stage" in token_set)
+                or sanitized in {"stage", "stages", "sleepstage", "sleepstages"}
+            )
+            position_hit = (
+                ("body" in token_set and "position" in token_set)
+                or "posture" in token_set
+                or sanitized in {"bodyposition", "bodypos", "positionbody"}
+            )
+
+            if stage_hit or position_hit:
+                self._hidden_channels.add(idx)
 
     def _ensure_stage_info_widget(self):
         if self._stage_info_widget is None:

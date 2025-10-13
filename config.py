@@ -17,7 +17,7 @@ class ViewerConfig:
     int16_cache_max_mb: float = 512.0
     int16_cache_memmap: bool = False
     hidden_channels: tuple[int, ...] = ()
-    hidden_annotation_channels: tuple[str, ...] = ("stage", "position")
+    hidden_annotation_channels: tuple[str, ...] = ()
     annotation_focus_only: bool = False
     theme: str = "Midnight"
     ini_path: Path | None = None
@@ -74,6 +74,10 @@ class ViewerConfig:
                             continue
                         names.append(part)
                     if names:
+                        normalized = tuple(part.lower() for part in names)
+                        if normalized == ("stage", "position"):
+                            names = []
+                    if names:
                         # Preserve unique entries while maintaining relative order
                         seen: set[str] = set()
                         ordered = []
@@ -82,6 +86,8 @@ class ViewerConfig:
                                 seen.add(name)
                                 ordered.append(name)
                         cfg.hidden_annotation_channels = tuple(ordered)
+                    else:
+                        cfg.hidden_annotation_channels = ()
 
             cache_section = parser["cache"] if "cache" in parser else None
             if cache_section:

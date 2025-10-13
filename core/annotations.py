@@ -85,7 +85,36 @@ def from_edfplus(edf_reader, time_zero_s: float = 0.0) -> Annotations:
     arr["start_s"] = onsets - float(time_zero_s)
     arr["end_s"]   = end_s   - float(time_zero_s)
     arr["label"]   = labels
-    arr["chan"]    = ""      # EDF+ annotations are usually global
+    arr["chan"]    = ""
+
+    position_canon = {
+        "Supine",
+        "Prone",
+        "Left Lateral",
+        "Right Lateral",
+        "Upright",
+        "Mixed",
+        "Other",
+        "Unknown",
+    }
+
+    for idx, raw_label in enumerate(labels):
+        stage_label = _normalise_stage_label(raw_label)
+        if stage_label:
+            arr["label"][idx] = stage_label
+            arr["chan"][idx] = STAGE_CHANNEL
+            continue
+        position_label = _normalise_position_label(raw_label)
+        if position_label in position_canon:
+            arr["label"][idx] = position_label
+            arr["chan"][idx] = POSITION_CHANNEL
+            continue
+        lowered = str(raw_label or "").strip().lower()
+        if lowered.startswith("position"):
+            arr["label"][idx] = _normalise_position_label(raw_label)
+            arr["chan"][idx] = POSITION_CHANNEL
+        else:
+            arr["label"][idx] = _normalise_label(raw_label)
 
     # sort by start
     order = np.argsort(arr["start_s"], kind="mergesort")
@@ -124,6 +153,73 @@ def _normalise_channel(channel: Optional[str]) -> str:
     if channel is None:
         return ""
     return str(channel).strip()
+
+
+_STAGE_ALIAS_MAP = {
+    "w": "Wake",
+    "wake": "Wake",
+    "awake": "Wake",
+    "n": "N1",
+    "n1": "N1",
+    "s1": "N1",
+    "stage1": "N1",
+    "1": "N1",
+    "nrem1": "N1",
+    "nrem01": "N1",
+    "n2": "N2",
+    "s2": "N2",
+    "stage2": "N2",
+    "2": "N2",
+    "nrem2": "N2",
+    "nrem02": "N2",
+    "light": "N2",
+    "n3": "N3",
+    "s3": "N3",
+    "stage3": "N3",
+    "3": "N3",
+    "n4": "N3",
+    "stage4": "N3",
+    "4": "N3",
+    "deep": "N3",
+    "sws": "N3",
+    "rem": "REM",
+    "r": "REM",
+    "stage5": "REM",
+    "5": "REM",
+}
+
+
+def _normalise_stage_label(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    lowered = text.lower()
+    lowered = lowered.replace("non-rem", "nrem")
+    lowered = lowered.replace("non rem", "nrem")
+    lowered = lowered.replace("rapid eye movement", "rem")
+    lowered = lowered.replace("rapid-eye-movement", "rem")
+    lowered = lowered.replace("sleep stage", "")
+    lowered = lowered.replace("slp stage", "")
+    lowered = lowered.replace("stage ", "")
+    lowered = lowered.replace("stage:", "")
+    lowered = lowered.replace("stage-", "")
+    lowered = lowered.replace("sleepstate", "")
+    lowered = lowered.replace("sleepstage", "")
+    lowered = lowered.replace("sleep", "")
+    lowered = lowered.replace("nrem", "n")
+    lowered = lowered.replace("light sleep", "light")
+    lowered = lowered.replace("deep sleep", "deep")
+    normalized = re.sub(r"[^a-z0-9]+", "", lowered)
+    if not normalized:
+        return None
+    # strip leading zeros (e.g. 01 -> 1)
+    normalized = normalized.lstrip("0")
+    label = _STAGE_ALIAS_MAP.get(normalized)
+    if label:
+        return label
+    return _STAGE_ALIAS_MAP.get(normalized.lower())
 
 
 @dataclass
@@ -387,6 +483,8 @@ def _normalise_position_label(value: Any) -> str:
 
     if token_set & {"other", "misc", "varied"}:
         return "Other"
+    if "mixed" in token_set:
+        return "Mixed"
 
     return text.strip().title()
 
@@ -467,17 +565,86 @@ def from_csv_positions(
 
 
 def discover_annotation_files(edf_path: str | Path) -> Dict[str, Path]:
+    """
+    Locate companion CSV files that ship alongside an EDF recording.
+
+    Historically we relied on an exact `<stem>STAGE.csv` / `<stem>POSITION.csv`
+    naming convention. Field systems, however, export slightly different
+    suffixes (e.g. `_Stages.csv`, `-position.csv`, mixed case extensions).
+    We now scan sibling CSVs that share the EDF stem (ignoring punctuation)
+    and pick the closest match for each role.
+    """
+
     base = Path(edf_path)
-    stem = base.with_suffix("")
-    candidates = {
-        "events": stem.with_suffix(".csv"),
-        "stages": stem.with_name(stem.name + "STAGE.csv"),
-        "positions": stem.with_name(stem.name + "POSITION.csv"),
-    }
+    parent = base.parent
+    stem = base.stem
+    stem_normalized = re.sub(r"[^a-z0-9]", "", stem.lower())
+
     found: Dict[str, Path] = {}
-    for key, candidate in candidates.items():
-        if candidate.exists():
-            found[key] = candidate
+
+    primary_events = base.with_suffix(".csv")
+    if primary_events.exists():
+        found["events"] = primary_events
+
+    def _score_stage(name: str) -> int:
+        if name.endswith("stage"):
+            return 3
+        if name.endswith("stages"):
+            return 2
+        if "stage" in name:
+            return 1
+        return 0
+
+    def _score_position(name: str) -> int:
+        if name.endswith("position"):
+            return 3
+        if "bodyposition" in name or "body_pos" in name:
+            return 2
+        if "position" in name or "posture" in name:
+            return 1
+        return 0
+
+    def _prefer(existing: tuple[int, Path] | None, score: int, candidate: Path):
+        if score <= 0:
+            return existing
+        if existing is None:
+            return (score, candidate)
+        prev_score, prev_path = existing
+        if score > prev_score:
+            return (score, candidate)
+        if score == prev_score and len(candidate.name) < len(prev_path.name):
+            return (score, candidate)
+        return existing
+
+    stage_choice: tuple[int, Path] | None = None
+    position_choice: tuple[int, Path] | None = None
+    events_choice: tuple[int, Path] | None = None
+
+    for csv_path in parent.glob(f"{stem}*"):
+        if not csv_path.is_file():
+            continue
+        if csv_path.suffix.lower() != ".csv":
+            continue
+        if csv_path == primary_events:
+            continue
+        name = csv_path.stem
+        name_lower = name.lower()
+        normalized = re.sub(r"[^a-z0-9]", "", name_lower)
+        if stem_normalized and not normalized.startswith(stem_normalized):
+            continue
+
+        stage_choice = _prefer(stage_choice, _score_stage(normalized), csv_path)
+        position_choice = _prefer(position_choice, _score_position(normalized), csv_path)
+        if "event" in name_lower or "annotation" in name_lower:
+            events_choice = _prefer(events_choice, 1, csv_path)
+
+    if events_choice and "events" not in found:
+        found["events"] = events_choice[1]
+    if stage_choice:
+        found["stages"] = stage_choice[1]
+    if position_choice:
+        found["positions"] = position_choice[1]
+
     return found
 
 
