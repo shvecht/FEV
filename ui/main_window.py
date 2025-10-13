@@ -257,7 +257,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.absoluteRange.setObjectName("absoluteRange")
         self.windowSummary = QtWidgets.QLabel("Window: 30.0 s")
         self.windowSummary.setObjectName("windowSummary")
-        self.stageSummaryLabel = QtWidgets.QLabel("Stage: --")
+        self.stageSummaryLabel = QtWidgets.QLabel("Stage: -- | Position: -- | Events: 0")
         self.stageSummaryLabel.setObjectName("stageSummary")
         self.stageSummaryLabel.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
         self.sourceLabel = QtWidgets.QLabel("Source: EDF (live)")
@@ -1387,7 +1387,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.annotationToggle.setEnabled(False)
         self.annotationFocusOnly.setEnabled(False)
         self._annotations_enabled = False
-        self.stageSummaryLabel.setText("Stage: --")
+        self.stageSummaryLabel.setText("Stage: -- | Position: -- | Events: 0")
         self._clear_annotation_lines()
         self._clear_annotation_rects()
         self._populate_event_list(clear=True)
@@ -1429,6 +1429,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 ann_sets.append(annotation_core.from_csv_stages(stages_path))
             except Exception as exc:  # pragma: no cover
                 LOG.warning("Failed to load stage CSV %s: %s", stages_path, exc)
+
+        positions_path = found.get("positions")
+        if positions_path:
+            try:
+                ann_sets.append(annotation_core.from_csv_positions(positions_path))
+            except Exception as exc:  # pragma: no cover
+                LOG.warning("Failed to load position CSV %s: %s", positions_path, exc)
 
         if not ann_sets:
             return
@@ -1533,8 +1540,52 @@ class MainWindow(QtWidgets.QMainWindow):
         data = self._annotations_index.data
         if data.size == 0:
             return data
-        mask = np.array([str(chan) == "stage" for chan in data["chan"]], dtype=bool)
+        mask = np.array(
+            [str(chan) == annotation_core.STAGE_CHANNEL for chan in data["chan"]],
+            dtype=bool,
+        )
         return data[mask]
+
+    def _position_annotations(self) -> np.ndarray:
+        if not self._annotations_index or self._annotations_index.is_empty():
+            return np.zeros(0, dtype=annotation_core.ANNOT_DTYPE)
+        data = self._annotations_index.data
+        if data.size == 0:
+            return data
+        mask = np.array(
+            [str(chan) == annotation_core.POSITION_CHANNEL for chan in data["chan"]],
+            dtype=bool,
+        )
+        return data[mask]
+
+    def _label_at_time(self, annotations: np.ndarray, timestamp: float) -> Optional[str]:
+        if annotations.size == 0:
+            return None
+        starts = annotations["start_s"]
+        idx = int(np.searchsorted(starts, timestamp, side="right") - 1)
+        if idx < 0 or idx >= annotations.size:
+            return None
+        if float(annotations[idx]["end_s"]) <= timestamp:
+            return None
+        label = str(annotations[idx]["label"]).strip()
+        return label or None
+
+    def _current_stage_position_labels(self) -> tuple[Optional[str], Optional[str]]:
+        center_time = self._view_start + self._view_duration * 0.5
+        stage_label = self._label_at_time(self._stage_annotations(), center_time)
+        position_label = self._label_at_time(self._position_annotations(), center_time)
+        return stage_label, position_label
+
+    def _compose_status_text(
+        self,
+        stage_label: Optional[str],
+        position_label: Optional[str],
+        events_summary: Optional[str],
+    ) -> str:
+        parts = [f"Stage: {stage_label or '--'}", f"Position: {position_label or '--'}"]
+        if events_summary:
+            parts.append(events_summary)
+        return " | ".join(parts)
 
     def _prompt_import_annotations(self):
         options = QtWidgets.QFileDialog.Options()
@@ -1548,7 +1599,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if not path:
             return
         path_obj = Path(path)
-        key = "stages" if path_obj.stem.upper().endswith("STAGE") else "events"
+        stem_upper = path_obj.stem.upper()
+        if stem_upper.endswith("STAGE"):
+            key = "stages"
+        elif stem_upper.endswith("POSITION"):
+            key = "positions"
+        else:
+            key = "events"
         self._manual_annotation_paths[key] = path_obj
         self._load_companion_annotations()
 
@@ -1614,7 +1671,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _update_annotation_summary(self):
         summary = self._event_count_summary()
-        self.stageSummaryLabel.setText(f"Stage: -- | {summary}")
+        stage_label, position_label = self._current_stage_position_labels()
+        self.stageSummaryLabel.setText(
+            self._compose_status_text(stage_label, position_label, summary)
+        )
 
     def _ensure_annotation_line_pool(self, count: int):
         if not self._primary_plot:
@@ -1663,7 +1723,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if data.size == 0 or ids.size == 0:
             return
 
-        mask = np.array([str(chan) != "stage" for chan in data["chan"]], dtype=bool)
+        excluded = {annotation_core.STAGE_CHANNEL, annotation_core.POSITION_CHANNEL}
+        mask = np.array([str(chan) not in excluded for chan in data["chan"]], dtype=bool)
         data = data[mask]
         ids = ids[mask]
         if data.size == 0:
@@ -1839,13 +1900,16 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self._annotations_index or not self._annotations_enabled:
             self._clear_annotation_lines()
             summary = self._event_count_summary()
-            self.stageSummaryLabel.setText(f"Stage: -- | {summary}")
+            self.stageSummaryLabel.setText(
+                self._compose_status_text(None, None, summary)
+            )
             return
 
         for line in self._annotation_lines:
             line.setVisible(False)
 
-        event_channels = [c for c in self._annotations_index.channel_set if c != "stage"]
+        excluded = {annotation_core.STAGE_CHANNEL, annotation_core.POSITION_CHANNEL}
+        event_channels = [c for c in self._annotations_index.channel_set if c not in excluded]
         events, ids = self._annotations_index.between(
             t0,
             t1,
@@ -1893,21 +1957,38 @@ class MainWindow(QtWidgets.QMainWindow):
             for idx in range(len(events), len(self._annotation_rects)):
                 self._annotation_rects[idx].setVisible(False)
 
-        stage_events = self._annotations_index.between(t0, t1, channels=["stage"])
+        stage_events = self._annotations_index.between(
+            t0, t1, channels=[annotation_core.STAGE_CHANNEL]
+        )
         if isinstance(stage_events, tuple):
             stage_events = stage_events[0]
-        summary = self._event_count_summary()
-        include_summary = (not focus_only) or bool(events.size)
-        if stage_events.size:
+        position_events = self._annotations_index.between(
+            t0, t1, channels=[annotation_core.POSITION_CHANNEL]
+        )
+        if isinstance(position_events, tuple):
+            position_events = position_events[0]
+
+        stage_display = None
+        if getattr(stage_events, "size", 0):
             counts = Counter(stage_events["label"])
             dominant, count = counts.most_common(1)[0]
-            text = f"Stage: {dominant} ({count})"
-        else:
-            text = "Stage: --"
+            stage_display = f"{dominant} ({count})"
 
-        if include_summary and summary:
-            text = f"{text} | {summary}"
-        self.stageSummaryLabel.setText(text)
+        position_display = None
+        if getattr(position_events, "size", 0):
+            p_counts = Counter(position_events["label"])
+            pos_label, p_count = p_counts.most_common(1)[0]
+            position_display = f"{pos_label} ({p_count})"
+
+        summary = self._event_count_summary()
+        include_summary = (not focus_only) or bool(events.size)
+        self.stageSummaryLabel.setText(
+            self._compose_status_text(
+                stage_display,
+                position_display,
+                summary if include_summary else None,
+            )
+        )
 
     def _prepare_tile(self, tile: _OverscanTile) -> bool:
         pixels = self._estimate_pixels() or 0
