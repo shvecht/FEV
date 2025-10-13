@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from collections import Counter
 from datetime import datetime, timedelta
@@ -157,6 +158,7 @@ class MainWindow(QtWidgets.QMainWindow):
             limits=self._limits,
         )
         self._updating_viewbox = False
+        self._maybe_build_int16_cache()
         prefetch_service.configure(
             tile_duration=self._config.prefetch_tile_s,
             max_tiles=self._config.prefetch_max_tiles,
@@ -1402,9 +1404,78 @@ class MainWindow(QtWidgets.QMainWindow):
         if isinstance(self.loader, ZarrLoader):
             self.sourceLabel.setText("Source: Zarr cache")
             self.sourceLabel.setStyleSheet("color: #7fb57d; font-style: italic;")
+        elif getattr(self.loader, "has_cache", None) and self.loader.has_cache():
+            self.sourceLabel.setText("Source: EDF (RAM cache)")
+            self.sourceLabel.setStyleSheet("color: #d7c77b; font-style: italic;")
         else:
             self.sourceLabel.setText("Source: EDF (live)")
             self.sourceLabel.setStyleSheet("color: #9ba9bf; font-style: italic;")
+
+    def _maybe_build_int16_cache(self) -> None:
+        cache_enabled = getattr(self._config, "int16_cache_enabled", False)
+        if not cache_enabled:
+            return
+
+        build_fn = getattr(self.loader, "build_int16_cache", None)
+        if build_fn is None:
+            LOG.warning("Int16 cache requested but loader does not support it; skipping.")
+            return
+
+        limit_mb = float(getattr(self._config, "int16_cache_max_mb", 0.0) or 0.0)
+        if limit_mb <= 0:
+            LOG.warning("Int16 cache enabled but max_mb is <= 0; skipping cache build.")
+            return
+
+        try:
+            size_bytes = self._estimate_source_bytes()
+        except Exception as exc:  # pragma: no cover - defensive logging
+            LOG.warning("Int16 cache skipped: failed to inspect EDF size (%s)", exc)
+            return
+
+        if size_bytes is None or size_bytes <= 0:
+            LOG.warning("Int16 cache skipped: unable to estimate EDF size.")
+            return
+
+        max_bytes = int(limit_mb * 1024 * 1024)
+        if size_bytes > max_bytes:
+            LOG.warning(
+                "Int16 cache skipped: EDF size %.1f MiB exceeds configured cap %.1f MiB.",
+                size_bytes / (1024 * 1024),
+                limit_mb,
+            )
+            return
+
+        prefer_memmap = bool(getattr(self._config, "int16_cache_memmap", False))
+        try:
+            built = build_fn(limit_mb, prefer_memmap=prefer_memmap)
+        except Exception as exc:  # pragma: no cover - log & continue without cache
+            LOG.warning("Int16 cache build failed: %s", exc)
+            return
+
+        if not built:
+            LOG.warning("Int16 cache skipped: loader declined to build within %.1f MiB cap.", limit_mb)
+
+    def _estimate_source_bytes(self) -> int | None:
+        path = getattr(self.loader, "path", None)
+        if path:
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                size = 0
+            if size > 0:
+                return size
+
+        info = getattr(self.loader, "info", None)
+        if info is None:
+            return None
+
+        try:
+            total_samples = sum(getattr(ch, "n_samples", 0) for ch in info)
+        except TypeError:
+            return None
+        if total_samples <= 0:
+            return None
+        return int(total_samples * np.dtype(np.int16).itemsize)
 
     def _estimate_pixels(self) -> int:
         if not self._primary_plot:

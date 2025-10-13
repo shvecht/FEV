@@ -44,6 +44,10 @@ uv run python -m pytest
 
 The suite covers loader slices, timebase math, overscan slicing, and view-window helpers. Zarr cache parity tests are planned; perf smoke scripts live under `scripts/`.
 
+## Performance tuning
+
+Short EDFs can be promoted into the int16 RAM cache for instant pans. Toggle the feature in the `[cache]` section of `config.ini` (see `docs/perf_comparison.md`) to cap the size and choose whether to keep the cache purely in memory or spill to a memmap backing file.
+
 ## Roadmap
 
 - Phase 4: CSV annotations import & overlay (detailed plan in `agents.md`)
