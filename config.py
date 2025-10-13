@@ -15,6 +15,7 @@ class ViewerConfig:
     int16_cache_enabled: bool = False
     int16_cache_max_mb: float = 512.0
     int16_cache_memmap: bool = False
+    hidden_channels: tuple[int, ...] = ()
     ini_path: Path | None = None
 
     @classmethod
@@ -37,6 +38,21 @@ class ViewerConfig:
                 cfg.prefetch_collapsed = ui_section.getboolean(
                     "prefetch_collapsed", fallback=cfg.prefetch_collapsed
                 )
+                hidden_raw = ui_section.get("hidden_channels", fallback="")
+                if hidden_raw:
+                    indices: set[int] = set()
+                    for part in hidden_raw.split(","):
+                        part = part.strip()
+                        if not part:
+                            continue
+                        try:
+                            value = int(part)
+                        except ValueError:
+                            continue
+                        if value >= 0:
+                            indices.add(value)
+                    if indices:
+                        cfg.hidden_channels = tuple(sorted(indices))
 
             cache_section = parser["cache"] if "cache" in parser else None
             if cache_section:
@@ -70,8 +86,10 @@ class ViewerConfig:
             "max_tiles": str(self.prefetch_max_tiles or 0),
             "max_mb": f"{self.prefetch_max_mb or 0}",
         }
+        hidden_serialized = ",".join(str(idx) for idx in sorted(set(self.hidden_channels)))
         parser["ui"] = {
             "prefetch_collapsed": "true" if self.prefetch_collapsed else "false",
+            "hidden_channels": hidden_serialized,
         }
         parser["cache"] = {
             "enabled": "true" if self.int16_cache_enabled else "false",
