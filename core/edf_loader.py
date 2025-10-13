@@ -1,10 +1,12 @@
 # core/edf_loader.py
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Dict
 import threading
 import numpy as np
 import pyedflib
 
+from core.int16_cache import Int16Cache, build_int16_cache as _build_int16_cache
 from core.timebase import Timebase
 
 @dataclass
@@ -32,9 +34,35 @@ class EdfLoader:
         self.info = [ChannelInfo(self.channels[i], self._fs[i], self._ns[i],
                                  self._r.getPhysicalDimension(i)) for i in range(self.n_channels)]
         self.timebase = Timebase(self.start_dt, self.duration_s)
+        self._cache: Int16Cache | None = None
+        self._scratch_float32: Dict[int, np.ndarray] = {}
 
     def fs(self, i: int) -> float:
         return self._fs[i]
+
+    def has_cache(self) -> bool:
+        return self._cache is not None
+
+    def cache_bytes(self) -> int:
+        cache = self._cache
+        return cache.total_bytes if cache is not None else 0
+
+    def build_int16_cache(self, max_mb: float, prefer_memmap: bool = True) -> bool:
+        max_bytes = int(max(0.0, float(max_mb)) * 1024 * 1024)
+        with self._lock:
+            cache = _build_int16_cache(
+                self._r,
+                max_bytes=max_bytes,
+                prefer_memmap=prefer_memmap,
+                memmap_dir=None,
+            )
+            if cache is None:
+                return False
+            if cache.total_bytes > max_bytes and max_bytes > 0:
+                return False
+            self._cache = cache
+            self._scratch_float32.clear()
+            return True
 
     def read(self, i: int, t0: float, t1: float):
         fs = self._fs[i]
@@ -48,7 +76,16 @@ class EdfLoader:
             n = min(n, max(0, total - s0))
             if n <= 0:
                 return np.zeros(0, dtype=float), np.zeros(0, dtype=np.float32)
-            x = self._r.readSignal(i, start=s0, n=n).astype(np.float32)
+            cache = self._cache
+            if cache is not None:
+                scratch = self._scratch_float32.get(i)
+                if scratch is None or scratch.shape[0] != n:
+                    scratch = np.empty(n, dtype=np.float32)
+                    self._scratch_float32[i] = scratch
+                cache.fill_float32(i, s0, s0 + n, out=scratch)
+                x = scratch.copy()
+            else:
+                x = self._r.readSignal(i, start=s0, n=n).astype(np.float32)
         t = Timebase.time_vector(s0, x.size, fs)
         return t, x
 
@@ -61,4 +98,7 @@ class EdfLoader:
                 return ([], [], [])
 
     def close(self):
-        self._r.close()
+        with self._lock:
+            self._cache = None
+            self._scratch_float32.clear()
+            self._r.close()

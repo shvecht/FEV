@@ -23,6 +23,24 @@ class FakeEdfReader:
         ]
         self._units = ["uV", "a.u."]
         self._closed = False
+        self._read_signal_calls = 0
+
+        self._digital = []
+        self._digital_min = []
+        self._digital_max = []
+        self._physical_min = []
+        self._physical_max = []
+        self._slope = [0.01, 0.02]
+        self._offset = [0.0, -1.0]
+        for idx, arr in enumerate(self._data):
+            slope = self._slope[idx]
+            offset = self._offset[idx]
+            digital = np.round((arr - offset) / slope).astype(np.int16)
+            self._digital.append(digital)
+            self._digital_min.append(int(digital.min()))
+            self._digital_max.append(int(digital.max()))
+            self._physical_min.append(float(digital.min() * slope + offset))
+            self._physical_max.append(float(digital.max() * slope + offset))
 
     # --- pyedflib API we rely on -------------------------------------------------
     def getStartdatetime(self):
@@ -41,11 +59,27 @@ class FakeEdfReader:
         return self._units[idx]
 
     def readSignal(self, idx: int, start: int, n: int):
+        self._read_signal_calls += 1
         arr = self._data[idx]
         if start >= arr.size:
             return np.zeros(0, dtype=np.float64)
         end = min(start + n, arr.size)
         return arr[start:end]
+
+    def read_digital_signal(self, idx: int):
+        return self._digital[idx]
+
+    def getDigitalMinimum(self, idx: int) -> int:
+        return self._digital_min[idx]
+
+    def getDigitalMaximum(self, idx: int) -> int:
+        return self._digital_max[idx]
+
+    def getPhysicalMinimum(self, idx: int) -> float:
+        return self._physical_min[idx]
+
+    def getPhysicalMaximum(self, idx: int) -> float:
+        return self._physical_max[idx]
 
     def readAnnotations(self):
         return ([0.0, 2.5], [1.0, 0.0], ["A", "B"])
@@ -57,6 +91,10 @@ class FakeEdfReader:
     @property
     def closed(self):
         return self._closed
+
+    @property
+    def read_signal_calls(self):
+        return self._read_signal_calls
 
 
 @pytest.fixture(autouse=True)
@@ -139,3 +177,38 @@ def test_read_respects_max_window():
     assert t.size == x.size
     assert t.size <= int(np.ceil(loader.fs(0) * 0.5)) + 1
     assert t[-1] - t[0] <= 0.5 + 1 / loader.fs(0)
+
+
+def test_build_int16_cache_and_read_uses_cache():
+    loader = edf_module.EdfLoader("dummy.edf")
+    try:
+        reader = loader._r
+        # Prime without cache
+        loader.read(0, 0.0, 0.1)
+        assert reader.read_signal_calls > 0
+        reader._read_signal_calls = 0
+
+        built = loader.build_int16_cache(max_mb=1.0, prefer_memmap=False)
+        assert built is True
+        assert loader.has_cache() is True
+        assert loader.cache_bytes() > 0
+
+        t, x = loader.read(0, 1.0, 1.2)
+        assert reader.read_signal_calls == 0
+        assert t.size == x.size
+        assert x.dtype == np.float32
+        expected = reader._data[0][100:120]
+        np.testing.assert_allclose(x[: expected.size], expected.astype(np.float32), atol=2e-2)
+    finally:
+        loader.close()
+
+
+def test_build_int16_cache_respects_limit():
+    loader = edf_module.EdfLoader("dummy.edf")
+    try:
+        built = loader.build_int16_cache(max_mb=0.0001, prefer_memmap=False)
+        assert built is False
+        assert loader.has_cache() is False
+        assert loader.cache_bytes() == 0
+    finally:
+        loader.close()
