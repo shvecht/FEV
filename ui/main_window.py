@@ -711,7 +711,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setStyleSheet(theme.stylesheet)
         self.plotLayout.setBackground(theme.pg_background)
         for plot in self.plots:
-            plot.setBackground(theme.pg_background)
             for axis_name in ("bottom", "left"):
                 axis = plot.getAxis(axis_name)
                 if axis is not None:
@@ -723,7 +722,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.time_axis.setTextPen(theme.pg_foreground)
 
         if self.stage_plot is not None:
-            self.stage_plot.setBackground(theme.pg_background)
             for axis_name in ("left", "bottom"):
                 axis = self.stage_plot.getAxis(axis_name)
                 if axis is not None:
@@ -1997,7 +1995,6 @@ class MainWindow(QtWidgets.QMainWindow):
             plot.setMenuEnabled(False)
             plot.setMouseEnabled(x=True, y=False)
             plot.showGrid(x=False, y=True, alpha=0.15)
-            plot.setBackground(self._theme.pg_background)
             curve_color = self._curve_color(idx)
             curve = plot.plot([], [], pen=pg.mkPen(curve_color, width=1.2))
             curve.setClipToView(True)
@@ -2031,7 +2028,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
             meta = self.loader.info[idx]
             visible = idx not in self._hidden_channels
-            plot.setBackground(self._theme.pg_background)
             self._apply_channel_visible(
                 idx,
                 visible,
@@ -2200,7 +2196,6 @@ class MainWindow(QtWidgets.QMainWindow):
             plot.hideAxis("right")
             plot.hideAxis("top")
             plot.getAxis("left").setStyle(showValues=True)
-            plot.setBackground(self._theme.pg_background)
             ticks = [
                 (0.0, "N3"),
                 (1.0, "N2"),
