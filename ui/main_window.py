@@ -24,6 +24,7 @@ from core.decimate import min_max_bins
 from core.overscan import slice_and_decimate
 from core.prefetch import prefetch_service
 from core.view_window import WindowLimits, clamp_window, pan_window, zoom_window
+from core.edf_loader import EdfLoader
 from core.zarr_cache import EdfToZarr, resolve_output_path
 from core.zarr_loader import ZarrLoader
 from core import annotations as annotation_core
@@ -1066,7 +1067,7 @@ class MainWindow(QtWidgets.QMainWindow):
             old_loader.close()
 
         try:
-            new_loader = type(old_loader)(path)
+            new_loader = self._create_loader_for_path(path)
         except Exception as exc:  # pragma: no cover - UI feedback
             QtWidgets.QMessageBox.critical(self, "Failed to open", str(exc))
             # attempt to restore previous loader if possible
@@ -1084,6 +1085,8 @@ class MainWindow(QtWidgets.QMainWindow):
             old_loader.close()
 
         self.loader = new_loader
+        if isinstance(self.loader, ZarrLoader):
+            setattr(self.loader, "max_window_s", self.loader.duration_s)
         self._update_data_source_label()
 
         self.startSpin.blockSignals(True)
@@ -1120,7 +1123,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self._prefetch.clear()
         self._schedule_prefetch()
 
+    def _create_loader_for_path(self, path: str) -> object:
+        candidate = Path(path)
+        if candidate.is_dir() or candidate.suffix.lower() == ".zarr":
+            return ZarrLoader(candidate, max_window_s=float("inf"))
+        return EdfLoader(path)
+
     def _start_zarr_ingest(self):
+        if isinstance(self.loader, ZarrLoader):
+            return
+
         if not getattr(self.loader, "path", None):
             return
 
