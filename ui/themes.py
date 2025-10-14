@@ -165,17 +165,20 @@ QFrame#appearanceSection {{
     margin-top: 12px;
     padding: 16px 16px 12px 16px;
 }}
-QFrame#prefetchSection QToolButton,
-QFrame#appearanceSection QToolButton {{
+QFrame#channelSection QToolButton#collapsibleSectionToggle,
+QFrame#prefetchSection QToolButton#collapsibleSectionToggle,
+QFrame#appearanceSection QToolButton#collapsibleSectionToggle {{
     background-color: transparent;
     border: none;
     border-radius: 0px;
     padding: 0px;
     color: {prefetch_toggle_text};
     font-weight: 600;
+    text-align: left;
 }}
-QFrame#prefetchSection QToolButton:hover,
-QFrame#appearanceSection QToolButton:hover {{
+QFrame#channelSection QToolButton#collapsibleSectionToggle:hover,
+QFrame#prefetchSection QToolButton#collapsibleSectionToggle:hover,
+QFrame#appearanceSection QToolButton#collapsibleSectionToggle:hover {{
     color: {prefetch_toggle_hover};
     background-color: transparent;
 }}
