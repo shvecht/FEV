@@ -234,6 +234,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._event_label_filter: str = ""
         self._annotation_channel_toggles: dict[str, QtWidgets.QCheckBox] = {}
 
+        self.hypnogramPlot: pg.PlotItem | None = None
+        self._hypnogram_label: pg.LabelItem | None = None
+        self.hypnogramRegion: pg.LinearRegionItem | None = None
+        self._hypnogram_outline: pg.PlotDataItem | None = None
+        self._hypnogram_fill_curves: dict[str, pg.PlotDataItem] = {}
+        self._stage_curve_cache: dict[str, object] | None = None
+        self._updating_hypnogram_region = False
+
         self._build_ui()
         self._update_annotation_channel_toggles()
         self._apply_theme(self._active_theme_key, persist=False)
@@ -789,6 +797,27 @@ class MainWindow(QtWidgets.QMainWindow):
                     axis.setPen(pen)
                     axis.setTextPen(theme.pg_foreground)
 
+        if self.hypnogramPlot is not None:
+            axis = self.hypnogramPlot.getAxis("bottom")
+            if axis is not None:
+                pen = pg.mkPen(theme.pg_foreground)
+                axis.setPen(pen)
+                axis.setTextPen(theme.pg_foreground)
+        if self._hypnogram_outline is not None:
+            outline_color = QtGui.QColor(theme.pg_foreground)
+            outline_color.setAlpha(200)
+            self._hypnogram_outline.setPen(pg.mkPen(outline_color, width=1.0))
+        if self.hypnogramRegion is not None:
+            brush_color = QtGui.QColor(theme.pg_foreground)
+            brush_color.setAlpha(60)
+            self.hypnogramRegion.setBrush(pg.mkBrush(brush_color))
+            region_pen = pg.mkPen(theme.pg_foreground, width=1.0)
+            for line in getattr(self.hypnogramRegion, "lines", ()):  # type: ignore[attr-defined]
+                try:
+                    line.setPen(region_pen)
+                except AttributeError:
+                    continue
+
         self.time_axis.setPen(pg.mkPen(theme.pg_foreground))
         self.time_axis.setTextPen(theme.pg_foreground)
 
@@ -965,6 +994,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._ensure_overscan_for_view()
 
         self._update_annotation_overlays(t0, t1)
+        self._update_hypnogram(t0, t1)
 
     def _update_time_labels(self, t0, t1):
         tb = self.loader.timebase
@@ -1047,6 +1077,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._configure_plots()
         self._refresh_limits()
         self._update_controls_from_state()
+        self._invalidate_stage_curve_cache()
         self.refresh()
         self._manual_annotation_paths.clear()
         self._load_companion_annotations()
@@ -1191,6 +1222,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._current_tile_id = None
         self._init_overscan_worker()
         self._manual_annotation_paths.clear()
+        self._invalidate_stage_curve_cache()
         self.refresh()
         self._load_companion_annotations()
         self._update_data_source_label()
@@ -1223,6 +1255,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self._update_controls_from_state()
         if sender != "viewbox":
             self._update_viewbox_from_state()
+        if sender != "hypnogram":
+            self._update_hypnogram_region(
+                self._view_start,
+                self._view_start + self._view_duration,
+            )
         self._schedule_refresh()
         self._schedule_prefetch()
         self._ensure_overscan_for_view()
@@ -1260,7 +1297,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_annotation_toggle(self, checked: bool):
         self._annotations_enabled = bool(checked)
+        self._invalidate_stage_curve_cache()
         self._update_annotation_overlays(
+            self._view_start,
+            min(self.loader.duration_s, self._view_start + self._view_duration),
+        )
+        self._update_hypnogram(
             self._view_start,
             min(self.loader.duration_s, self._view_start + self._view_duration),
         )
@@ -1421,9 +1463,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._populate_event_list(clear=True)
         self._update_annotation_channel_toggles()
         self._update_annotation_summary()
+        self._invalidate_stage_curve_cache()
 
         path = getattr(self.loader, "path", None)
+        t0 = self._view_start
+        t1 = min(self.loader.duration_s, self._view_start + self._view_duration)
         if not path:
+            self._update_hypnogram(t0, t1)
             return
 
         ann_sets: list[annotation_core.Annotations] = []
@@ -1466,6 +1512,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 LOG.warning("Failed to load position CSV %s: %s", positions_path, exc)
 
         if not ann_sets:
+            self._update_hypnogram(t0, t1)
             return
 
         self._annotations_index = annotation_core.AnnotationIndex(ann_sets)
@@ -1481,6 +1528,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._view_start,
             min(self.loader.duration_s, self._view_start + self._view_duration),
         )
+        self._update_hypnogram(t0, t1)
 
     def _stage_annotations(self) -> np.ndarray:
         if not self._annotations_index or self._annotations_index.is_empty():
@@ -1800,6 +1848,9 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self._hidden_annotation_channels.add(key)
 
+        if key == annotation_core.STAGE_CHANNEL:
+            self._invalidate_stage_curve_cache()
+
         if persist:
             ordered = list(dict.fromkeys(self._config.hidden_annotation_channels))
             if visible:
@@ -1818,6 +1869,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_annotation_summary()
         if self.loader is not None:
             self._update_annotation_overlays(
+                self._view_start,
+                min(self.loader.duration_s, self._view_start + self._view_duration),
+            )
+            self._update_hypnogram(
                 self._view_start,
                 min(self.loader.duration_s, self._view_start + self._view_duration),
             )
@@ -2279,6 +2334,297 @@ class MainWindow(QtWidgets.QMainWindow):
             self.plots.append(plot)
             self.curves.append(curve)
 
+    def _ensure_hypnogram_plot(self) -> None:
+        row = len(self.plots)
+        if self.hypnogramPlot is None:
+            label = self.plotLayout.addLabel(row=row, col=0, text="Hypnogram", justify="right")
+            self._hypnogram_label = label
+            plot = self.plotLayout.addPlot(row=row, col=1)
+            plot.setMenuEnabled(False)
+            plot.setMouseEnabled(x=False, y=False)
+            plot.hideButtons()
+            plot.showAxis("left", show=False)
+            plot.showAxis("right", show=False)
+            plot.showAxis("top", show=False)
+            vb = plot.getViewBox()
+            if vb is not None:
+                vb.enableAutoRange(x=False, y=False)
+            plot.setMinimumHeight(72)
+            plot.setXRange(self._view_start, self._view_start + self._view_duration, padding=0)
+            outline = plot.plot([], [], pen=pg.mkPen("#f0f4ff", width=1.0))
+            outline.setZValue(5)
+            outline.setVisible(False)
+            self._hypnogram_outline = outline
+
+            region = pg.LinearRegionItem(
+                values=(self._view_start, self._view_start + self._view_duration),
+                movable=True,
+            )
+            region.setZValue(20)
+            region.sigRegionChanged.connect(self._on_hypnogram_region_changed)
+            plot.addItem(region)
+
+            self.hypnogramPlot = plot
+            self.hypnogramRegion = region
+        else:
+            try:
+                self.plotLayout.removeItem(self.hypnogramPlot)
+            except (KeyError, ValueError):
+                pass
+            if self._hypnogram_label is not None:
+                try:
+                    self.plotLayout.removeItem(self._hypnogram_label)
+                except (KeyError, ValueError):
+                    pass
+            if self._hypnogram_label is not None:
+                self.plotLayout.addItem(self._hypnogram_label, row=row, col=0)
+            self.plotLayout.addItem(self.hypnogramPlot, row=row, col=1)
+
+        self._update_hypnogram_bounds()
+        self._update_hypnogram_region(
+            self._view_start,
+            self._view_start + self._view_duration,
+            force=True,
+        )
+
+    def _update_hypnogram_axis(self) -> None:
+        plot = self.hypnogramPlot
+        if plot is None:
+            return
+        plot.setAxisItems({"bottom": self.time_axis})
+        plot.showAxis("bottom", show=True)
+        plot.showAxis("left", show=False)
+        plot.showAxis("right", show=False)
+        plot.showAxis("top", show=False)
+        if self._primary_plot is not None:
+            plot.setXLink(self._primary_plot)
+        else:
+            plot.setXLink(None)
+        plot.setLimits(xMin=0.0, xMax=self.loader.duration_s)
+        vb = plot.getViewBox()
+        if vb is not None:
+            vb.setMouseEnabled(x=False, y=False)
+            vb.enableAutoRange(x=False, y=False)
+
+    def _update_hypnogram_bounds(self) -> None:
+        total = getattr(self.loader, "duration_s", None)
+        region = self.hypnogramRegion
+        if region is not None and total is not None:
+            region.setBounds((0.0, float(total)))
+
+    def _update_hypnogram_region(self, start: float, end: float, *, force: bool = False) -> None:
+        region = self.hypnogramRegion
+        if region is None:
+            return
+        total = float(getattr(self.loader, "duration_s", 0.0) or 0.0)
+        start = max(0.0, min(start, total))
+        end = max(start, min(end, total))
+        current = region.getRegion()
+        if not force and current and abs(current[0] - start) < 1e-6 and abs(current[1] - end) < 1e-6:
+            return
+        self._updating_hypnogram_region = True
+        try:
+            region.setRegion((start, end))
+        finally:
+            self._updating_hypnogram_region = False
+
+    def _set_hypnogram_visible(self, visible: bool) -> None:
+        plot = self.hypnogramPlot
+        if plot is None:
+            return
+        plot.setVisible(visible)
+        if self._hypnogram_label is not None:
+            self._hypnogram_label.setVisible(visible)
+        region = self.hypnogramRegion
+        if region is not None:
+            region.setVisible(visible)
+        if not visible and self._hypnogram_outline is not None:
+            self._hypnogram_outline.setVisible(False)
+        if not visible:
+            for item in self._hypnogram_fill_curves.values():
+                item.setVisible(False)
+
+    def _ensure_hypnogram_curves(
+        self, labels: Sequence[str], colors: dict[str, QtGui.QColor]
+    ) -> None:
+        plot = self.hypnogramPlot
+        if plot is None:
+            return
+        for label in labels:
+            if label not in self._hypnogram_fill_curves:
+                base_color = QtGui.QColor(colors.get(label, QtGui.QColor(DEFAULT_STAGE_COLOR)))
+                fill_color = QtGui.QColor(base_color)
+                fill_color.setAlpha(140)
+                pen_color = QtGui.QColor(base_color)
+                pen_color.setAlpha(200)
+                item = pg.PlotDataItem()
+                item.setZValue(-10)
+                item.setPen(pg.mkPen(pen_color, width=1.0))
+                item.setBrush(pg.mkBrush(fill_color))
+                item.setVisible(False)
+                plot.addItem(item)
+                self._hypnogram_fill_curves[label] = item
+        for label, item in list(self._hypnogram_fill_curves.items()):
+            if label not in labels:
+                item.clear()
+                item.setVisible(False)
+
+    def _invalidate_stage_curve_cache(self) -> None:
+        self._stage_curve_cache = None
+
+    def _stage_curve_data(self) -> dict[str, object]:
+        if self._stage_curve_cache is not None:
+            return self._stage_curve_cache
+
+        stages = self._stage_annotations()
+        if stages.size == 0:
+            cache = {
+                "step_x": np.zeros(0, dtype=float),
+                "step_y": np.zeros(0, dtype=float),
+                "label_data": {},
+                "labels": [],
+                "level_map": {},
+                "colors": {},
+                "max_level": -1,
+            }
+            self._stage_curve_cache = cache
+            return cache
+
+        stage_order: list[str] = []
+        if self._annotations_index is not None:
+            for meta in getattr(self._annotations_index, "sources", []):
+                if not isinstance(meta, dict):
+                    continue
+                stage_map = meta.get("stage_map") if isinstance(meta, dict) else None
+                if isinstance(stage_map, dict):
+                    for value in stage_map.values():
+                        label = str(value)
+                        if label and label not in stage_order:
+                            stage_order.append(label)
+
+        for label in STAGE_COLORS:
+            if label not in stage_order:
+                stage_order.append(label)
+
+        for raw_label in stages["label"]:
+            label = str(raw_label)
+            if label and label not in stage_order:
+                stage_order.append(label)
+
+        level_map = {label: idx for idx, label in enumerate(stage_order)}
+        color_map = {label: QtGui.QColor(STAGE_COLORS.get(label, DEFAULT_STAGE_COLOR)) for label in stage_order}
+
+        step_x: list[float] = []
+        step_y: list[float] = []
+        label_data: dict[str, dict[str, object]] = {}
+        prev_end: float | None = None
+
+        segments: list[dict[str, object]] = []
+        for entry in stages:
+            start = float(entry["start_s"])
+            end = float(entry["end_s"])
+            label = str(entry["label"])
+            level = level_map[label]
+            if prev_end is not None and start - prev_end > 1e-6:
+                step_x.append(float("nan"))
+                step_y.append(float("nan"))
+            step_x.extend([start, end])
+            step_y.extend([level, level])
+            prev_end = end
+
+            if segments and segments[-1]["label"] == label and abs(float(segments[-1]["end"]) - start) < 1e-6:
+                segments[-1]["end"] = end
+            else:
+                segments.append({"start": start, "end": end, "label": label, "level": level})
+
+        for segment in segments:
+            label = str(segment["label"])
+            level = int(segment["level"])
+            payload = label_data.setdefault(
+                label,
+                {"x": [], "top": [], "fill": level - 0.45},
+            )
+            xs: list[float] = payload["x"]  # type: ignore[assignment]
+            ys: list[float] = payload["top"]  # type: ignore[assignment]
+            if xs:
+                last_val = xs[-1]
+                if not np.isnan(last_val) and float(segment["start"]) - last_val > 1e-6:
+                    xs.append(float("nan"))
+                    ys.append(float("nan"))
+            xs.extend([float(segment["start"]), float(segment["end"])])
+            top_value = level + 0.45
+            ys.extend([top_value, top_value])
+
+        for payload in label_data.values():
+            payload["x"] = np.asarray(payload["x"], dtype=float)
+            payload["top"] = np.asarray(payload["top"], dtype=float)
+
+        cache = {
+            "step_x": np.asarray(step_x, dtype=float),
+            "step_y": np.asarray(step_y, dtype=float),
+            "label_data": label_data,
+            "labels": stage_order,
+            "level_map": level_map,
+            "colors": color_map,
+            "max_level": max(level_map.values()) if level_map else -1,
+        }
+        self._stage_curve_cache = cache
+        return cache
+
+    def _update_hypnogram(self, t0: float, t1: float) -> None:
+        plot = self.hypnogramPlot
+        if plot is None:
+            return
+        has_stages = (
+            self._annotations_enabled
+            and self._annotations_index is not None
+            and not self._annotations_index.is_empty()
+            and annotation_core.STAGE_CHANNEL not in self._hidden_annotation_channels
+        )
+        if not has_stages:
+            self._set_hypnogram_visible(False)
+            self._update_hypnogram_region(t0, t1)
+            return
+
+        data = self._stage_curve_data()
+        step_x = data["step_x"]
+        step_y = data["step_y"]
+        if step_x.size == 0:
+            self._set_hypnogram_visible(False)
+            self._update_hypnogram_region(t0, t1)
+            return
+
+        self._set_hypnogram_visible(True)
+        self._ensure_hypnogram_curves(data["labels"], data["colors"])
+
+        max_level = max(0, int(data.get("max_level", 0)))
+        plot.setYRange(-0.6, max_level + 0.6, padding=0)
+        plot.setLimits(yMin=-0.6, yMax=max_level + 0.6)
+
+        if self._hypnogram_outline is not None:
+            self._hypnogram_outline.setData(step_x, step_y, connect="finite")
+            self._hypnogram_outline.setVisible(True)
+
+        label_data: dict[str, dict[str, object]] = data["label_data"]
+        for label, item in self._hypnogram_fill_curves.items():
+            payload = label_data.get(label)
+            if not payload:
+                item.clear()
+                item.setVisible(False)
+                continue
+            x_vals = payload.get("x")
+            y_vals = payload.get("top")
+            if isinstance(x_vals, np.ndarray) and isinstance(y_vals, np.ndarray) and x_vals.size:
+                item.setData(x_vals, y_vals, connect="finite")
+                fill_level = float(payload.get("fill", 0.0))
+                item.setFillLevel(fill_level)
+                item.setVisible(True)
+            else:
+                item.clear()
+                item.setVisible(False)
+
+        self._update_hypnogram_region(t0, t1)
+
     def _configure_plots(self):
         n = self.loader.n_channels
         old_primary = self._primary_plot
@@ -2312,9 +2658,12 @@ class MainWindow(QtWidgets.QMainWindow):
             )
 
             self.curves[idx].setPen(pg.mkPen(self._curve_color(idx), width=1.2))
+            plot.showAxis("bottom", show=False)
 
         if n == 0:
             self._primary_plot = None
+            self._ensure_hypnogram_plot()
+            self._update_hypnogram_axis()
             return
 
         new_primary = self.plots[n - 1]
@@ -2329,10 +2678,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 except Exception:
                     pass
 
-        new_primary.setAxisItems({"bottom": self.time_axis})
-        new_primary.showAxis("bottom", show=True)
         self._primary_plot = new_primary
         self._connect_primary_viewbox()
+
+        self._ensure_hypnogram_plot()
+        self._update_hypnogram_axis()
 
         if self._annotation_lines:
             for line in self._annotation_lines:
@@ -2511,3 +2861,14 @@ class MainWindow(QtWidgets.QMainWindow):
         end = float(xrange[1])
         duration = max(self._limits.duration_min, end - start)
         self._set_view(start, duration, sender="viewbox")
+
+    @QtCore.Slot()
+    def _on_hypnogram_region_changed(self):
+        if self._updating_hypnogram_region or self.hypnogramRegion is None:
+            return
+        region = self.hypnogramRegion.getRegion()
+        if not region or len(region) != 2:
+            return
+        start, end = region
+        duration = max(self._limits.duration_min, end - start)
+        self._set_view(start, duration, sender="hypnogram")
