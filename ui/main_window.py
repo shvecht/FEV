@@ -38,7 +38,9 @@ STAGE_COLORS: dict[str, str] = {
     "REM": "#c2556f",
 }
 DEFAULT_STAGE_COLOR = "#4c5d73"
+
 STAGE_TEXT_MARGIN = 26.0
+PANEL_MAX_WIDTH = 400  # hard cap for the controls sidebar width
 
 
 class _ZarrIngestWorker(QtCore.QObject):
@@ -308,7 +310,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         control = QtWidgets.QFrame()
         control.setObjectName("controlPanel")
-        control.setMinimumWidth(200)
+        control.setMinimumWidth(50)
+        control.setMaximumWidth(PANEL_MAX_WIDTH)
         control.setSizePolicy(
             QtWidgets.QSizePolicy.Preferred,
             QtWidgets.QSizePolicy.Expanding,
@@ -540,7 +543,8 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QSizePolicy.Minimum,
             QtWidgets.QSizePolicy.Expanding,
         )
-        control_scroll.setMinimumWidth(control.minimumWidth())
+        control_scroll.setMinimumWidth(0)
+        control_scroll.setMaximumWidth(PANEL_MAX_WIDTH)
         control_scroll.setWidget(control)
         self._control_scroll = control_scroll
 
@@ -618,7 +622,7 @@ class MainWindow(QtWidgets.QMainWindow):
         splitter.addWidget(scroll)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([220, 980])
+        splitter.setSizes([160, 1040])
         self._splitter = splitter
 
         central = QtWidgets.QWidget()
@@ -709,18 +713,30 @@ class MainWindow(QtWidgets.QMainWindow):
         panel_min = (
             self.controlPanel.minimumWidth() if hasattr(self, "controlPanel") else 200
         )
+        panel_max = (
+            self.controlPanel.maximumWidth() if hasattr(self, "controlPanel") else PANEL_MAX_WIDTH
+        )
         if collapsed:
             self._control_wrapper.setMinimumWidth(rail_width)
             self._control_wrapper.setMaximumWidth(rail_width)
         else:
+            # Let the splitter manage the live width; just bound the range.
+            self._control_wrapper.setMinimumWidth(panel_min)
+            self._control_wrapper.setMaximumWidth(panel_max)
+            # Nudge the initial size toward a sensible value without locking it.
             scroll_hint = (
                 self._control_scroll.sizeHint().width()
                 if self._control_scroll is not None
                 else panel_min
             )
-            expanded_width = max(panel_min, scroll_hint)
-            self._control_wrapper.setMinimumWidth(expanded_width)
-            self._control_wrapper.setMaximumWidth(16777215)
+            target = max(panel_min, min(scroll_hint, panel_max))
+            # If the current width is far from target (e.g., after theme/layout change), push splitter sizes once.
+            if self._splitter is not None:
+                sizes = self._splitter.sizes()
+                total = sum(sizes) or max(self.width(), panel_max + 600)
+                first = int(target)
+                second = max(1, total - first)
+                self._splitter.setSizes([first, second])
         if self.controlToggleBtn.isChecked() != collapsed:
             with QtCore.QSignalBlocker(self.controlToggleBtn):
                 self.controlToggleBtn.setChecked(collapsed)
@@ -732,10 +748,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 total = max(self.width(), rail_width + 600)
             if collapsed:
                 first = rail_width
-            else:
-                first = max(self._control_wrapper.sizeHint().width(), panel_min)
-            second = max(1, total - first)
-            self._splitter.setSizes([first, second])
+                second = max(1, total - first)
+                self._splitter.setSizes([first, second])
 
     def _update_control_toggle_icon(self, collapsed: bool) -> None:
         arrow = QtCore.Qt.RightArrow if collapsed else QtCore.Qt.LeftArrow
