@@ -204,6 +204,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._primary_plot = None
         self._overscan_factor = 2.0  # windows per side
+        self._overscan_zoom_reuse_ratio = 0.7
         self._overscan_tile: _OverscanTile | None = None
         self._overscan_request_id = 0
         self._overscan_inflight: Optional[int] = None
@@ -1381,12 +1382,21 @@ class MainWindow(QtWidgets.QMainWindow):
         window_end = min(self.loader.duration_s, window_start + self._view_duration)
         tile = self._overscan_tile
         if tile is not None and tile.contains(window_start, window_end):
+            ratio = 1.0
+            if tile.view_duration > 0:
+                ratio = self._view_duration / tile.view_duration
+            if ratio < self._overscan_zoom_reuse_ratio:
+                self._request_overscan_tile(window_start, self._view_duration)
+                self._update_tile_view_metadata(tile, window_start, self._view_duration)
+                return
+            self._update_tile_view_metadata(tile, window_start, self._view_duration)
             return
         self._request_overscan_tile(window_start, self._view_duration)
 
     def _request_overscan_tile(self, window_start: float, window_duration: float):
         if self._overscan_worker is None or self.loader.n_channels == 0:
             return
+        self._update_tile_view_metadata(self._overscan_tile, window_start, window_duration)
         start, end = self._compute_overscan_bounds(window_start, window_duration)
         if end <= start:
             return
@@ -1436,9 +1446,18 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._overscan_inflight = None
         self._overscan_tile = tile_obj
+        self._update_tile_view_metadata(self._overscan_tile, self._view_start, self._view_duration)
         self._current_tile_id = None
         self._apply_tile_to_curves(tile_obj)
         self._schedule_refresh()
+
+    def _update_tile_view_metadata(
+        self, tile: _OverscanTile | None, view_start: float, view_duration: float
+    ) -> None:
+        if tile is None:
+            return
+        tile.view_start = view_start
+        tile.view_duration = view_duration
 
     def _handle_overscan_failed(self, request_id: int, message: str):
         if request_id != self._overscan_request_id:
