@@ -17,7 +17,7 @@ class ViewerConfig:
     int16_cache_max_mb: float = 512.0
     int16_cache_memmap: bool = False
     hidden_channels: tuple[int, ...] = ()
-    hidden_annotation_channels: tuple[str, ...] = ()
+    hidden_annotation_channels: tuple[str, ...] = ("stage", "position")
     annotation_focus_only: bool = False
     theme: str = "Midnight"
     ini_path: Path | None = None
@@ -67,25 +67,21 @@ class ViewerConfig:
 
                 hidden_ann_raw = ui_section.get("hidden_annotation_channels", fallback="")
                 if hidden_ann_raw:
-                    names: list[str] = []
-                    for part in hidden_ann_raw.split(","):
-                        part = part.strip()
-                        if not part:
-                            continue
-                        names.append(part)
+                    names = [part.strip() for part in hidden_ann_raw.split(",") if part.strip()]
                     if names:
                         normalized = tuple(part.lower() for part in names)
-                        if normalized == ("stage", "position"):
-                            names = []
-                    if names:
-                        # Preserve unique entries while maintaining relative order
-                        seen: set[str] = set()
-                        ordered = []
-                        for name in names:
-                            if name not in seen:
-                                seen.add(name)
-                                ordered.append(name)
-                        cfg.hidden_annotation_channels = tuple(ordered)
+                        default_normalized = tuple(
+                            part.lower() for part in cfg.hidden_annotation_channels
+                        )
+                        if normalized != default_normalized:
+                            # Preserve unique entries while maintaining relative order
+                            seen: set[str] = set()
+                            ordered = []
+                            for name in names:
+                                if name not in seen:
+                                    seen.add(name)
+                                    ordered.append(name)
+                            cfg.hidden_annotation_channels = tuple(ordered)
                     else:
                         cfg.hidden_annotation_channels = ()
 
