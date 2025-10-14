@@ -36,6 +36,7 @@ class CollapsibleSection(QtWidgets.QFrame):
         self._content.setMinimumHeight(0)
 
         self._toggle = QtWidgets.QToolButton(self)
+        self._toggle.setObjectName("collapsibleSectionToggle")
         self._toggle.setText(title)
         self._toggle.setToolButtonStyle(QtCore.Qt.ToolButtonTextBesideIcon)
         self._toggle.setArrowType(
@@ -45,10 +46,16 @@ class CollapsibleSection(QtWidgets.QFrame):
         self._toggle.setChecked(expanded)
         self._toggle.setCursor(QtCore.Qt.PointingHandCursor)
         self._toggle.setAutoRaise(True)
+        self._toggle.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed
+        )
+        self._toggle.setIconSize(QtCore.QSize(12, 12))
 
         header_layout = QtWidgets.QHBoxLayout()
         header_layout.setContentsMargins(0, 0, 0, 0)
-        header_layout.addWidget(self._toggle)
+        header_layout.addWidget(
+            self._toggle, 0, QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter
+        )
 
         content_layout = QtWidgets.QVBoxLayout()
         content_layout.setContentsMargins(0, 0, 0, 0)
