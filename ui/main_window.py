@@ -18,6 +18,7 @@ from PySide6 import QtCore, QtWidgets, QtGui
 from ui.time_axis import TimeAxis
 from ui.widgets import CollapsibleSection
 from ui.themes import DEFAULT_THEME, THEMES, ThemeDefinition
+from ui.hover_utils import _sample_at_time
 from config import ViewerConfig
 from core.decimate import min_max_bins
 from core.overscan import slice_and_decimate
@@ -203,6 +204,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self.time_axis.set_mode("absolute")
 
         self._primary_plot = None
+        self._hover_line: pg.InfiniteLine | None = None
+        self._hover_label: pg.TextItem | None = None
+        self._hover_plot: pg.PlotItem | None = None
+        self._hover_label_anchor: tuple[float, float] = (0.0, 1.0)
+        self._plot_viewport: QtWidgets.QWidget | None = None
         self._overscan_factor = 2.0  # windows per side
         self._overscan_zoom_reuse_ratio = 0.7
         self._overscan_tile: _OverscanTile | None = None
@@ -527,6 +533,24 @@ class MainWindow(QtWidgets.QMainWindow):
         self.plotLayout.ci.layout.setSpacing(0)
         self.plotLayout.ci.layout.setContentsMargins(0, 0, 0, 0)
 
+        self._hover_line = pg.InfiniteLine(angle=90, movable=False)
+        self._hover_line.setZValue(1000)
+        self._hover_line.setVisible(False)
+        self._hover_line.setPen(pg.mkPen((240, 240, 240, 220), width=1.0, style=QtCore.Qt.DashLine))
+        self._hover_label_anchor = (0.0, 1.0)
+        self._hover_label = pg.TextItem(anchor=self._hover_label_anchor)
+        self._hover_label.setZValue(1001)
+        self._hover_label.setColor((240, 240, 240))
+        self._hover_label.setVisible(False)
+        scene = self.plotLayout.scene()
+        scene.sigMouseMoved.connect(self._update_hover_indicator)
+        mouse_exited = getattr(scene, "sigMouseExited", None)
+        if mouse_exited is not None:
+            mouse_exited.connect(self._on_plot_scene_mouse_exited)
+        self._plot_viewport = self.plotLayout.viewport()
+        if self._plot_viewport is not None:
+            self._plot_viewport.installEventFilter(self)
+
         self.plots: list[pg.PlotItem] = []
         self.curves: list[pg.PlotDataItem] = []
         self.channel_labels: list[pg.LabelItem] = []
@@ -697,6 +721,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_control_toggle(self, collapsed: bool) -> None:
         self._set_controls_collapsed(bool(collapsed), persist=True)
+
+    def eventFilter(self, obj: QtCore.QObject, event: QtCore.QEvent) -> bool:
+        if obj is self._plot_viewport and event.type() == QtCore.QEvent.Leave:
+            self._hide_hover_indicator()
+        return super().eventFilter(obj, event)
 
     def _set_controls_collapsed(self, collapsed: bool, *, persist: bool) -> None:
         collapsed = bool(collapsed)
@@ -2720,6 +2749,8 @@ class MainWindow(QtWidgets.QMainWindow):
             if plot.getAxis("bottom") is self.time_axis:
                 plot.setAxisItems({"bottom": pg.AxisItem(orientation="bottom")})
 
+        self._sync_hover_overlay_target()
+
     def _sync_channel_controls(self) -> None:
         if not hasattr(self, "channelSection"):
             return
@@ -2798,6 +2829,117 @@ class MainWindow(QtWidgets.QMainWindow):
         if persist:
             self._config.hidden_channels = tuple(sorted(self._hidden_channels))
             self._config.save()
+
+    def _attach_hover_overlay(self, plot: pg.PlotItem | None) -> None:
+        if self._hover_line is None or self._hover_label is None:
+            return
+        if plot is self._hover_plot:
+            return
+        if self._hover_plot is not None:
+            try:
+                self._hover_plot.removeItem(self._hover_line)
+            except Exception:
+                pass
+            try:
+                self._hover_plot.removeItem(self._hover_label)
+            except Exception:
+                pass
+        self._hover_plot = plot
+        if plot is not None:
+            plot.addItem(self._hover_line, ignoreBounds=True)
+            plot.addItem(self._hover_label, ignoreBounds=True)
+
+    def _sync_hover_overlay_target(self) -> None:
+        if self._hover_line is None or self._hover_label is None:
+            return
+        plot = self._hover_plot
+        if plot is None:
+            return
+        if plot not in self.plots[: self.loader.n_channels] or not plot.isVisible():
+            self._hide_hover_indicator(detach=True)
+            return
+        target_vb = plot.getViewBox()
+        get_viewbox = getattr(self._hover_line, "getViewBox", None)
+        line_vb = get_viewbox() if callable(get_viewbox) else None
+        if target_vb is not None and line_vb is not target_vb:
+            self._attach_hover_overlay(plot)
+
+    def _hide_hover_indicator(self, *, detach: bool = False) -> None:
+        if self._hover_line is not None:
+            self._hover_line.setVisible(False)
+        if self._hover_label is not None:
+            self._hover_label.setVisible(False)
+        if detach:
+            self._attach_hover_overlay(None)
+
+    @QtCore.Slot()
+    def _on_plot_scene_mouse_exited(self) -> None:
+        self._hide_hover_indicator()
+
+    @QtCore.Slot(QtCore.QPointF)
+    def _update_hover_indicator(self, scene_pos: QtCore.QPointF) -> None:
+        if self._hover_line is None or self._hover_label is None:
+            return
+        if self._view_duration > 300 or self._primary_plot is None:
+            self._hide_hover_indicator(detach=True)
+            return
+
+        active_plot: pg.PlotItem | None = None
+        active_idx: int | None = None
+        for idx, plot in enumerate(self.plots[: self.loader.n_channels]):
+            if idx in self._hidden_channels:
+                continue
+            if not plot.isVisible():
+                continue
+            vb = plot.vb if hasattr(plot, "vb") else plot.getViewBox()
+            if vb is None:
+                continue
+            if not vb.sceneBoundingRect().contains(scene_pos):
+                continue
+            active_plot = plot
+            active_idx = idx
+            break
+
+        if active_plot is None or active_idx is None:
+            self._hide_hover_indicator(detach=True)
+            return
+
+        vb = active_plot.vb if hasattr(active_plot, "vb") else active_plot.getViewBox()
+        if vb is None:
+            self._hide_hover_indicator(detach=True)
+            return
+
+        view_point = vb.mapSceneToView(scene_pos)
+        t_val = float(view_point.x())
+        curve = self.curves[active_idx]
+        sample = _sample_at_time(curve, t_val)
+        if sample is None:
+            self._hide_hover_indicator(detach=True)
+            return
+
+        sample_time, sample_value = sample
+        meta = self.loader.info[active_idx]
+        unit = getattr(meta, "unit", "") or ""
+        value_text = f"{sample_value:.3f}"
+        if unit:
+            value_text = f"{value_text} {unit}"
+
+        self._attach_hover_overlay(active_plot)
+        self._hover_line.setValue(sample_time)
+        self._hover_line.setVisible(True)
+
+        y_min, y_max = vb.viewRange()[1]
+        anchor_y = 1.0
+        span = abs(y_max - y_min)
+        if span > 0 and (y_max - sample_value) < 0.1 * span:
+            anchor_y = 0.0
+        new_anchor = (0.0, anchor_y)
+        if new_anchor != self._hover_label_anchor:
+            self._hover_label.setAnchor(new_anchor)
+            self._hover_label_anchor = new_anchor
+        self._hover_label.setText(value_text)
+        self._hover_label.setPos(sample_time, sample_value)
+        self._hover_label.setVisible(True)
 
     def _on_channel_checkbox_toggled(self, idx: int, checked: bool) -> None:
         self._set_channel_visible(idx, bool(checked))
