@@ -74,6 +74,16 @@ QComboBox {{
     color: {spinbox_text};
 }}
 QComboBox::drop-down {{ border: none; }}
+QLineEdit {{
+    background-color: {spinbox_bg};
+    border: 1px solid {spinbox_border};
+    border-radius: 6px;
+    padding: 6px 8px;
+    color: {spinbox_text};
+}}
+QLineEdit::placeholder {{
+    color: {text_muted};
+}}
 QPushButton#fileSelectButton {{
     background-color: {file_button_bg};
     border: 1px solid {file_button_border};
@@ -131,10 +141,21 @@ QFrame#channelSection {{
 QFrame#channelSection QCheckBox {{
     color: {channel_checkbox};
 }}
+QGroupBox#annotationSection QCheckBox {{
+    color: {text_primary};
+}}
 QGroupBox#annotationSection QListWidget {{
     background-color: {annotation_list_bg};
     border: 1px solid {annotation_list_border};
     border-radius: 6px;
+    color: {text_primary};
+}}
+QGroupBox#annotationSection QListWidget::item:selected {{
+    background-color: {file_button_bg};
+    color: {file_button_text};
+}}
+QGroupBox#annotationSection QListWidget::item:hover {{
+    background-color: {tool_button_bg_hover};
 }}
 QFrame#prefetchSection,
 QFrame#appearanceSection {{
@@ -230,7 +251,7 @@ THEMES: dict[str, ThemeDefinition] = {
                 "channel_section_bg": "#141e30",
                 "channel_section_border": "#24324b",
                 "channel_checkbox": "#dfe7ff",
-                "annotation_list_bg": "#0f1724",
+                "annotation_list_bg": "#0d1420",
                 "annotation_list_border": "#1f2a3d",
                 "prefetch_bg": "#141e30",
                 "prefetch_border": "#24324b",
@@ -262,69 +283,95 @@ THEMES: dict[str, ThemeDefinition] = {
     ),
     "Dawn": ThemeDefinition(
         name="Dawn",
-        pg_background="#C4CBD8",
+        pg_background="#F5F7FA",
         pg_foreground="#0F172A",
         stylesheet=_make_stylesheet(
             {
-                "window_bg": "#C4CBD8",
+                # Base canvas & text
+                "window_bg": "#F5F7FA",
                 "text_primary": "#0F172A",
-                "text_muted": "#475569",
+                "text_muted": "#5B6573",
                 "stage_summary": "#1E3A8A",
                 "source_label": "#64748B",
-                "control_bg": "#C4CBD8",
-                "control_border": "#CBD5E1",
+
+                # Left control rail
+                "control_bg": "#FFFFFF",
+                "control_border": "#D9E1EA",
+
+                # Telemetry pill
                 "telemetry_bg": "#EEF2F7",
-                "telemetry_border": "#CBD5E1",
+                "telemetry_border": "#D9E1EA",
                 "telemetry_text": "#0F172A",
-                "spinbox_bg": "#C4CBD8",
-                "spinbox_border": "#C7D2E0",
+
+                # Inputs (spinbox/combos/line-edits share these)
+                "spinbox_bg": "#FFFFFF",
+                "spinbox_border": "#CBD5E1",
                 "spinbox_text": "#0F172A",
+
+                # Primary action button (file select)
                 "file_button_bg": "#E7EEF9",
                 "file_button_border": "#C5D1EA",
                 "file_button_text": "#0F172A",
                 "file_button_bg_hover": "#D9E4F7",
                 "file_button_border_hover": "#AFC1E6",
                 "file_button_bg_pressed": "#CAD7F1",
-                "groupbox_bg": "#C4CBD8",
-                "groupbox_border": "#D1D9E6",
+
+                # Group boxes
+                "groupbox_bg": "#FFFFFF",
+                "groupbox_border": "#D9E1EA",
                 "groupbox_title": "#334155",
-                "group_button_bg": "#EDF2FB",
-                "group_button_border": "#CBD6EB",
+                "group_button_bg": "#F0F4FA",
+                "group_button_border": "#D4DEED",
                 "group_button_text": "#1F2A44",
-                "group_button_bg_hover": "#E3EBFA",
-                "group_button_bg_pressed": "#D4DDF3",
-                "channel_section_bg": "#C4CBD8",
-                "channel_section_border": "#D1D9E6",
+                "group_button_bg_hover": "#E6ECF7",
+                "group_button_bg_pressed": "#D9E4F3",
+
+                # Channel list
+                "channel_section_bg": "#FFFFFF",
+                "channel_section_border": "#D9E1EA",
                 "channel_checkbox": "#0F172A",
-                "annotation_list_bg": "#F5F7FB",
-                "annotation_list_border": "#D1D9E6",
-                "prefetch_bg": "#C4CBD8",
-                "prefetch_border": "#D1D9E6",
+
+                # Annotations list (slight tint so it stands apart from white)
+                "annotation_list_bg": "#F9FBFD",
+                "annotation_list_border": "#D9E1EA",
+
+                # Prefetch & Appearance frames
+                "prefetch_bg": "#FFFFFF",
+                "prefetch_border": "#D9E1EA",
+
+                # Tool buttons (small icon buttons)
                 "tool_button_bg": "#E9EEF8",
                 "tool_button_border": "#CBD5E1",
                 "tool_button_text": "#0F172A",
                 "tool_button_bg_hover": "#DFE7F7",
                 "tool_button_bg_pressed": "#CFDBF1",
+
+                # Expanders
                 "prefetch_toggle_text": "#334155",
                 "prefetch_toggle_hover": "#1F2A44",
+
+                # Progress bar (ingest)
                 "ingest_bar_bg": "#EEF2F7",
                 "ingest_bar_border": "#CBD5E1",
                 "ingest_bar_chunk": "#3B82F6",
+
+                # Scroll areas
                 "scroll_bg": "#F2F4F8",
             }
         ),
+        # Curves: readable on a light canvas
         curve_colors=(
-            "#2563EB",  # EEG/Stage primary
-            "#D97706",  # Amber
+            "#1D4ED8",  # Blue
+            "#B45309",  # Amber (darker for light bg)
             "#059669",  # Green
-            "#DC2626",  # Red
-            "#7C3AED",  # Violet
-            "#0284C7",  # Sky
+            "#9333EA",  # Violet
+            "#0EA5E9",  # Sky
+            "#DC2626",  # Red (alerts)
         ),
-        stage_curve_color="#2563EB",
+        stage_curve_color="#1D4ED8",
         channel_label_active="#0F172A",
         channel_label_hidden="#6B7280",
-        preview_colors=("#3461c1", "#cf6b2b", "#1d936c"),
+        preview_colors=("#1D4ED8", "#B45309", "#059669"),
     ),
     "Slate": ThemeDefinition(
         name="Slate",
@@ -351,7 +398,7 @@ THEMES: dict[str, ThemeDefinition] = {
                 "file_button_bg_hover": "#2a303b",
                 "file_button_border_hover": "#3d4554",
                 "file_button_bg_pressed": "#1d222a",
-                "groupbox_bg": "#181c22",
+                "groupbox_bg": "#192027",
                 "groupbox_border": "#282e38",
                 "groupbox_title": "#b2b8c2",
                 "group_button_bg": "#232934",
@@ -362,7 +409,7 @@ THEMES: dict[str, ThemeDefinition] = {
                 "channel_section_bg": "#181c22",
                 "channel_section_border": "#282e38",
                 "channel_checkbox": "#f0f2f6",
-                "annotation_list_bg": "#14171d",
+                "annotation_list_bg": "#131821",
                 "annotation_list_border": "#242933",
                 "prefetch_bg": "#181c22",
                 "prefetch_border": "#282e38",
@@ -429,7 +476,7 @@ THEMES: dict[str, ThemeDefinition] = {
                 "channel_section_bg": "#FFFFFF",
                 "channel_section_border": "#E6E2C8",
                 "channel_checkbox": "#283618",
-                "annotation_list_bg": "#FFF8E8",
+                "annotation_list_bg": "#FFF3DA",
                 "annotation_list_border": "#E6E2C8",
                 "prefetch_bg": "#FFFFFF",
                 "prefetch_border": "#E6E2C8",
@@ -456,7 +503,7 @@ THEMES: dict[str, ThemeDefinition] = {
         ),
         stage_curve_color="#606C38",
         channel_label_active="#283618",
-        channel_label_hidden="#6B6F5A",
+        channel_label_hidden="#787D66",
         preview_colors=("#606C38", "#DDA15E", "#BC6C25"),
     ),
 
@@ -563,8 +610,8 @@ THEMES: dict[str, ThemeDefinition] = {
                 "channel_section_bg": "#0C2534",
                 "channel_section_border": "#18475F",
                 "channel_checkbox": "#E6F4FF",
-                "annotation_list_bg": "#081C28",
-                "annotation_list_border": "#123245",
+                "annotation_list_bg": "#0A1E2C",
+                "annotation_list_border": "#1A3A4D",
                 "prefetch_bg": "#0C2534",
                 "prefetch_border": "#18475F",
                 "tool_button_bg": "#0F2C3D",
@@ -659,5 +706,71 @@ THEMES: dict[str, ThemeDefinition] = {
         channel_label_active="#184E77",
         channel_label_hidden="#2F6C90",
         preview_colors=("#99D98C", "#34A0A4", "#1A759F"),
+    ),
+    "CarbonNight": ThemeDefinition(
+        name="CarbonNight",
+        pg_background="#1b2129",
+        pg_foreground="#e6edf5",
+        stylesheet=_make_stylesheet(
+            {
+                "window_bg": "#161a1f",
+                "text_primary": "#e6edf5",
+                "text_muted": "#9aa3ad",
+                "stage_summary": "#8bd4c6",
+                "source_label": "#9aa3ad",
+                "control_bg": "#1d2229",
+                "control_border": "#2a313b",
+                "telemetry_bg": "#151a1f",
+                "telemetry_border": "#2a313b",
+                "telemetry_text": "#d2d8e0",
+                "spinbox_bg": "#1c222a",
+                "spinbox_border": "#2b3340",
+                "spinbox_text": "#f2f6ff",
+                "file_button_bg": "#223041",
+                "file_button_border": "#2f3e52",
+                "file_button_text": "#eaf2ff",
+                "file_button_bg_hover": "#2c3d52",
+                "file_button_border_hover": "#3d5373",
+                "file_button_bg_pressed": "#1e2a3a",
+                "groupbox_bg": "#1b2027",
+                "groupbox_border": "#2a303a",
+                "groupbox_title": "#b6c0cc",
+                "group_button_bg": "#232a34",
+                "group_button_border": "#313a46",
+                "group_button_text": "#e7edf6",
+                "group_button_bg_hover": "#2c3542",
+                "group_button_bg_pressed": "#1f2630",
+                "channel_section_bg": "#1b2027",
+                "channel_section_border": "#2a303a",
+                "channel_checkbox": "#f1f5fb",
+                "annotation_list_bg": "#14181f",
+                "annotation_list_border": "#242a34",
+                "prefetch_bg": "#1b2027",
+                "prefetch_border": "#2a303a",
+                "tool_button_bg": "#202732",
+                "tool_button_border": "#2e3744",
+                "tool_button_text": "#e6edf5",
+                "tool_button_bg_hover": "#2a3340",
+                "tool_button_bg_pressed": "#1a2029",
+                "prefetch_toggle_text": "#b6c0cc",
+                "prefetch_toggle_hover": "#e6edf5",
+                "ingest_bar_bg": "#151a1f",
+                "ingest_bar_border": "#242b36",
+                "ingest_bar_chunk": "#4f7cff",
+                "scroll_bg": "#161a1f",
+            }
+        ),
+        curve_colors=(
+            "#31c7b2",  # teal
+            "#f0b429",  # amber
+            "#60a5fa",  # blue
+            "#a78bfa",  # violet
+            "#22d3ee",  # cyan
+            "#f472b6",  # pink
+        ),
+        stage_curve_color="#60a5fa",
+        channel_label_active="#e6edf5",
+        channel_label_hidden="#718096",
+        preview_colors=("#31c7b2", "#f0b429", "#60a5fa"),
     ),
 }

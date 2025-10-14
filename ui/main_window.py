@@ -31,14 +31,13 @@ from core import annotations as annotation_core
 LOG = logging.getLogger(__name__)
 
 STAGE_COLORS: dict[str, str] = {
-    "Wake": "#f6c87c",
-    "N1": "#f3dda3",
-    "N2": "#9fd7a5",
-    "N3": "#6ec2d0",
-    "REM": "#f59db7",
+    "Wake": "#c47c00",
+    "N1": "#c1a146",
+    "N2": "#3f8e5a",
+    "N3": "#2c7f8d",
+    "REM": "#c2556f",
 }
-DEFAULT_STAGE_COLOR = "#b9c1cf"
-STAGE_LABEL_COLOR = "#0f1a2b"
+DEFAULT_STAGE_COLOR = "#4c5d73"
 STAGE_TEXT_MARGIN = 26.0
 
 
@@ -213,16 +212,16 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._hidden_channels: set[int] = set(getattr(self._config, "hidden_channels", ()))
         self._auto_hide_annotation_channels()
-        hidden_ann = getattr(self._config, "hidden_annotation_channels", ("stage", "position"))
+        hidden_ann = getattr(self._config, "hidden_annotation_channels", ())
         self._hidden_annotation_channels: set[str] = {
             str(name).strip() for name in hidden_ann if str(name).strip()
         }
+        self._hidden_annotation_channels.discard(annotation_core.STAGE_CHANNEL)
         self._manual_annotation_paths: dict[str, Path] = {}
         self._annotations_index: annotation_core.AnnotationIndex | None = None
         self._annotation_lines: list[pg.InfiniteLine] = []
         self._annotations_enabled = False
         self._annotation_rects: list[QtWidgets.QGraphicsRectItem] = []
-        self._stage_rects: list[QtWidgets.QGraphicsRectItem] = []
         self._stage_label_items: list[QtWidgets.QGraphicsSimpleTextItem] = []
         self._all_event_records: list[dict[str, float | str | int]] = []
         self._event_records: list[dict[str, float | str | int]] = []
@@ -231,9 +230,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._event_color_cache: dict[str, QtGui.QColor] = {}
         self._selected_event_channel: str | None = None
         self._event_label_filter: str = ""
-        self._stage_label_item: pg.LabelItem | None = None
-        self._stage_info_widget: QtWidgets.QTableWidget | None = None
-        self._stage_info_proxy: QtWidgets.QGraphicsProxyWidget | None = None
         self._annotation_channel_toggles: dict[str, QtWidgets.QCheckBox] = {}
 
         self._build_ui()
@@ -289,9 +285,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.annotationFocusOnly = QtWidgets.QCheckBox("Show only selected event")
         self.annotationFocusOnly.setChecked(False)
         self.annotationFocusOnly.setEnabled(False)
-        self.annotationStageToggle = QtWidgets.QCheckBox("Show sleep stages")
-        self.annotationStageToggle.setChecked(False)
-        self.annotationStageToggle.setEnabled(False)
         self.annotationPositionToggle = QtWidgets.QCheckBox("Show body position")
         self.annotationPositionToggle.setChecked(False)
         self.annotationPositionToggle.setEnabled(False)
@@ -412,7 +405,6 @@ class MainWindow(QtWidgets.QMainWindow):
         annotationLayout.setSpacing(10)
         annotationLayout.addWidget(self.annotationToggle)
         annotationLayout.addWidget(self.annotationFocusOnly)
-        annotationLayout.addWidget(self.annotationStageToggle)
         annotationLayout.addWidget(self.annotationPositionToggle)
         annotationLayout.addWidget(self.annotationImportBtn)
         filterRow = QtWidgets.QHBoxLayout()
@@ -434,7 +426,6 @@ class MainWindow(QtWidgets.QMainWindow):
         controlLayout.addWidget(annotationSection)
 
         self._annotation_channel_toggles = {
-            annotation_core.STAGE_CHANNEL: self.annotationStageToggle,
             annotation_core.POSITION_CHANNEL: self.annotationPositionToggle,
         }
 
@@ -787,14 +778,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.time_axis.setPen(pg.mkPen(theme.pg_foreground))
         self.time_axis.setTextPen(theme.pg_foreground)
 
-        if self._stage_info_widget is not None:
-            self._stage_info_widget.viewport().setAutoFillBackground(False)
-            header = self._stage_info_widget.horizontalHeader()
-            header.setStyleSheet("")
-
         self._apply_curve_pens()
         self._refresh_channel_label_styles()
-        self._update_stage_label_style()
         self._update_theme_preview(resolved_key)
 
         if persist:
@@ -819,16 +804,6 @@ class MainWindow(QtWidgets.QMainWindow):
             meta = self.loader.info[idx]
             hidden = idx in self._hidden_channels
             label_item.setText(self._format_label(meta, hidden=hidden))
-
-    def _update_stage_label_style(self) -> None:
-        if self._stage_label_item is not None:
-            self._stage_label_item.setText(self._stage_label_markup())
-
-    def _stage_label_markup(self) -> str:
-        color = getattr(self._theme, "channel_label_active", "#ffffff")
-        return (
-            "<span style='color:" + color + ";font-weight:600;font-size:11pt;padding-right:12px;'>Stage</span>"
-        )
 
     def _update_theme_preview(self, key: str) -> None:
         if not hasattr(self, "themePreviewWidget"):
@@ -976,7 +951,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self._ensure_overscan_for_view()
 
         self._update_annotation_overlays(t0, t1)
-        self._update_stage_info()
 
     def _update_time_labels(self, t0, t1):
         tb = self.loader.timebase
@@ -1432,7 +1406,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._clear_annotation_rects()
         self._populate_event_list(clear=True)
         self._update_annotation_channel_toggles()
-        self._update_stage_info()
         self._update_annotation_summary()
 
         path = getattr(self.loader, "path", None)
@@ -1490,91 +1463,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._reset_event_filters()
         self._populate_event_list()
         self._update_annotation_summary()
-        self._update_stage_info()
         self._update_annotation_overlays(
             self._view_start,
             min(self.loader.duration_s, self._view_start + self._view_duration),
         )
-
-    def _update_stage_info(self):
-        if self._stage_info_widget is None:
-            self._ensure_stage_info_widget()
-        table = self._stage_info_widget
-        proxy = self._stage_info_proxy
-        label_item = self._stage_label_item
-        if table is None:
-            return
-        if table.rowCount() != 3:
-            table.setRowCount(3)
-        entries = [None, None, None]
-        if not self._annotations_index or self._annotations_index.is_empty():
-            if proxy is not None:
-                proxy.setVisible(False)
-            if label_item is not None:
-                label_item.setVisible(False)
-            for row in range(3):
-                for col in range(table.columnCount()):
-                    self._set_stage_table_item(table, row, col, "--")
-            table.clearSelection()
-            return
-
-        stages = self._stage_annotations()
-        if stages.size == 0:
-            if proxy is not None:
-                proxy.setVisible(False)
-            if label_item is not None:
-                label_item.setVisible(False)
-            for row in range(3):
-                for col in range(table.columnCount()):
-                    self._set_stage_table_item(table, row, col, "--")
-            table.clearSelection()
-            return
-
-        center_time = self._view_start + self._view_duration * 0.5
-        starts = stages["start_s"]
-        idx = int(np.searchsorted(starts, center_time, side="right") - 1)
-        current_idx = idx if idx >= 0 and stages[idx]["end_s"] > center_time else -1
-        prev_idx = current_idx - 1 if current_idx >= 0 else idx
-        next_idx = current_idx + 1 if current_idx >= 0 else idx + 1
-
-        current_entry = stages[current_idx] if current_idx >= 0 else None
-        prev_entry = stages[prev_idx] if prev_idx is not None and prev_idx >= 0 else None
-        next_entry = stages[next_idx] if next_idx is not None and next_idx < stages.size else None
-
-        entries = [prev_entry, current_entry, next_entry]
-
-        if proxy is not None:
-            proxy.setVisible(True)
-        if label_item is not None:
-            label_item.setVisible(True)
-
-        for row, entry in enumerate(entries):
-            if entry is None:
-                self._set_stage_table_item(table, row, 0, "--")
-                self._set_stage_table_item(table, row, 1, "--")
-                self._set_stage_table_item(table, row, 2, "--")
-            else:
-                label = str(entry["label"]) or "--"
-                start_text = self._format_clock(float(entry["start_s"]))
-                end_text = self._format_clock(float(entry["end_s"]))
-                self._set_stage_table_item(table, row, 0, label)
-                self._set_stage_table_item(table, row, 1, start_text)
-                self._set_stage_table_item(table, row, 2, end_text)
-
-        if entries[1] is not None:
-            table.selectRow(1)
-        else:
-            table.clearSelection()
-
-    def _set_stage_table_item(
-        self, table: QtWidgets.QTableWidget, row: int, column: int, text: str
-    ) -> None:
-        item = table.item(row, column)
-        if item is None:
-            item = QtWidgets.QTableWidgetItem()
-            item.setFlags(QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsSelectable)
-            table.setItem(row, column, item)
-        item.setText(text)
 
     def _stage_annotations(self) -> np.ndarray:
         if not self._annotations_index or self._annotations_index.is_empty():
@@ -1761,65 +1653,79 @@ class MainWindow(QtWidgets.QMainWindow):
             scene.addItem(rect_item)
             self._annotation_rects.append(rect_item)
 
-    def _ensure_stage_rect_pool(self, count: int):
+    def _ensure_stage_label_pool(self, count: int):
         scene = self.plotLayout.scene()
-        while len(self._stage_rects) < count:
-            rect_item = QtWidgets.QGraphicsRectItem()
-            rect_item.setPen(QtGui.QPen(QtCore.Qt.NoPen))
-            rect_item.setZValue(-40)
-            rect_item.setVisible(False)
-            scene.addItem(rect_item)
-
+        while len(self._stage_label_items) < count:
             label_item = QtWidgets.QGraphicsSimpleTextItem("")
             font = label_item.font()
             font.setBold(True)
             label_item.setFont(font)
-            label_item.setBrush(QtGui.QBrush(QtGui.QColor(STAGE_LABEL_COLOR)))
-            label_item.setZValue(-39)
+            label_item.setZValue(-5)
             label_item.setVisible(False)
             scene.addItem(label_item)
-
-            self._stage_rects.append(rect_item)
             self._stage_label_items.append(label_item)
 
     def _stage_color_for_label(self, label: str) -> QtGui.QColor:
-        base = STAGE_COLORS.get(label, DEFAULT_STAGE_COLOR)
-        color = QtGui.QColor(base)
-        color.setAlpha(90)
-        return color
+        return QtGui.QColor(STAGE_COLORS.get(label, DEFAULT_STAGE_COLOR))
 
-    def _clear_stage_rects(self):
-        for rect in self._stage_rects:
-            rect.setVisible(False)
-        for label_item in self._stage_label_items:
-            label_item.setVisible(False)
+    def _clear_stage_labels(self):
+        for item in self._stage_label_items:
+            item.setVisible(False)
 
     def _clear_annotation_lines(self):
         for line in self._annotation_lines:
             line.setVisible(False)
         self._clear_annotation_rects()
-        self._clear_stage_rects()
+        self._clear_stage_labels()
 
     def _clear_annotation_rects(self):
         for rect in self._annotation_rects:
             rect.setVisible(False)
 
-    def _update_stage_background(self, stage_events: np.ndarray, t0: float, t1: float):
+    def _dominant_position_for_segment(
+        self,
+        position_events: np.ndarray,
+        start: float,
+        end: float,
+    ) -> Optional[str]:
+        if position_events is None or getattr(position_events, "size", 0) == 0:
+            return None
+        mask = (position_events["start_s"] < end) & (position_events["end_s"] > start)
+        if not np.any(mask):
+            return None
+        best_label: Optional[str] = None
+        best_overlap = -1.0
+        for entry in position_events[mask]:
+            overlap_start = max(start, float(entry["start_s"]))
+            overlap_end = min(end, float(entry["end_s"]))
+            overlap = max(0.0, overlap_end - overlap_start)
+            if overlap >= best_overlap:
+                best_overlap = overlap
+                best_label = str(entry["label"]) or None
+        return best_label
+
+    def _update_stage_labels(
+        self,
+        stage_events: np.ndarray,
+        position_events: np.ndarray,
+        t0: float,
+        t1: float,
+    ) -> None:
         if not self._primary_plot:
-            self._clear_stage_rects()
+            self._clear_stage_labels()
             return
         if stage_events is None or getattr(stage_events, "size", 0) == 0:
-            self._clear_stage_rects()
+            self._clear_stage_labels()
             return
 
         vb = self._primary_plot.getViewBox()
         if vb is None:
-            self._clear_stage_rects()
+            self._clear_stage_labels()
             return
 
         scene_rect = self.plotLayout.ci.mapRectToScene(self.plotLayout.ci.boundingRect())
         if scene_rect is None:
-            self._clear_stage_rects()
+            self._clear_stage_labels()
             return
 
         segments: list[tuple[float, float, str]] = []
@@ -1832,27 +1738,24 @@ class MainWindow(QtWidgets.QMainWindow):
             segments.append((start, end, label))
 
         if not segments:
-            self._clear_stage_rects()
+            self._clear_stage_labels()
             return
 
-        self._ensure_stage_rect_pool(len(segments))
-        height = scene_rect.height()
+        self._ensure_stage_label_pool(len(segments))
 
         for idx, (start, end, label) in enumerate(segments):
+            label_item = self._stage_label_items[idx]
+            pos_label = self._dominant_position_for_segment(position_events, start, end)
+            text = f"{label} | {pos_label}" if pos_label else label
+            label_item.setText(text)
+            label_item.setBrush(QtGui.QBrush(self._stage_color_for_label(label)))
+
             p1 = vb.mapViewToScene(QtCore.QPointF(start, 0))
             p2 = vb.mapViewToScene(QtCore.QPointF(end, 0))
             x1, x2 = p1.x(), p2.x()
             left = min(x1, x2)
             width = max(2.0, abs(x2 - x1))
-            rect = QtCore.QRectF(left, scene_rect.top(), width, height)
 
-            rect_item = self._stage_rects[idx]
-            rect_item.setRect(rect)
-            rect_item.setBrush(QtGui.QBrush(self._stage_color_for_label(label)))
-            rect_item.setVisible(True)
-
-            label_item = self._stage_label_items[idx]
-            label_item.setText(label)
             text_rect = label_item.boundingRect()
             label_width = text_rect.width()
             label_height = text_rect.height()
@@ -1864,8 +1767,6 @@ class MainWindow(QtWidgets.QMainWindow):
             label_item.setPos(x_mid, y_pos)
             label_item.setVisible(True)
 
-        for idx in range(len(segments), len(self._stage_rects)):
-            self._stage_rects[idx].setVisible(False)
         for idx in range(len(segments), len(self._stage_label_items)):
             self._stage_label_items[idx].setVisible(False)
 
@@ -1901,7 +1802,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_event_channel_options()
         self._populate_event_list()
         self._update_annotation_summary()
-        self._update_stage_info()
         if self.loader is not None:
             self._update_annotation_overlays(
                 self._view_start,
@@ -2177,8 +2077,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 item.setVisible(True)
             for idx in range(len(events), len(self._annotation_rects)):
                 self._annotation_rects[idx].setVisible(False)
+        else:
+            for idx in range(len(self._annotation_rects)):
+                self._annotation_rects[idx].setVisible(False)
 
-            self._clear_stage_rects()
+        if annotation_core.STAGE_CHANNEL in hidden_channels:
+            stage_events = np.zeros(0, dtype=annotation_core.ANNOT_DTYPE)
         else:
             stage_events = self._annotations_index.between(
                 t0, t1, channels=[annotation_core.STAGE_CHANNEL]
@@ -2186,9 +2090,6 @@ class MainWindow(QtWidgets.QMainWindow):
             if isinstance(stage_events, tuple):
                 stage_events = stage_events[0]
             stage_events = np.array(stage_events, copy=False)
-            self._update_stage_background(stage_events, t0, t1)
-        if annotation_core.STAGE_CHANNEL in hidden_channels:
-            stage_events = np.zeros(0, dtype=annotation_core.ANNOT_DTYPE)
 
         if annotation_core.POSITION_CHANNEL in hidden_channels:
             position_events = np.zeros(0, dtype=annotation_core.ANNOT_DTYPE)
@@ -2198,6 +2099,9 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             if isinstance(position_events, tuple):
                 position_events = position_events[0]
+            position_events = np.array(position_events, copy=False)
+
+        self._update_stage_labels(stage_events, position_events, t0, t1)
 
         stage_display = None
         if getattr(stage_events, "size", 0):
@@ -2433,8 +2337,6 @@ class MainWindow(QtWidgets.QMainWindow):
             if plot.getAxis("bottom") is self.time_axis:
                 plot.setAxisItems({"bottom": pg.AxisItem(orientation="bottom")})
 
-        self._ensure_stage_info_widget()
-
     def _sync_channel_controls(self) -> None:
         if not hasattr(self, "channelSection"):
             return
@@ -2567,35 +2469,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
             if stage_hit or position_hit:
                 self._hidden_channels.add(idx)
-
-    def _ensure_stage_info_widget(self):
-        if self._stage_info_widget is None:
-            row = len(self.plots)
-            self._stage_label_item = self.plotLayout.addLabel(
-                row=row, col=0, text="Stage", justify="right"
-            )
-            self._stage_label_item.setText(self._stage_label_markup())
-            self._stage_label_item.setVisible(False)
-            table = QtWidgets.QTableWidget(3, 3)
-            table.setHorizontalHeaderLabels(["Stage", "Start", "End"])
-            table.setVerticalHeaderLabels(["Previous", "Current", "Next"])
-            table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-            table.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
-            table.setFocusPolicy(QtCore.Qt.NoFocus)
-            table.horizontalHeader().setStretchLastSection(True)
-            table.verticalHeader().setDefaultSectionSize(26)
-            table.setAlternatingRowColors(True)
-            table.setMaximumHeight(140)
-            table.setMinimumHeight(110)
-            proxy = QtWidgets.QGraphicsProxyWidget()
-            proxy.setWidget(table)
-            proxy.setVisible(False)
-            self.plotLayout.addItem(proxy, row=row, col=1)
-            self._stage_info_widget = table
-            self._stage_info_proxy = proxy
-
-        if self._stage_label_item is not None:
-            self._stage_label_item.setText(self._stage_label_markup())
 
     def _connect_primary_viewbox(self):
         if self._primary_viewbox is not None:
