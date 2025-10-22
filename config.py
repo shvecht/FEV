@@ -20,6 +20,7 @@ class ViewerConfig:
     hidden_annotation_channels: tuple[str, ...] = ("stage", "position")
     annotation_focus_only: bool = False
     theme: str = "Midnight"
+    canvas_backend: str = "pyqtgraph"
     ini_path: Path | None = None
 
     @classmethod
@@ -49,6 +50,9 @@ class ViewerConfig:
                     "annotation_focus_only", fallback=cfg.annotation_focus_only
                 )
                 cfg.theme = ui_section.get("theme", fallback=cfg.theme)
+                cfg.canvas_backend = ui_section.get(
+                    "canvas_backend", fallback=cfg.canvas_backend
+                )
                 hidden_raw = ui_section.get("hidden_channels", fallback="")
                 if hidden_raw:
                     indices: set[int] = set()
@@ -128,6 +132,7 @@ class ViewerConfig:
             "hidden_annotation_channels": hidden_ann_serialized,
             "annotation_focus_only": "true" if self.annotation_focus_only else "false",
             "theme": self.theme,
+            "canvas_backend": self.canvas_backend,
         }
         parser["cache"] = {
             "enabled": "true" if self.int16_cache_enabled else "false",
