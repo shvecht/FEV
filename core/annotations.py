@@ -47,12 +47,26 @@ class Annotations:
         if self.size == 0 or t1 <= t0:
             return self.data[:0]
         starts = self.data["start_s"]
-        # left bound: first event with start_s >= (t0 - max_span_guess)
-        # but we don't know span; do standard lower_bound at t0, then scan backwards a little.
-        i = np.searchsorted(starts, t0, side="left")
-        # move left while prior events might overlap (start_s < t0 but end_s > t0)
-        j = max(0, i - 64)  # small safety back-scan window
-        subset = self.data[j:np.searchsorted(starts, t1, side="right")]
+        left = int(np.searchsorted(starts, t0, side="left"))
+
+        # Determine earliest candidate index by checking if any earlier
+        # events extend past t0. Older code only scanned a fixed window
+        # (64 items) which missed long-running events when many short
+        # events followed them. Instead, examine the whole prefix in a
+        # vectorised manner and jump directly to the earliest overlap.
+        if left > 0:
+            prefix = self.data[:left]
+            mask_prefix = prefix["end_s"] > t0
+            if mask_prefix.any():
+                first_overlap = int(np.argmax(mask_prefix))
+                start_idx = first_overlap
+            else:
+                start_idx = left
+        else:
+            start_idx = 0
+
+        end_idx = int(np.searchsorted(starts, t1, side="right"))
+        subset = self.data[start_idx:end_idx]
         mask = (subset["start_s"] < t1) & (subset["end_s"] > t0)
         return subset[mask]
 

@@ -1,9 +1,9 @@
-from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 
 from core.annotations import (
+    ANNOT_DTYPE,
     Annotations,
     AnnotationIndex,
     CsvEventMapping,
@@ -95,3 +95,23 @@ def test_discover_annotation_files(tmp_path: Path):
     found = discover_annotation_files(edf_path)
     assert found["events"] == events
     assert found["stages"] == stages
+
+
+def test_annotations_between_includes_long_running_events():
+    arr = np.zeros(130, dtype=ANNOT_DTYPE)
+    arr["start_s"][0] = 0.0
+    arr["end_s"][0] = 1000.0
+    arr["label"][0] = "long"
+    arr["chan"][0] = ""
+
+    for idx in range(1, 130):
+        arr["start_s"][idx] = float(idx)
+        arr["end_s"][idx] = float(idx) + 0.5
+        arr["label"][idx] = f"s{idx}"
+        arr["chan"][idx] = ""
+
+    anns = Annotations(arr, {}, None)
+
+    view = anns.between(900.0, 905.0)
+    assert view.size >= 1
+    assert "long" in view["label"].tolist()
