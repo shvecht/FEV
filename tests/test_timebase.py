@@ -19,7 +19,13 @@ def test_sec_to_idx_basic():
 def test_sec_to_idx_clamps_negative_start():
     s0, n = Timebase.sec_to_idx(-1.0, 1.0, fs=50.0)
     assert s0 == 0
-    assert n == 100
+    assert n == 50
+
+
+def test_sec_to_idx_window_before_start():
+    s0, n = Timebase.sec_to_idx(-2.0, -0.5, fs=100.0)
+    assert s0 == 0
+    assert n == 0
 
 
 def test_idx_to_time_scalar_and_array():
