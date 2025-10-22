@@ -51,6 +51,16 @@ def patch_loader(monkeypatch):
     yield
 
 
+def _expected_minmax(data: np.ndarray, bin_size: int) -> np.ndarray:
+    out = []
+    for start in range(0, data.size, bin_size):
+        segment = data[start : start + bin_size]
+        if segment.size == 0:
+            continue
+        out.append((segment.min(), segment.max()))
+    return np.asarray(out, dtype=np.float32)
+
+
 def test_edf_to_zarr_builds_channel_arrays():
     store = zarr.storage.MemoryStore()
     builder = zc.EdfToZarr(
@@ -81,6 +91,43 @@ def test_edf_to_zarr_builds_channel_arrays():
     assert c3.attrs["name"] == "C3"
     assert c3.attrs["fs"] == 100.0
     assert c3.attrs["unit"] == "uV"
+
+
+def test_edf_to_zarr_builds_lod_levels():
+    store = zarr.storage.MemoryStore()
+    builder = zc.EdfToZarr(
+        "study.edf",
+        out_path="study.zarr",
+        chunk_duration=1.0,
+        store_factory=lambda path: store,
+        lod_durations=(1.0, 5.0, 30.0),
+    )
+
+    group = builder.build()
+    assert group.attrs["lod_durations_s"] == [1.0, 5.0, 30.0]
+
+    lod_root = group["lod"]
+    c3_group = lod_root["0"]
+    baseline = FakeEdfLoader("", duration_s=4.0)
+    data = baseline._data[0].astype(np.float32)
+
+    def get_level(group, duration):
+        for key in group.array_keys():
+            arr = group[key]
+            if abs(arr.attrs.get("bin_duration_s", -1.0) - duration) < 1e-6:
+                return arr
+        raise AssertionError(f"duration {duration} not found")
+
+    ds_1s = get_level(c3_group, 1.0)
+    assert ds_1s.attrs["bin_size"] == 100
+    np.testing.assert_allclose(ds_1s[:, 0], _expected_minmax(data, 100)[:, 0], atol=1e-6)
+    np.testing.assert_allclose(ds_1s[:, 1], _expected_minmax(data, 100)[:, 1], atol=1e-6)
+
+    ds_5s = get_level(c3_group, 5.0)
+    assert ds_5s.shape == (1, 2)
+    expected_5s = _expected_minmax(data, 500)
+    np.testing.assert_allclose(ds_5s[:, 0], expected_5s[:, 0], atol=1e-6)
+    np.testing.assert_allclose(ds_5s[:, 1], expected_5s[:, 1], atol=1e-6)
 
 
 def test_progress_callback_tracks_samples():
@@ -205,5 +252,30 @@ def test_zarr_loader_annotation_roundtrip(tmp_path):
         assert ann_out is annotations
         loader.set_annotations(annotations_module.Annotations.empty())
         assert loader.annotations().size == 0
+    finally:
+        loader.close()
+
+
+def test_zarr_loader_exposes_lod_levels(tmp_path):
+    store_path = tmp_path / "study.zarr"
+    builder = zc.EdfToZarr(
+        "study.edf",
+        out_path=str(store_path),
+        lod_durations=(1.0, 2.0),
+    )
+    builder.build()
+
+    baseline = FakeEdfLoader("study.edf")
+    data = baseline._data[0].astype(np.float32)
+
+    loader = ZarrLoader(store_path)
+    try:
+        levels = loader.lod_levels(0)
+        assert levels == [1.0, 2.0]
+        mins, maxs, duration = loader.read_lod(0, 1.0)
+        expected = _expected_minmax(data, 100)
+        np.testing.assert_allclose(mins, expected[:, 0], atol=1e-6)
+        np.testing.assert_allclose(maxs, expected[:, 1], atol=1e-6)
+        assert duration == pytest.approx(1.0)
     finally:
         loader.close()

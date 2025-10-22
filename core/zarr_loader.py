@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable, List, Tuple
+from typing import Dict, Iterable, List, Tuple
 
 import numpy as np
 import zarr
@@ -40,6 +40,7 @@ class ZarrLoader:
 
         self._channel_arrays: List[zarr.Array] = []
         self._channel_meta: List[ChannelMeta] = []
+        self._lod_levels: Dict[int, Dict[float, zarr.Array]] = {}
 
         ch_group = self._root["channels"]
         idx = 0
@@ -56,6 +57,9 @@ class ZarrLoader:
         self.n_channels = len(self._channel_arrays)
         if not self.channels:
             self.channels = [meta.name for meta in self._channel_meta]
+
+        if "lod" in self._root:
+            self._load_lod_groups(self._root["lod"])
 
         self.info = self._channel_meta
         self.timebase = Timebase(
@@ -93,8 +97,53 @@ class ZarrLoader:
     def set_annotations(self, annotations: annotations_core.Annotations | None):
         self._annotations = annotations
 
+    # ------------------------------------------------------------------
+
+    def lod_levels(self, idx: int) -> List[float]:
+        levels = self._lod_levels.get(idx)
+        if not levels:
+            return []
+        return sorted(levels.keys())
+
+    def read_lod(self, idx: int, duration_s: float) -> Tuple[np.ndarray, np.ndarray, float]:
+        levels = self._lod_levels.get(idx)
+        if not levels:
+            raise KeyError(f"no LOD levels for channel {idx}")
+        key = self._lod_key(duration_s)
+        if key not in levels:
+            available = ", ".join(str(v) for v in sorted(levels.keys()))
+            raise KeyError(f"LOD duration {duration_s} not found for channel {idx}; available: {available}")
+        dataset = levels[key]
+        data = dataset[:]
+        mins = data[:, 0]
+        maxs = data[:, 1]
+        duration = float(dataset.attrs.get("bin_duration_s", duration_s))
+        return mins, maxs, duration
+
     def close(self):
         pass
+
+    # ------------------------------------------------------------------
+
+    def _load_lod_groups(self, lod_root: zarr.Group) -> None:
+        for name in lod_root.group_keys():
+            try:
+                idx = int(name)
+            except ValueError:
+                continue
+            ch_group = lod_root[name]
+            durations: Dict[float, zarr.Array] = {}
+            for level_name in ch_group.array_keys():
+                arr = ch_group[level_name]
+                duration = float(arr.attrs.get("bin_duration_s", 0.0))
+                key = self._lod_key(duration)
+                durations[key] = arr
+            if durations:
+                self._lod_levels[idx] = durations
+
+    @staticmethod
+    def _lod_key(duration: float) -> float:
+        return round(float(duration), 9)
 
 
 __all__ = ["ZarrLoader", "ChannelMeta"]
