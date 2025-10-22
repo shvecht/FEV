@@ -67,6 +67,7 @@ class PrefetchCache:
                 return entry.data
         data = self.fetch(channel, start, start + duration)
         with self._lock:
+            self._update_estimated_tile_bytes(data)
             self._cache[key] = CacheEntry(data=data, last_access=time.time())
             self._cache.move_to_end(key)
             self._evict_if_needed()
@@ -108,12 +109,7 @@ class PrefetchCache:
                     continue
             data = self.fetch(channel, start, start + duration)
             with self._lock:
-                tile_bytes = sum(arr.nbytes for arr in data)
-                if tile_bytes > 0:
-                    if self._estimated_tile_bytes == 0.0:
-                        self._estimated_tile_bytes = float(tile_bytes)
-                    else:
-                        self._estimated_tile_bytes = 0.8 * self._estimated_tile_bytes + 0.2 * float(tile_bytes)
+                self._update_estimated_tile_bytes(data)
                 self._cache[key] = CacheEntry(data=data, last_access=time.time())
                 self._cache.move_to_end(key)
                 self._evict_if_needed()
@@ -128,6 +124,15 @@ class PrefetchCache:
         with self._lock:
             self.config = config
             self._evict_if_needed()
+
+    def _update_estimated_tile_bytes(self, data: Tuple[np.ndarray, np.ndarray]) -> None:
+        tile_bytes = sum(arr.nbytes for arr in data)
+        if tile_bytes <= 0:
+            return
+        if self._estimated_tile_bytes == 0.0:
+            self._estimated_tile_bytes = float(tile_bytes)
+        else:
+            self._estimated_tile_bytes = 0.8 * self._estimated_tile_bytes + 0.2 * float(tile_bytes)
 
 
 class PrefetchService:

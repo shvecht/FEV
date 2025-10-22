@@ -37,3 +37,20 @@ def test_prefetch_service_configures_caches():
     assert cache.config.tile_duration == 2.0
     assert cache.config.max_tiles == 5
     assert cache.config.max_bytes == 1.0 * 1024 * 1024
+
+
+def _heavy_fetch(channel: int, start: float, end: float):
+    # Each tile is intentionally large so that size-based eviction should trigger.
+    t = np.linspace(start, end, num=512, endpoint=False, dtype=np.float32)
+    x = np.full_like(t, fill_value=channel, dtype=np.float32)
+    return t, x
+
+
+def test_prefetch_get_respects_max_bytes_budget():
+    config = PrefetchConfig(tile_duration=1.0, max_tiles=10, max_bytes=1024.0)
+    cache = PrefetchCache(_heavy_fetch, config)
+
+    for idx in range(3):
+        cache.get_tile(0, float(idx), 1.0)
+        with cache._lock:
+            assert len(cache._cache) == 1
