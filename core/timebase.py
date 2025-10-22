@@ -44,8 +44,12 @@ class Timebase:
         """
         if fs <= 0:
             raise ValueError("fs must be positive")
-        s0 = int(np.floor(max(0.0, t0_s) * fs))
-        n  = int(max(0.0, np.ceil((t1_s - t0_s) * fs)))
+
+        start = max(0.0, t0_s)
+        end = max(start, t1_s)
+
+        s0 = int(np.floor(start * fs))
+        n = int(max(0.0, np.ceil((end - start) * fs)))
         return s0, n
 
     @staticmethod
