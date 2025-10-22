@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import math
 from pathlib import Path
-from typing import Callable, Optional, Protocol, cast
+from typing import Callable, Optional, Protocol, Sequence, cast
 
 import numpy as np
 import zarr
@@ -46,6 +47,7 @@ class EdfToZarr:
     out_path: Optional[str] = None
     chunk_duration: float = 5.0
     max_chunk_samples: int = 4096
+    lod_durations: Sequence[float] = (1.0, 5.0, 30.0)
     store_factory: Optional[Callable[[Path], BaseStore]] = None
     loader_factory: Optional[Callable[[str], EdfLoader]] = None
     progress_callback: Optional[Callable[[int, int], None]] = None
@@ -103,9 +105,16 @@ class EdfToZarr:
         attrs["chunk_duration_s"] = float(self.chunk_duration)
         attrs["max_chunk_samples"] = int(self.max_chunk_samples)
         attrs["max_window_s"] = float(getattr(loader, "max_window_s", 120.0))
+        lod_levels = self._normalized_lod_durations()
+        if lod_levels:
+            attrs["lod_durations_s"] = list(lod_levels)
 
     def _write_channels(self, group: zarr.Group, loader: EdfLoader) -> None:
         channels_group = group.create_group("channels")
+        lod_levels = self._normalized_lod_durations()
+        lod_root: zarr.Group | None = None
+        if lod_levels:
+            lod_root = group.create_group("lod")
 
         for idx, info in enumerate(loader.info):
             chunk_len = self._compute_chunk_len(info.fs)
@@ -121,7 +130,11 @@ class EdfToZarr:
             array.attrs["fs"] = float(info.fs)
             array.attrs["n_samples"] = int(info.n_samples)
 
-            self._stream_channel(loader, idx, info, array, chunk_len)
+            envelope_writers: list[_EnvelopeWriter] = []
+            if lod_root is not None:
+                envelope_writers = self._create_lod_writers(lod_root, idx, info, lod_levels)
+
+            self._stream_channel(loader, idx, info, array, chunk_len, envelope_writers)
 
         # ensure callback sees completion state
         self._progress_done = self._progress_total
@@ -134,7 +147,15 @@ class EdfToZarr:
         samples = max(1, samples)
         return min(self.max_chunk_samples, samples)
 
-    def _stream_channel(self, loader: EdfLoader, idx: int, info, array: zarr.Array, chunk_len: int) -> None:
+    def _stream_channel(
+        self,
+        loader: EdfLoader,
+        idx: int,
+        info,
+        array: zarr.Array,
+        chunk_len: int,
+        envelope_writers: Sequence["_EnvelopeWriter"],
+    ) -> None:
         total = int(info.n_samples)
         fs = float(info.fs)
         offset = 0
@@ -147,8 +168,13 @@ class EdfToZarr:
             if data.dtype != np.float32:
                 data = data.astype(np.float32)
             array[offset : offset + data.size] = data
+            for writer in envelope_writers:
+                writer.ingest(data)
             offset += data.size
             self._report_progress(data.size)
+
+        for writer in envelope_writers:
+            writer.finalize()
 
     def _report_progress(self, delta: int) -> None:
         if not self.progress_callback:
@@ -157,5 +183,109 @@ class EdfToZarr:
         self._progress_done = min(self._progress_total, self._progress_done + increment)
         self.progress_callback(self._progress_done, max(1, self._progress_total))
 
+    # ------------------------------------------------------------------
+
+    def _normalized_lod_durations(self) -> tuple[float, ...]:
+        seen: dict[float, float] = {}
+        for duration in self.lod_durations:
+            value = float(duration)
+            if not math.isfinite(value) or value <= 0:
+                continue
+            key = round(value, 9)
+            if key not in seen:
+                seen[key] = value
+        return tuple(seen[key] for key in sorted(seen))
+
+    def _create_lod_writers(
+        self,
+        lod_root: zarr.Group,
+        idx: int,
+        info,
+        lod_levels: Sequence[float],
+    ) -> list["_EnvelopeWriter"]:
+        if int(info.n_samples) <= 0:
+            return []
+        ch_group = lod_root.create_group(str(idx))
+        writers: list[_EnvelopeWriter] = []
+        fs = float(info.fs)
+        total_samples = int(info.n_samples)
+        for duration in lod_levels:
+            bin_size = max(1, int(round(fs * duration)))
+            if bin_size <= 0:
+                continue
+            bins = int(math.ceil(total_samples / bin_size))
+            if bins <= 0:
+                continue
+            chunk_bins = bins
+            if self.max_chunk_samples > 0:
+                approx = self.max_chunk_samples // max(1, bin_size)
+                if approx <= 0:
+                    approx = 1
+                chunk_bins = min(bins, approx)
+            dataset = ch_group.create_dataset(
+                self._lod_dataset_name(duration),
+                shape=(bins, 2),
+                chunks=(chunk_bins, 2),
+                dtype="float32",
+                overwrite=True,
+            )
+            dataset.attrs["bin_duration_s"] = float(duration)
+            dataset.attrs["bin_size"] = int(bin_size)
+            dataset.attrs["columns"] = ["min", "max"]
+            writers.append(_EnvelopeWriter(dataset, bin_size, bins))
+        return writers
+
+    @staticmethod
+    def _lod_dataset_name(duration: float) -> str:
+        text = format(duration, "g").replace("-", "neg").replace(".", "p")
+        return f"sec_{text}"
+
 
 __all__ = ["EdfToZarr", "DEFAULT_PROCESSED_DIR", "resolve_output_path"]
+
+
+class _EnvelopeWriter:
+    """Incrementally computes min/max envelopes for fixed-size bins."""
+
+    def __init__(self, dataset: zarr.Array, bin_size: int, expected_bins: int) -> None:
+        self._dataset = dataset
+        self._bin_size = max(1, int(bin_size))
+        self._expected_bins = max(0, int(expected_bins))
+        self._buffer = np.empty(0, dtype=np.float32)
+        self._write_idx = 0
+
+    def ingest(self, data: np.ndarray) -> None:
+        if data.size == 0:
+            return
+        if data.dtype != np.float32:
+            data = data.astype(np.float32)
+        if self._buffer.size:
+            data = np.concatenate((self._buffer, data))
+            self._buffer = np.empty(0, dtype=np.float32)
+        bin_size = self._bin_size
+        full_bins = data.size // bin_size
+        if full_bins:
+            trimmed = data[: full_bins * bin_size]
+            reshaped = trimmed.reshape(full_bins, bin_size)
+            mins = reshaped.min(axis=1)
+            maxs = reshaped.max(axis=1)
+            out = np.stack((mins, maxs), axis=1)
+            self._dataset[self._write_idx : self._write_idx + full_bins] = out
+            self._write_idx += full_bins
+            data = data[full_bins * bin_size :]
+        if data.size:
+            self._buffer = data.copy()
+
+    def finalize(self) -> None:
+        if self._buffer.size:
+            mins = float(self._buffer.min())
+            maxs = float(self._buffer.max())
+            self._dataset[self._write_idx] = (mins, maxs)
+            self._write_idx += 1
+            self._buffer = np.empty(0, dtype=np.float32)
+
+        remaining = self._expected_bins - self._write_idx
+        if remaining > 0:
+            fill = np.full((remaining, 2), np.nan, dtype=np.float32)
+            self._dataset[self._write_idx : self._write_idx + remaining] = fill
+            self._write_idx += remaining
