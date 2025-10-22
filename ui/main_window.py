@@ -19,6 +19,7 @@ from ui.time_axis import TimeAxis
 from ui.widgets import CollapsibleSection
 from ui.themes import DEFAULT_THEME, THEMES, ThemeDefinition
 from ui.hover_utils import _sample_at_time
+from ui.gpu_canvas import VispyChannelCanvas
 from config import ViewerConfig
 from core.decimate import min_max_bins
 from core.overscan import slice_and_decimate
@@ -197,6 +198,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self._config.theme = theme_key
         self._controls_collapsed = bool(getattr(self._config, "controls_collapsed", False))
 
+        requested_backend = str(getattr(self._config, "canvas_backend", "pyqtgraph"))
+        self._requested_canvas_backend = requested_backend.lower()
+        self._gpu_canvas: VispyChannelCanvas | None = None
+        self._gpu_init_error: str | None = None
+        self._use_gpu_canvas = False
+        if self._requested_canvas_backend in {"vispy", "gpu", "gpu-vispy"}:
+            try:
+                self._gpu_canvas = VispyChannelCanvas()
+                self._use_gpu_canvas = True
+                self._config.canvas_backend = "vispy"
+            except Exception as exc:  # pragma: no cover - GPU fallback
+                LOG.warning("GPU canvas unavailable, falling back to pyqtgraph: %s", exc)
+                self._gpu_init_error = str(exc)
+                self._gpu_canvas = None
+                self._use_gpu_canvas = False
+                self._config.canvas_backend = "pyqtgraph"
+
         pg.setConfigOptions(antialias=True)
 
         self.setWindowTitle("EDF Viewer — Multi-channel")
@@ -272,6 +290,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self._start_zarr_ingest()
         self._load_companion_annotations()
         QtCore.QTimer.singleShot(0, self._ensure_overscan_for_view)
+        if self._gpu_init_error:
+            QtCore.QTimer.singleShot(
+                0,
+                lambda: QtWidgets.QMessageBox.warning(
+                    self,
+                    "GPU canvas unavailable",
+                    "Falling back to CPU renderer: " + str(self._gpu_init_error),
+                ),
+            )
 
     # ----- UI construction -------------------------------------------------
 
@@ -438,6 +465,16 @@ class MainWindow(QtWidgets.QMainWindow):
         eventNav.addWidget(self.eventNextBtn)
         annotationLayout.addLayout(eventNav)
 
+        if self._use_gpu_canvas:
+            note = "Annotation overlays are unavailable in GPU mode"
+            for widget in (
+                self.annotationToggle,
+                self.annotationFocusOnly,
+                self.annotationPositionToggle,
+            ):
+                widget.setEnabled(False)
+                widget.setToolTip(note)
+
         controlLayout.addWidget(primaryControls)
         controlLayout.addWidget(self.channelSection)
         controlLayout.addWidget(telemetryBar)
@@ -525,39 +562,55 @@ class MainWindow(QtWidgets.QMainWindow):
         controlLayout.addWidget(self.ingestBar)
         controlLayout.addStretch(1)
 
-        self.plotLayout = pg.GraphicsLayoutWidget()
-        self.plotLayout.setMinimumSize(0, 0)
-        self.plotLayout.setSizePolicy(
-            QtWidgets.QSizePolicy.Expanding,
-            QtWidgets.QSizePolicy.Expanding,
-        )
-        self.plotLayout.ci.layout.setSpacing(0)
-        self.plotLayout.ci.layout.setContentsMargins(0, 0, 0, 0)
+        if self._use_gpu_canvas and self._gpu_canvas is not None:
+            self.plotLayout = self._gpu_canvas
+            self.plotLayout.setMinimumSize(0, 0)
+            self.plotLayout.setSizePolicy(
+                QtWidgets.QSizePolicy.Expanding,
+                QtWidgets.QSizePolicy.Expanding,
+            )
+            self._plot_viewport = self.plotLayout
+            self._hover_line = None
+            self._hover_label = None
+            self._hover_plot = None
+            self.plots = []
+            self.curves = []
+            self.channel_labels = []
+            self._configure_gpu_canvas()
+        else:
+            self.plotLayout = pg.GraphicsLayoutWidget()
+            self.plotLayout.setMinimumSize(0, 0)
+            self.plotLayout.setSizePolicy(
+                QtWidgets.QSizePolicy.Expanding,
+                QtWidgets.QSizePolicy.Expanding,
+            )
+            self.plotLayout.ci.layout.setSpacing(0)
+            self.plotLayout.ci.layout.setContentsMargins(0, 0, 0, 0)
 
-        self._hover_line = pg.InfiniteLine(angle=90, movable=False)
-        self._hover_line.setZValue(1000)
-        self._hover_line.setVisible(False)
-        self._hover_line.setPen(pg.mkPen((240, 240, 240, 220), width=1.0, style=QtCore.Qt.DashLine))
-        self._hover_label_anchor = (0.0, 1.0)
-        self._hover_label = pg.TextItem(anchor=self._hover_label_anchor)
-        self._hover_label.setZValue(1001)
-        self._hover_label.setColor((240, 240, 240))
-        self._hover_label.setVisible(False)
-        scene = self.plotLayout.scene()
-        scene.sigMouseMoved.connect(self._update_hover_indicator)
-        mouse_exited = getattr(scene, "sigMouseExited", None)
-        if mouse_exited is not None:
-            mouse_exited.connect(self._on_plot_scene_mouse_exited)
-        self._plot_viewport = self.plotLayout.viewport()
-        if self._plot_viewport is not None:
-            self._plot_viewport.installEventFilter(self)
+            self._hover_line = pg.InfiniteLine(angle=90, movable=False)
+            self._hover_line.setZValue(1000)
+            self._hover_line.setVisible(False)
+            self._hover_line.setPen(pg.mkPen((240, 240, 240, 220), width=1.0, style=QtCore.Qt.DashLine))
+            self._hover_label_anchor = (0.0, 1.0)
+            self._hover_label = pg.TextItem(anchor=self._hover_label_anchor)
+            self._hover_label.setZValue(1001)
+            self._hover_label.setColor((240, 240, 240))
+            self._hover_label.setVisible(False)
+            scene = self.plotLayout.scene()
+            scene.sigMouseMoved.connect(self._update_hover_indicator)
+            mouse_exited = getattr(scene, "sigMouseExited", None)
+            if mouse_exited is not None:
+                mouse_exited.connect(self._on_plot_scene_mouse_exited)
+            self._plot_viewport = self.plotLayout.viewport()
+            if self._plot_viewport is not None:
+                self._plot_viewport.installEventFilter(self)
 
-        self.plots: list[pg.PlotItem] = []
-        self.curves: list[pg.PlotDataItem] = []
-        self.channel_labels: list[pg.LabelItem] = []
+            self.plots: list[pg.PlotItem] = []
+            self.curves: list[pg.PlotDataItem] = []
+            self.channel_labels: list[pg.LabelItem] = []
 
-        self._ensure_plot_rows(self.loader.n_channels)
-        self._configure_plots()
+            self._ensure_plot_rows(self.loader.n_channels)
+            self._configure_plots()
 
         scroll = QtWidgets.QScrollArea()
         scroll.setWidgetResizable(True)
@@ -819,14 +872,23 @@ class MainWindow(QtWidgets.QMainWindow):
         pg.setConfigOption("foreground", theme.pg_foreground)
 
         self.setStyleSheet(theme.stylesheet)
-        self.plotLayout.setBackground(theme.pg_background)
-        for plot in self.plots:
-            for axis_name in ("bottom", "left"):
-                axis = plot.getAxis(axis_name)
-                if axis is not None:
-                    pen = pg.mkPen(theme.pg_foreground)
-                    axis.setPen(pen)
-                    axis.setTextPen(theme.pg_foreground)
+
+        if self._use_gpu_canvas and self._gpu_canvas is not None:
+            colors = theme.curve_colors or ("#5f8bff",)
+            self._gpu_canvas.set_theme(
+                background=theme.pg_background,
+                curve_colors=colors,
+                label_color=theme.pg_foreground,
+            )
+        else:
+            self.plotLayout.setBackground(theme.pg_background)
+            for plot in self.plots:
+                for axis_name in ("bottom", "left"):
+                    axis = plot.getAxis(axis_name)
+                    if axis is not None:
+                        pen = pg.mkPen(theme.pg_foreground)
+                        axis.setPen(pen)
+                        axis.setTextPen(theme.pg_foreground)
 
         if self.hypnogramPlot is not None:
             axis = self.hypnogramPlot.getAxis("bottom")
@@ -864,11 +926,24 @@ class MainWindow(QtWidgets.QMainWindow):
         return colors[idx % len(colors)]
 
     def _apply_curve_pens(self) -> None:
+        if self._use_gpu_canvas and self._gpu_canvas is not None:
+            for idx in range(self.loader.n_channels):
+                color = self._curve_color(idx)
+                self._gpu_canvas.set_curve_color(idx, color)
+            return
+
         for idx, curve in enumerate(self.curves):
             color = self._curve_color(idx)
             curve.setPen(pg.mkPen(color, width=1.2))
 
     def _refresh_channel_label_styles(self) -> None:
+        if self._use_gpu_canvas and self._gpu_canvas is not None:
+            infos = getattr(self.loader, "info", [])
+            for idx, meta in enumerate(infos):
+                hidden = idx in self._hidden_channels
+                self._gpu_canvas.set_channel_label(idx, self._format_label(meta, hidden=hidden))
+            return
+
         if not self.channel_labels:
             return
         n = self.loader.n_channels
@@ -969,6 +1044,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.windowSpin.blockSignals(False)
 
     def _update_viewbox_from_state(self):
+        if self._use_gpu_canvas and self._gpu_canvas is not None:
+            self._gpu_canvas.set_view(self._view_start, self._view_duration)
+            return
         if not self._primary_plot:
             return
         self._updating_viewbox = True
@@ -1010,22 +1088,28 @@ class MainWindow(QtWidgets.QMainWindow):
             self._current_tile_id = None
             for i in range(self.loader.n_channels):
                 if i in self._hidden_channels:
-                    self.curves[i].setData([], [])
+                    if self._use_gpu_canvas and self._gpu_canvas is not None:
+                        self._gpu_canvas.clear_channel(i)
+                    elif i < len(self.curves):
+                        self.curves[i].setData([], [])
                     continue
                 t, x = self.loader.read(i, t0, t1)
                 if pixels and x.size > pixels * 2:
                     t, x = min_max_bins(t, x, pixels)
-                self.curves[i].setData(t, x)
+                if self._use_gpu_canvas and self._gpu_canvas is not None:
+                    self._gpu_canvas.set_channel_data(i, t, x)
+                elif i < len(self.curves):
+                    self.curves[i].setData(t, x)
 
-        if self._primary_plot is not None:
-            self._update_viewbox_from_state()
+        self._update_viewbox_from_state()
         self._update_time_labels(t0, t1)
 
         if not used_tile and self._overscan_inflight is None:
             self._ensure_overscan_for_view()
 
         self._update_annotation_overlays(t0, t1)
-        self._update_hypnogram(t0, t1)
+        if not self._use_gpu_canvas:
+            self._update_hypnogram(t0, t1)
 
     def _update_time_labels(self, t0, t1):
         tb = self.loader.timebase
@@ -2134,6 +2218,13 @@ class MainWindow(QtWidgets.QMainWindow):
         return QtGui.QColor(base)
 
     def _update_annotation_overlays(self, t0: float, t1: float):
+        if self._use_gpu_canvas:
+            summary = self._event_count_summary()
+            stage_label, position_label = self._current_stage_position_labels()
+            self.stageSummaryLabel.setText(
+                self._compose_status_text(stage_label, position_label, summary)
+            )
+            return
         if not self._primary_plot:
             return
         if not self._annotations_index or self._annotations_index.is_empty():
@@ -2270,6 +2361,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _apply_tile_to_curves(self, tile: _OverscanTile) -> None:
         self._prepare_tile(tile)
+        if self._use_gpu_canvas and self._gpu_canvas is not None:
+            for idx, (t_arr, x_arr) in enumerate(tile.channel_data):
+                if idx in self._hidden_channels:
+                    self._gpu_canvas.clear_channel(idx)
+                    continue
+                self._gpu_canvas.set_channel_data(idx, t_arr, x_arr)
+            self._current_tile_id = tile.request_id
+            return
         for idx, (t_arr, x_arr) in enumerate(tile.channel_data):
             if idx < len(self.curves):
                 if idx in self._hidden_channels:
@@ -2285,14 +2384,15 @@ class MainWindow(QtWidgets.QMainWindow):
         super().closeEvent(event)
 
     def _update_data_source_label(self):
+        renderer = "GPU (VisPy)" if self._use_gpu_canvas else "CPU (pyqtgraph)"
         if isinstance(self.loader, ZarrLoader):
-            self.sourceLabel.setText("Source: Zarr cache")
+            self.sourceLabel.setText(f"Source: Zarr cache | Renderer: {renderer}")
             self.sourceLabel.setStyleSheet("color: #7fb57d; font-style: italic;")
         elif getattr(self.loader, "has_cache", None) and self.loader.has_cache():
-            self.sourceLabel.setText("Source: EDF (RAM cache)")
+            self.sourceLabel.setText(f"Source: EDF (RAM cache) | Renderer: {renderer}")
             self.sourceLabel.setStyleSheet("color: #d7c77b; font-style: italic;")
         else:
-            self.sourceLabel.setText("Source: EDF (live)")
+            self.sourceLabel.setText(f"Source: EDF (live) | Renderer: {renderer}")
             self.sourceLabel.setStyleSheet("color: #9ba9bf; font-style: italic;")
 
     def _maybe_build_int16_cache(self) -> None:
@@ -2362,6 +2462,8 @@ class MainWindow(QtWidgets.QMainWindow):
         return int(total_samples * np.dtype(np.int16).itemsize)
 
     def _estimate_pixels(self) -> int:
+        if self._use_gpu_canvas and self._gpu_canvas is not None:
+            return max(0, self._gpu_canvas.estimate_pixels())
         if not self._primary_plot:
             return 0
         vb = self._primary_plot.getViewBox()
@@ -2373,6 +2475,8 @@ class MainWindow(QtWidgets.QMainWindow):
     # ----- Plot helpers ------------------------------------------------------
 
     def _ensure_plot_rows(self, count: int):
+        if self._use_gpu_canvas:
+            return
         while len(self.plots) < count:
             idx = len(self.plots)
             label = self.plotLayout.addLabel(row=idx, col=0, text="", justify="right")
@@ -2395,6 +2499,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.curves.append(curve)
 
     def _ensure_hypnogram_plot(self) -> None:
+        if self._use_gpu_canvas:
+            return
         row = len(self.plots)
         if self.hypnogramPlot is None:
             label = self.plotLayout.addLabel(row=row, col=0, text="Hypnogram", justify="right")
@@ -2448,6 +2554,8 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
     def _update_hypnogram_axis(self) -> None:
+        if self._use_gpu_canvas:
+            return
         plot = self.hypnogramPlot
         if plot is None:
             return
@@ -2467,12 +2575,16 @@ class MainWindow(QtWidgets.QMainWindow):
             vb.enableAutoRange(x=False, y=False)
 
     def _update_hypnogram_bounds(self) -> None:
+        if self._use_gpu_canvas:
+            return
         total = getattr(self.loader, "duration_s", None)
         region = self.hypnogramRegion
         if region is not None and total is not None:
             region.setBounds((0.0, float(total)))
 
     def _update_hypnogram_region(self, start: float, end: float, *, force: bool = False) -> None:
+        if self._use_gpu_canvas:
+            return
         region = self.hypnogramRegion
         if region is None:
             return
@@ -2489,6 +2601,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._updating_hypnogram_region = False
 
     def _set_hypnogram_visible(self, visible: bool) -> None:
+        if self._use_gpu_canvas:
+            return
         plot = self.hypnogramPlot
         if plot is None:
             return
@@ -2507,6 +2621,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _ensure_hypnogram_curves(
         self, labels: Sequence[str], colors: dict[str, QtGui.QColor]
     ) -> None:
+        if self._use_gpu_canvas:
+            return
         plot = self.hypnogramPlot
         if plot is None:
             return
@@ -2687,12 +2803,17 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _configure_plots(self):
         n = self.loader.n_channels
-        old_primary = self._primary_plot
-        self._ensure_plot_rows(n)
-
         # Trim hidden channels to valid range
         self._hidden_channels = {idx for idx in self._hidden_channels if 0 <= idx < n}
         self._sync_channel_controls()
+
+        if self._use_gpu_canvas and self._gpu_canvas is not None:
+            self._configure_gpu_canvas()
+            self._primary_plot = None
+            return
+
+        old_primary = self._primary_plot
+        self._ensure_plot_rows(n)
 
         # Reset previous primary axis if needed
         if self._primary_plot and self._primary_plot not in self.plots[:n]:
@@ -2763,6 +2884,22 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._sync_hover_overlay_target()
 
+    def _configure_gpu_canvas(self) -> None:
+        if not (self._use_gpu_canvas and self._gpu_canvas is not None):
+            return
+        infos = getattr(self.loader, "info", [])
+        hidden = {idx for idx in self._hidden_channels if 0 <= idx < len(infos)}
+        self._gpu_canvas.configure_channels(infos=infos, hidden_indices=hidden)
+        self._gpu_canvas.set_view(self._view_start, self._view_duration)
+        theme = self._theme
+        colors = theme.curve_colors or ("#5f8bff",)
+        self._gpu_canvas.set_theme(
+            background=theme.pg_background,
+            curve_colors=colors,
+            label_color=theme.pg_foreground,
+        )
+        self._gpu_canvas.set_hover_enabled(False)
+
     def _sync_channel_controls(self) -> None:
         if not hasattr(self, "channelSection"):
             return
@@ -2804,6 +2941,28 @@ class MainWindow(QtWidgets.QMainWindow):
         sync_checkbox: bool,
         persist: bool,
     ) -> None:
+        if self._use_gpu_canvas and self._gpu_canvas is not None:
+            n = self.loader.n_channels
+            if idx >= n:
+                self._hidden_channels.discard(idx)
+                return
+            meta = self.loader.info[idx]
+            if visible:
+                self._hidden_channels.discard(idx)
+            else:
+                self._hidden_channels.add(idx)
+                self._gpu_canvas.clear_channel(idx)
+            self._gpu_canvas.set_channel_visibility(idx, visible)
+            self._gpu_canvas.set_channel_label(idx, self._format_label(meta, hidden=not visible))
+            if sync_checkbox and idx < len(self.channel_checkboxes):
+                checkbox = self.channel_checkboxes[idx]
+                checkbox.blockSignals(True)
+                checkbox.setChecked(visible)
+                checkbox.blockSignals(False)
+            if persist:
+                self._config.hidden_channels = tuple(sorted(self._hidden_channels))
+                self._config.save()
+            return
         if idx >= len(self.plots):
             return
 
@@ -2843,6 +3002,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._config.save()
 
     def _attach_hover_overlay(self, plot: pg.PlotItem | None) -> None:
+        if self._use_gpu_canvas:
+            return
         if self._hover_line is None or self._hover_label is None:
             return
         if plot is self._hover_plot:
@@ -2862,6 +3023,8 @@ class MainWindow(QtWidgets.QMainWindow):
             plot.addItem(self._hover_label, ignoreBounds=True)
 
     def _sync_hover_overlay_target(self) -> None:
+        if self._use_gpu_canvas:
+            return
         if self._hover_line is None or self._hover_label is None:
             return
         plot = self._hover_plot
@@ -2877,6 +3040,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._attach_hover_overlay(plot)
 
     def _hide_hover_indicator(self, *, detach: bool = False) -> None:
+        if self._use_gpu_canvas:
+            return
         if self._hover_line is not None:
             self._hover_line.setVisible(False)
         if self._hover_label is not None:
@@ -2886,10 +3051,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.Slot()
     def _on_plot_scene_mouse_exited(self) -> None:
+        if self._use_gpu_canvas:
+            return
         self._hide_hover_indicator()
 
     @QtCore.Slot(QtCore.QPointF)
     def _update_hover_indicator(self, scene_pos: QtCore.QPointF) -> None:
+        if self._use_gpu_canvas:
+            return
         if self._hover_line is None or self._hover_label is None:
             return
         if self._view_duration > 300 or self._primary_plot is None:
@@ -2964,11 +3133,16 @@ class MainWindow(QtWidgets.QMainWindow):
     def _format_label(self, meta, *, hidden: bool = False) -> str:
         unit = f" [{meta.unit}]" if getattr(meta, "unit", "") else ""
         text = f"{meta.name}{unit}"
+        if hidden:
+            text = f"{text} (hidden)"
+
+        if self._use_gpu_canvas and self._gpu_canvas is not None:
+            return text
+
         theme = getattr(self, "_theme", THEMES[DEFAULT_THEME])
         if hidden:
             color = theme.channel_label_hidden
             extra = "font-style: italic; opacity:0.7;"
-            text = f"{text} (hidden)"
         else:
             color = theme.channel_label_active
             extra = "font-weight:600;"
@@ -3008,6 +3182,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._hidden_channels.add(idx)
 
     def _connect_primary_viewbox(self):
+        if self._use_gpu_canvas:
+            return
         if self._primary_viewbox is not None:
             try:
                 self._primary_viewbox.sigXRangeChanged.disconnect(self._on_viewbox_range)
@@ -3026,6 +3202,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_viewbox_from_state()
 
     def _on_viewbox_range(self, viewbox, xrange):
+        if self._use_gpu_canvas:
+            return
         if viewbox is not self._primary_viewbox or self._updating_viewbox:
             return
         if not xrange or len(xrange) != 2:
