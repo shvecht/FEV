@@ -1,5 +1,4 @@
 # Ignore raw and processed data (big, not for source control)
-raw/
 processed/
 
 # Byte-compiled / cache
