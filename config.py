@@ -21,6 +21,9 @@ class ViewerConfig:
     annotation_focus_only: bool = False
     theme: str = "Midnight"
     canvas_backend: str = "pyqtgraph"
+    lod_enabled: bool = True
+    lod_min_bin_multiple: float = 2.0
+    lod_min_view_duration_s: float = 240.0
     ini_path: Path | None = None
 
     @classmethod
@@ -100,6 +103,17 @@ class ViewerConfig:
                 cfg.int16_cache_memmap = cache_section.getboolean(
                     "memmap", fallback=cfg.int16_cache_memmap
                 )
+            lod_section = parser["lod"] if "lod" in parser else None
+            if lod_section:
+                cfg.lod_enabled = lod_section.getboolean(
+                    "enabled", fallback=cfg.lod_enabled
+                )
+                cfg.lod_min_bin_multiple = lod_section.getfloat(
+                    "min_bin_multiple", fallback=cfg.lod_min_bin_multiple
+                )
+                cfg.lod_min_view_duration_s = lod_section.getfloat(
+                    "min_view_duration_s", fallback=cfg.lod_min_view_duration_s
+                )
         cfg.ini_path = path
         return cfg
 
@@ -138,6 +152,11 @@ class ViewerConfig:
             "enabled": "true" if self.int16_cache_enabled else "false",
             "max_mb": f"{self.int16_cache_max_mb:.3f}",
             "memmap": "true" if self.int16_cache_memmap else "false",
+        }
+        parser["lod"] = {
+            "enabled": "true" if self.lod_enabled else "false",
+            "min_bin_multiple": f"{self.lod_min_bin_multiple:.3f}",
+            "min_view_duration_s": f"{self.lod_min_view_duration_s:.3f}",
         }
         with self.ini_path.open("w") as fh:
             parser.write(fh)

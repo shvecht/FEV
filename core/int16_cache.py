@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 from pathlib import Path
 import threading
-from typing import Callable, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence
 
 import numpy as np
 from numpy.typing import NDArray
@@ -12,6 +13,18 @@ import pyedflib
 
 
 Int16Array = NDArray[np.int16]
+
+
+@dataclass(frozen=True)
+class EnvelopeLevel:
+    duration_s: float
+    bin_size: int
+    data: NDArray[np.float32]
+
+    def slice(self, start: int, stop: int) -> NDArray[np.float32]:
+        start = max(0, int(start))
+        stop = max(start, int(stop))
+        return self.data[start:stop]
 
 
 @dataclass(frozen=True)
@@ -31,6 +44,7 @@ class Int16Cache:
     channels: Sequence[Int16Array]
     calibration: Sequence[ChannelCalibration]
     channel_names: Optional[Sequence[str]] = None
+    lod_envelopes: Optional[Sequence[Dict[float, EnvelopeLevel]]] = None
     _locks: List[threading.RLock] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -47,6 +61,13 @@ class Int16Cache:
         object.__setattr__(self, "channels", tuple(arr for arr in self.channels))
         object.__setattr__(self, "calibration", tuple(self.calibration))
         object.__setattr__(self, "channel_names", tuple(self.channel_names))
+        if self.lod_envelopes is None:
+            lod = tuple({} for _ in range(channel_count))
+        else:
+            if len(self.lod_envelopes) != channel_count:
+                raise ValueError("lod_envelopes length must match number of channels")
+            lod = tuple(dict(levels) for levels in self.lod_envelopes)
+        object.__setattr__(self, "lod_envelopes", lod)
         locks = [threading.RLock() for _ in range(channel_count)]
         object.__setattr__(self, "_locks", locks)
 
@@ -107,6 +128,28 @@ class Int16Cache:
             raise IndexError("channel index out of range")
         return self.calibration[channel]
 
+    def lod_levels(self, channel: int) -> list[float]:
+        if not 0 <= channel < self.channel_count:
+            raise IndexError("channel index out of range")
+        levels = self.lod_envelopes[channel]
+        if not levels:
+            return []
+        return sorted(levels.keys())
+
+    def lod_level(self, channel: int, duration: float) -> EnvelopeLevel:
+        if not 0 <= channel < self.channel_count:
+            raise IndexError("channel index out of range")
+        levels = self.lod_envelopes[channel]
+        if not levels:
+            raise KeyError(f"no LOD levels for channel {channel}")
+        key = _lod_key(duration)
+        if key not in levels:
+            available = ", ".join(str(value) for value in sorted(levels.keys()))
+            raise KeyError(
+                f"LOD duration {duration} not found for channel {channel}; available: {available}"
+            )
+        return levels[key]
+
 
 def _digital_read_fn(reader: pyedflib.EdfReader) -> Callable[[int], NDArray[np.int64]]:
     if hasattr(reader, "read_digital_signal"):
@@ -122,6 +165,7 @@ def build_int16_cache(
     max_bytes: int,
     prefer_memmap: bool,
     memmap_dir: Optional[Path],
+    lod_durations: Sequence[float] | None = (1.0, 5.0, 30.0),
 ) -> Optional[Int16Cache]:
     if max_bytes <= 0:
         return None
@@ -136,6 +180,7 @@ def build_int16_cache(
 
     channels: List[Int16Array] = []
     calibration: List[ChannelCalibration] = []
+    lod_levels: List[Dict[float, EnvelopeLevel]] = []
     running_bytes = 0
     memmap_paths: List[Path] = []
 
@@ -190,6 +235,79 @@ def build_int16_cache(
             )
         )
 
+        lod_levels.append(
+            _compute_envelopes(
+                data,
+                sample_frequency,
+                slope,
+                offset,
+                lod_durations,
+            )
+        )
+
         running_bytes += expected_bytes
 
-    return Int16Cache(channels=channels, calibration=calibration, channel_names=labels)
+    return Int16Cache(
+        channels=channels,
+        calibration=calibration,
+        channel_names=labels,
+        lod_envelopes=lod_levels,
+    )
+
+
+def _compute_envelopes(
+    data: np.ndarray,
+    fs: float,
+    slope: float,
+    offset: float,
+    lod_durations: Sequence[float] | None,
+) -> Dict[float, EnvelopeLevel]:
+    if lod_durations is None:
+        return {}
+    if fs <= 0 or data.size == 0:
+        return {}
+    envelopes: Dict[float, EnvelopeLevel] = {}
+    total_samples = int(data.size)
+    for value in lod_durations:
+        duration = float(value)
+        if not math.isfinite(duration) or duration <= 0:
+            continue
+        bin_size = max(1, int(round(fs * duration)))
+        if bin_size <= 0:
+            continue
+        # Recompute duration from integer bin size to keep loader metadata consistent.
+        bin_duration = bin_size / fs
+        bins = int(math.ceil(total_samples / bin_size))
+        if bins <= 0:
+            continue
+        out = np.full((bins, 2), np.nan, dtype=np.float32)
+        for idx in range(bins):
+            start = idx * bin_size
+            stop = min(total_samples, start + bin_size)
+            segment = data[start:stop]
+            if segment.size == 0:
+                continue
+            local_min = float(segment.min())
+            local_max = float(segment.max())
+            if slope != 1.0 or offset != 0.0:
+                min_val = float(local_min * slope + offset)
+                max_val = float(local_max * slope + offset)
+            else:
+                min_val = local_min
+                max_val = local_max
+            if min_val <= max_val:
+                out[idx, 0] = min_val
+                out[idx, 1] = max_val
+            else:
+                out[idx, 0] = max_val
+                out[idx, 1] = min_val
+        envelopes[_lod_key(bin_duration)] = EnvelopeLevel(
+            duration_s=bin_duration,
+            bin_size=bin_size,
+            data=out,
+        )
+    return envelopes
+
+
+def _lod_key(duration: float) -> float:
+    return round(float(duration), 9)

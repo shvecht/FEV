@@ -2,6 +2,7 @@
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, List, Tuple
+import math
 import threading
 import numpy as np
 import pyedflib
@@ -84,6 +85,16 @@ class EdfLoader:
         cache = self._cache
         return cache.total_bytes if cache is not None else 0
 
+    def lod_levels(self, i: int) -> list[float]:
+        cache = self._cache
+        if cache is None:
+            return []
+        raw_idx = self._channel_map[i]
+        try:
+            return cache.lod_levels(raw_idx)
+        except IndexError:
+            return []
+
     def build_int16_cache(self, max_mb: float, prefer_memmap: bool = True) -> bool:
         max_bytes = int(max(0.0, float(max_mb)) * 1024 * 1024)
         with self._lock:
@@ -100,6 +111,39 @@ class EdfLoader:
             self._cache = cache
             self._scratch_float32.clear()
             return True
+
+    def read_lod_window(
+        self,
+        i: int,
+        t0: float,
+        t1: float,
+        duration_s: float,
+    ) -> tuple[np.ndarray, float, int]:
+        cache = self._cache
+        if cache is None:
+            raise KeyError("LOD envelopes unavailable; build int16 cache first")
+        raw_idx = self._channel_map[i]
+        level = cache.lod_level(raw_idx, duration_s)
+        if level.data.size == 0:
+            return level.data[:0], level.duration_s, 0
+
+        t0_c, t1_c = self.timebase.clamp_window(t0, t1)
+        t1_c = min(t1_c, t0_c + self.max_window_s)
+        if t1_c <= t0_c:
+            return level.data[:0], level.duration_s, 0
+
+        bin_duration = float(level.duration_s)
+        if bin_duration <= 0:
+            raise ValueError("LOD bin duration must be positive")
+
+        total_bins = level.data.shape[0]
+        start_bin = max(0, int(math.floor(t0_c / bin_duration)))
+        end_bin = int(math.ceil(t1_c / bin_duration))
+        if end_bin <= start_bin:
+            return level.data[:0], bin_duration, start_bin
+        start_bin = min(start_bin, total_bins)
+        end_bin = min(max(start_bin, end_bin), total_bins)
+        return level.slice(start_bin, end_bin), bin_duration, start_bin
 
     def read(self, i: int, t0: float, t1: float):
         raw_idx = self._channel_map[i]
