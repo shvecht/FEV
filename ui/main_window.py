@@ -118,6 +118,7 @@ class _OverscanTile:
     pixel_budget: Optional[int] = None
     prepared_mask: list[bool] = field(default_factory=list)
     lod_durations: list[Optional[float]] = field(default_factory=list)
+    is_final: bool = True
 
     def contains(self, window_start: float, window_end: float) -> bool:
         return window_start >= self.start and window_end <= self.end
@@ -149,44 +150,28 @@ class _OverscanWorker(QtCore.QObject):
                 min_view = 0.0
             self._lod_min_view_duration = min_view if min_view > 0.0 else None
         self._lod_ratio = float(lod_ratio or 0.0)
+        self._preview_sample_cap = 4096
 
     @QtCore.Slot(object)
     def render(self, request_obj):
         if not isinstance(request_obj, _OverscanRequest):
             return
         req: _OverscanRequest = request_obj
+        preview_tile: _OverscanTile | None = None
         try:
-            raw_chunks: list[SignalChunk] = []
-            payloads: list[tuple[np.ndarray, np.ndarray]] = []
-            lod_durations: list[Optional[float]] = []
-            for ch in req.channel_indices:
-                chunk, lod_duration = self._read_channel(
-                    ch,
-                    req.start,
-                    req.end,
-                    req.view_duration,
-                    req.max_samples,
-                )
-                raw_chunks.append(chunk)
-                payloads.append(chunk.as_tuple())
-                lod_durations.append(lod_duration)
+            preview_tile = self._build_tile(req, preview=True)
+        except Exception as exc:  # pragma: no cover - preview errors stay silent
+            LOG.debug("Overscan preview failed: %s", exc)
+            preview_tile = None
+        if preview_tile is not None:
+            self.finished.emit(req.request_id, preview_tile)
+
+        try:
+            final_tile = self._build_tile(req, preview=False)
         except Exception as exc:  # pragma: no cover - worker error propagated to UI
             self.failed.emit(req.request_id, str(exc))
             return
-
-        tile = _OverscanTile(
-            request_id=req.request_id,
-            start=req.start,
-            end=req.end,
-            view_start=req.view_start,
-            view_duration=req.view_duration,
-            raw_channel_data=raw_chunks,
-            channel_data=payloads,
-            max_samples=req.max_samples,
-            prepared_mask=[False] * len(raw_chunks),
-            lod_durations=lod_durations,
-        )
-        self.finished.emit(req.request_id, tile)
+        self.finished.emit(req.request_id, final_tile)
 
     def _read_channel(
         self,
@@ -200,6 +185,122 @@ class _OverscanWorker(QtCore.QObject):
         if lod_chunk is not None:
             return lod_chunk, lod_chunk.lod_duration_s
         return self._read_raw_channel(channel, start, end, max_samples), None
+
+    def _build_tile(self, req: _OverscanRequest, *, preview: bool) -> _OverscanTile | None:
+        raw_chunks: list[SignalChunk] = []
+        payloads: list[tuple[np.ndarray, np.ndarray]] = []
+        lod_durations: list[Optional[float]] = []
+        has_samples = False
+        for ch in req.channel_indices:
+            if preview:
+                chunk = self._read_preview_channel(
+                    ch,
+                    req.start,
+                    req.end,
+                    req.view_duration,
+                )
+                lod_duration = chunk.lod_duration_s if chunk is not None else None
+                if chunk is None:
+                    empty_t = np.zeros(0, dtype=np.float64)
+                    empty_x = np.zeros(0, dtype=np.float32)
+                    chunk = chunk_from_arrays(
+                        empty_t,
+                        empty_x,
+                        source_start=req.start,
+                        source_end=req.end,
+                    )
+            else:
+                chunk, lod_duration = self._read_channel(
+                    ch,
+                    req.start,
+                    req.end,
+                    req.view_duration,
+                    req.max_samples,
+                )
+            raw_chunks.append(chunk)
+            payload = chunk.as_tuple()
+            payloads.append(payload)
+            lod_durations.append(lod_duration)
+            if payload[1].size > 0:
+                has_samples = True
+
+        if preview and not has_samples:
+            return None
+
+        tile = _OverscanTile(
+            request_id=req.request_id,
+            start=req.start,
+            end=req.end,
+            view_start=req.view_start,
+            view_duration=req.view_duration,
+            raw_channel_data=raw_chunks,
+            channel_data=payloads,
+            max_samples=req.max_samples,
+            prepared_mask=[False] * len(raw_chunks),
+            lod_durations=lod_durations,
+            is_final=not preview,
+        )
+        return tile
+
+    def _lod_durations_for_channel(self, channel: int) -> tuple[float, ...]:
+        durations: Sequence[float] | None = None
+        levels_fn = getattr(self._loader, "lod_levels", None)
+        if callable(levels_fn):
+            try:
+                levels = levels_fn(channel)
+            except Exception:
+                levels = None
+            if levels:
+                if isinstance(levels, dict):
+                    durations = tuple(float(k) for k in levels.keys())
+                else:
+                    durations = tuple(float(v) for v in levels)
+        if not durations:
+            durations_fn = getattr(self._loader, "lod_durations", None)
+            if callable(durations_fn):
+                try:
+                    durations = tuple(float(v) for v in durations_fn(channel))
+                except Exception:
+                    durations = None
+        if not durations:
+            return tuple()
+        filtered = [float(v) for v in durations if float(v) > 0.0]
+        return tuple(sorted(filtered))
+
+    def _read_preview_channel(
+        self,
+        channel: int,
+        start: float,
+        end: float,
+        view_duration: float,
+    ) -> SignalChunk | None:
+        durations = self._lod_durations_for_channel(channel)
+        if durations:
+            min_view = self._lod_min_view_duration
+            if min_view is None or view_duration >= min_view:
+                coarse = durations[-1]
+                chunk = self._read_lod_chunk(channel, start, end, coarse)
+                if chunk is not None and chunk.x.size > 0:
+                    return chunk
+        return self._read_raw_channel(
+            channel,
+            start,
+            end,
+            min(self._preview_sample_cap, self._safe_max_samples(view_duration, channel)),
+        )
+
+    def _safe_max_samples(self, view_duration: float, channel: int) -> int:
+        fs = getattr(self._loader, "channel_fs", None)
+        if callable(fs):
+            try:
+                rate = float(fs(channel))
+            except Exception:
+                rate = 0.0
+        else:
+            rate = float(getattr(self._loader, "fs", 0.0) or 0.0)
+        if rate <= 0.0:
+            return self._preview_sample_cap
+        return int(min(self._preview_sample_cap, max(1, int(math.ceil(rate * view_duration)))))
 
     def _read_raw_channel(
         self,
@@ -244,25 +345,7 @@ class _OverscanWorker(QtCore.QObject):
         return self._read_lod_chunk(channel, start, end, lod_duration)
 
     def _select_lod(self, channel: int, view_duration: float) -> Optional[float]:
-        durations: Optional[Sequence[float]] = None
-        levels_fn = getattr(self._loader, "lod_levels", None)
-        if callable(levels_fn):
-            try:
-                levels = levels_fn(channel)
-            except Exception:
-                levels = None
-            if levels:
-                if isinstance(levels, dict):
-                    durations = tuple(float(k) for k in levels.keys())
-                else:
-                    durations = tuple(float(v) for v in levels)
-        if not durations:
-            durations_fn = getattr(self._loader, "lod_durations", None)
-            if callable(durations_fn):
-                try:
-                    durations = tuple(float(v) for v in durations_fn(channel))
-                except Exception:
-                    durations = None
+        durations = self._lod_durations_for_channel(channel)
         if not durations:
             return None
         min_view = self._lod_min_view_duration
@@ -364,7 +447,9 @@ class MainWindow(QtWidgets.QMainWindow):
             max_tiles=self._config.prefetch_max_tiles,
             max_mb=self._config.prefetch_max_mb,
         )
-        self._prefetch = prefetch_service.create_cache(self._fetch_tile)
+        self._prefetch = prefetch_service.create_cache(
+            self._fetch_tile, preview_fetch=self._fetch_tile_preview
+        )
         self._prefetch.start()
 
         theme_key = getattr(self._config, "theme", DEFAULT_THEME)
@@ -1208,23 +1293,42 @@ class MainWindow(QtWidgets.QMainWindow):
             except RuntimeError:
                 pass
 
+    def _available_lod_durations(self, channel: int) -> tuple[float, ...]:
+        durations: list[float] = []
+        levels_fn = getattr(self.loader, "lod_levels", None)
+        if callable(levels_fn):
+            try:
+                levels = levels_fn(channel)
+            except Exception:
+                levels = None
+            if levels:
+                if isinstance(levels, dict):
+                    durations.extend(float(key) for key in levels.keys())
+                else:
+                    durations.extend(float(val) for val in levels)
+        if not durations:
+            durations_fn = getattr(self.loader, "lod_durations", None)
+            if callable(durations_fn):
+                try:
+                    extra = durations_fn(channel)
+                except Exception:
+                    extra = None
+                if extra:
+                    durations.extend(float(val) for val in extra)
+        filtered = [float(val) for val in durations if float(val) > 0.0]
+        return tuple(sorted(filtered))
+
     def _expected_lod_duration_for_channel(
         self, channel: int, view_duration: float
     ) -> Optional[float]:
         if not self._lod_enabled:
             return None
-        levels_fn = getattr(self.loader, "lod_levels", None)
-        if not callable(levels_fn):
-            return None
-        try:
-            levels = levels_fn(channel)
-        except Exception:
-            return None
-        if not levels:
+        durations = self._available_lod_durations(channel)
+        if not durations:
             return None
         return select_lod_duration(
             view_duration,
-            levels,
+            durations,
             self._lod_min_bin_multiple,
             min_view_duration=self._lod_min_view_duration,
         )
@@ -1628,7 +1732,9 @@ class MainWindow(QtWidgets.QMainWindow):
         prefetch_service.configure(tile_duration=tile, max_tiles=max_tiles, max_mb=max_mb)
         if self._prefetch is not None:
             self._prefetch.stop()
-        self._prefetch = prefetch_service.create_cache(self._fetch_tile)
+        self._prefetch = prefetch_service.create_cache(
+            self._fetch_tile, preview_fetch=self._fetch_tile_preview
+        )
         self._prefetch.start()
         self._schedule_prefetch()
         self._config.save()
@@ -1719,6 +1825,61 @@ class MainWindow(QtWidgets.QMainWindow):
             return result.as_tuple()
         return result
 
+    def _fetch_tile_preview(self, channel: int, start: float, end: float):
+        loader = self.loader
+        start, duration = clamp_window(start, end - start, total=loader.duration_s, limits=self._limits)
+        if duration <= 0:
+            empty = np.zeros(0, dtype=np.float64)
+            return empty, empty.astype(np.float32)
+        window_end = start + duration
+        durations = self._available_lod_durations(channel)
+        read_window = getattr(loader, "read_lod_window", None)
+        if durations and callable(read_window):
+            coarse = durations[-1]
+            try:
+                result = read_window(channel, start, window_end, coarse)
+            except Exception:
+                result = None
+            else:
+                chunk = None
+                if isinstance(result, SignalChunk):
+                    chunk = result
+                elif result is not None:
+                    data, bin_duration, start_bin = result
+                    if getattr(data, "size", 0) > 0:
+                        mins = np.asarray(data[:, 0], dtype=np.float32)
+                        maxs = np.asarray(data[:, 1], dtype=np.float32)
+                        t_vals, x_vals = envelope_to_series(
+                            mins,
+                            maxs,
+                            bin_duration=float(bin_duration),
+                            start_bin=int(start_bin),
+                            window_start=start,
+                            window_end=window_end,
+                        )
+                        if t_vals.size > 0:
+                            chunk = chunk_from_arrays(
+                                np.asarray(t_vals, dtype=np.float64),
+                                np.asarray(x_vals, dtype=np.float32),
+                            )
+                if chunk is not None and chunk.x.size > 0:
+                    return chunk.as_tuple()
+
+        sample_cap = getattr(self._overscan_worker, "_preview_sample_cap", 2048)
+        try:
+            result = loader.read(
+                channel,
+                start,
+                window_end,
+                max_samples=int(sample_cap),
+            )
+        except TypeError:
+            result = loader.read(channel, start, window_end)
+        if isinstance(result, SignalChunk):
+            return result.as_tuple()
+        t_arr, x_arr = result
+        return np.asarray(t_arr, dtype=np.float64), np.asarray(x_arr, dtype=np.float32)
+
     def _ensure_overscan_for_view(self):
         if self._overscan_worker is None or self.loader.n_channels == 0:
             return
@@ -1806,11 +1967,15 @@ class MainWindow(QtWidgets.QMainWindow):
         return start, end
 
     def _handle_overscan_finished(self, request_id: int, tile_obj):
-        if request_id != self._overscan_request_id:
-            return
         if not isinstance(tile_obj, _OverscanTile):
             return
-        self._overscan_inflight = None
+        is_final = bool(getattr(tile_obj, "is_final", True))
+        if request_id != self._overscan_request_id:
+            return
+        if is_final:
+            self._overscan_inflight = None
+        else:
+            self._overscan_inflight = request_id
         self._overscan_tile = tile_obj
         self._update_tile_view_metadata(self._overscan_tile, self._view_start, self._view_duration)
         self._current_tile_id = None
@@ -2631,11 +2796,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _apply_tile_to_curves(self, tile: _OverscanTile) -> None:
         self._prepare_tile(tile)
+        is_final = bool(getattr(tile, "is_final", True))
         if self._use_gpu_canvas and self._gpu_canvas is not None:
             for idx, series in enumerate(tile.channel_data):
                 t_arr, x_arr = series
                 if idx in self._hidden_channels:
                     self._gpu_canvas.clear_channel(idx)
+                    continue
+                if not is_final and x_arr.size == 0:
                     continue
                 self._gpu_canvas.set_channel_data(idx, t_arr, x_arr)
             self._current_tile_id = tile.request_id
@@ -2645,6 +2813,8 @@ class MainWindow(QtWidgets.QMainWindow):
             if idx < len(self.curves):
                 if idx in self._hidden_channels:
                     self.curves[idx].setData([], [])
+                    continue
+                if not is_final and x_arr.size == 0:
                     continue
                 self.curves[idx].setData(t_arr, x_arr)
         self._current_tile_id = tile.request_id

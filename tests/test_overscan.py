@@ -115,6 +115,7 @@ def test_overscan_worker_prefers_lod(monkeypatch):
     assert tile.prepared_mask == [True]
     t_arr, x_arr = tile.channel_data[0]
     assert t_arr.size == x_arr.size > 0
+    assert tile.is_final is True
 
 
 def test_overscan_worker_respects_min_view_duration(monkeypatch):
@@ -168,6 +169,7 @@ def test_overscan_worker_respects_min_view_duration(monkeypatch):
     assert tile.raw_channel_data[0].lod_duration_s is None
     assert tile.prepared_mask == [True]
     assert tile.lod_durations == [None]
+    assert tile.is_final is True
 
 
 def test_overscan_worker_ratio_respects_min_view(monkeypatch):

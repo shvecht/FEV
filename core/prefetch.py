@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import threading
-import time
 from collections import OrderedDict
 from dataclasses import dataclass, replace
-from typing import Callable, Dict, Tuple
+from typing import Callable, Tuple
 
 import numpy as np
+import threading
+import time
 
 FetchFunc = Callable[[int, float, float], Tuple[np.ndarray, np.ndarray]]
 
@@ -19,6 +19,13 @@ def _tile_key(channel: int, start: float, duration: float) -> tuple[int, float, 
 class CacheEntry:
     data: Tuple[np.ndarray, np.ndarray]
     last_access: float
+    is_final: bool
+
+
+@dataclass(frozen=True)
+class _PrefetchTask:
+    key: tuple[int, float, float]
+    stage: str  # "preview" or "final"
 
 
 @dataclass
@@ -29,14 +36,20 @@ class PrefetchConfig:
 
 
 class PrefetchCache:
-    def __init__(self, fetch: FetchFunc, config: PrefetchConfig | None = None):
+    def __init__(
+        self,
+        fetch: FetchFunc,
+        config: PrefetchConfig | None = None,
+        preview_fetch: FetchFunc | None = None,
+    ):
         self.fetch = fetch
+        self.preview_fetch = preview_fetch
         self.config = config or PrefetchConfig()
         self._cache: OrderedDict[tuple[int, float, float], CacheEntry] = OrderedDict()
         self._lock = threading.RLock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
-        self._pending: list[tuple[int, float, float]] = []
+        self._pending: list[_PrefetchTask] = []
         self._estimated_tile_bytes: float = 0.0
 
     def start(self):
@@ -64,11 +77,17 @@ class PrefetchCache:
             if entry:
                 entry.last_access = time.time()
                 self._cache.move_to_end(key)
+                if not entry.is_final:
+                    self._ensure_final_enqueued(key)
                 return entry.data
         data = self.fetch(channel, start, start + duration)
         with self._lock:
             self._update_estimated_tile_bytes(data)
-            self._cache[key] = CacheEntry(data=data, last_access=time.time())
+            self._cache[key] = CacheEntry(
+                data=data,
+                last_access=time.time(),
+                is_final=True,
+            )
             self._cache.move_to_end(key)
             self._evict_if_needed()
         return data
@@ -77,8 +96,12 @@ class PrefetchCache:
         tiles = self._tiles_for_window(channel, start, duration)
         with self._lock:
             for tile in tiles:
-                if tile not in self._cache:
-                    self._pending.append(tile)
+                entry = self._cache.get(tile)
+                needs_final = entry is None or not entry.is_final
+                if self.preview_fetch is not None and needs_final:
+                    self._enqueue_task(_PrefetchTask(tile, "preview"))
+                if needs_final:
+                    self._enqueue_task(_PrefetchTask(tile, "final"))
 
     def _tiles_for_window(self, channel: int, start: float, duration: float):
         tiles = []
@@ -95,24 +118,38 @@ class PrefetchCache:
 
     def _worker(self):
         while not self._stop.is_set():
-            tile = None
+            task: _PrefetchTask | None = None
             with self._lock:
-                if self._pending:
-                    tile = self._pending.pop(0)
-            if tile is None:
+                while self._pending:
+                    candidate = self._pending.pop(0)
+                    if candidate.stage == "preview" and self.preview_fetch is None:
+                        continue
+                    entry = self._cache.get(candidate.key)
+                    if entry and entry.is_final:
+                        continue
+                    task = candidate
+                    break
+            if task is None:
                 self._stop.wait(0.1)
                 continue
-            channel, start, duration = tile
+            channel, start, duration = task.key
             key = _tile_key(channel, start, duration)
+            fetch_fn = self.preview_fetch if task.stage == "preview" else self.fetch
+            data = fetch_fn(channel, start, start + duration)
             with self._lock:
-                if key in self._cache:
+                entry = self._cache.get(key)
+                is_final = task.stage == "final"
+                if entry is not None and entry.is_final and not is_final:
                     continue
-            data = self.fetch(channel, start, start + duration)
-            with self._lock:
-                self._update_estimated_tile_bytes(data)
-                self._cache[key] = CacheEntry(data=data, last_access=time.time())
+                self._cache[key] = CacheEntry(
+                    data=data,
+                    last_access=time.time(),
+                    is_final=is_final,
+                )
                 self._cache.move_to_end(key)
-                self._evict_if_needed()
+                if is_final:
+                    self._update_estimated_tile_bytes(data)
+                    self._evict_if_needed()
 
     def _max_tiles_allowed(self) -> int:
         if self.config.max_bytes and self._estimated_tile_bytes > 0:
@@ -124,6 +161,16 @@ class PrefetchCache:
         with self._lock:
             self.config = config
             self._evict_if_needed()
+
+    def _enqueue_task(self, task: _PrefetchTask) -> None:
+        if task in self._pending:
+            return
+        self._pending.append(task)
+
+    def _ensure_final_enqueued(self, key: tuple[int, float, float]) -> None:
+        final_task = _PrefetchTask(key, "final")
+        if final_task not in self._pending:
+            self._pending.append(final_task)
 
     def _update_estimated_tile_bytes(self, data: Tuple[np.ndarray, np.ndarray]) -> None:
         tile_bytes = sum(arr.nbytes for arr in data)
@@ -163,10 +210,12 @@ class PrefetchService:
         with self._lock:
             self._config = cfg
 
-    def create_cache(self, fetch: FetchFunc) -> PrefetchCache:
+    def create_cache(
+        self, fetch: FetchFunc, *, preview_fetch: FetchFunc | None = None
+    ) -> PrefetchCache:
         with self._lock:
             cfg = self._config
-        return PrefetchCache(fetch, cfg)
+        return PrefetchCache(fetch, cfg, preview_fetch=preview_fetch)
 
 
 prefetch_service = PrefetchService()
