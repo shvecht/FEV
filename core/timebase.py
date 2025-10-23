@@ -30,8 +30,26 @@ class Timebase:
     def to_seconds(self, when: datetime) -> float:
         """
         Convert absolute datetime -> seconds-from-start.
+
+        ``pyedflib`` timestamps are inconsistent about timezone awareness, so
+        callers may hand us datetimes whose ``tzinfo`` does not match the
+        recording start. Normalise both values before subtracting so that we
+        gracefully accept any naive/aware combination.
         """
-        delta = when - self.start_dt
+        base = self.start_dt
+        other = when
+
+        base_tz = base.tzinfo
+        other_tz = other.tzinfo
+
+        if base_tz is None and other_tz is not None:
+            base = base.replace(tzinfo=other_tz)
+        elif base_tz is not None and other_tz is None:
+            other = other.replace(tzinfo=base_tz)
+        elif base_tz is not None and other_tz is not None and other_tz != base_tz:
+            other = other.astimezone(base_tz)
+
+        delta = other - base
         return delta.total_seconds()
 
     # ----- sample index conversions (per-channel fs) -----
