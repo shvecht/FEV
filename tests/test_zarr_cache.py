@@ -210,7 +210,28 @@ def test_zarr_loader_parity_with_edf(tmp_path):
             np.testing.assert_allclose(x_z, x_e, atol=1e-6)
     finally:
         loader.close()
-        zarr_loader.close()
+
+
+def test_zarr_loader_read_lod_window(tmp_path):
+    store_path = tmp_path / "study.zarr"
+    builder = zc.EdfToZarr(
+        "study.edf",
+        out_path=str(store_path),
+        lod_durations=(1.0, 2.0),
+    )
+    builder.build()
+
+    loader = ZarrLoader(store_path)
+    try:
+        chunk = loader.read_lod_window(0, 0.0, 5.0, 2.0)
+    finally:
+        loader.close()
+
+    assert hasattr(chunk, "lod_duration_s")
+    assert chunk.lod_duration_s == pytest.approx(2.0, rel=1e-3, abs=1e-6)
+    t, x = chunk
+    assert t.size > 0
+    assert x.size == t.size
 
 
 def test_zarr_loader_respects_window_cap(tmp_path):

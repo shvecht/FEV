@@ -17,6 +17,7 @@ Int16Array = NDArray[np.int16]
 
 @dataclass(frozen=True)
 class EnvelopeLevel:
+class LODLevel:
     duration_s: float
     bin_size: int
     data: NDArray[np.float32]
@@ -45,6 +46,7 @@ class Int16Cache:
     calibration: Sequence[ChannelCalibration]
     channel_names: Optional[Sequence[str]] = None
     lod_envelopes: Optional[Sequence[Dict[float, EnvelopeLevel]]] = None
+    lod_levels: Optional[Sequence[Dict[float, LODLevel]]] = None
     _locks: List[threading.RLock] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -68,6 +70,13 @@ class Int16Cache:
                 raise ValueError("lod_envelopes length must match number of channels")
             lod = tuple(dict(levels) for levels in self.lod_envelopes)
         object.__setattr__(self, "lod_envelopes", lod)
+        if self.lod_levels is None:
+            lod_levels = tuple({} for _ in range(channel_count))
+        else:
+            if len(self.lod_levels) != channel_count:
+                raise ValueError("lod_levels length must match channels")
+            lod_levels = tuple(dict(levels) for levels in self.lod_levels)
+        object.__setattr__(self, "lod_levels", lod_levels)
         locks = [threading.RLock() for _ in range(channel_count)]
         object.__setattr__(self, "_locks", locks)
 
@@ -150,6 +159,25 @@ class Int16Cache:
             )
         return levels[key]
 
+    # ------------------------------------------------------------------
+
+    def lod_durations(self, channel: int) -> tuple[float, ...]:
+        levels = self._lod_dict(channel)
+        return tuple(sorted(levels.keys()))
+
+    def lod_level(self, channel: int, duration_s: float) -> LODLevel:
+        levels = self._lod_dict(channel)
+        key = round(float(duration_s), 9)
+        if key not in levels:
+            available = ", ".join(str(k) for k in sorted(levels.keys()))
+            raise KeyError(f"LOD duration {duration_s} missing (available: {available})")
+        return levels[key]
+
+    def _lod_dict(self, channel: int) -> Dict[float, LODLevel]:
+        if not 0 <= channel < self.channel_count:
+            raise IndexError("channel index out of range")
+        return self.lod_levels[channel]
+
 
 def _digital_read_fn(reader: pyedflib.EdfReader) -> Callable[[int], NDArray[np.int64]]:
     if hasattr(reader, "read_digital_signal"):
@@ -166,6 +194,7 @@ def build_int16_cache(
     prefer_memmap: bool,
     memmap_dir: Optional[Path],
     lod_durations: Sequence[float] | None = (1.0, 5.0, 30.0),
+    lod_durations: Sequence[float] = (1.0, 5.0, 30.0),
 ) -> Optional[Int16Cache]:
     if max_bytes <= 0:
         return None
@@ -181,6 +210,7 @@ def build_int16_cache(
     channels: List[Int16Array] = []
     calibration: List[ChannelCalibration] = []
     lod_levels: List[Dict[float, EnvelopeLevel]] = []
+    lod_levels: List[Dict[float, LODLevel]] = []
     running_bytes = 0
     memmap_paths: List[Path] = []
 
@@ -241,6 +271,9 @@ def build_int16_cache(
                 sample_frequency,
                 slope,
                 offset,
+            _compute_lod_levels(
+                channels[-1],
+                calibration[-1],
                 lod_durations,
             )
         )
@@ -311,3 +344,59 @@ def _compute_envelopes(
 
 def _lod_key(duration: float) -> float:
     return round(float(duration), 9)
+        lod_levels=lod_levels,
+    )
+
+
+def _compute_lod_levels(
+    data: Int16Array,
+    calibration: ChannelCalibration,
+    durations: Sequence[float],
+) -> Dict[float, LODLevel]:
+    levels: Dict[float, LODLevel] = {}
+    fs = float(calibration.sample_frequency)
+    if fs <= 0:
+        return levels
+    slope = float(calibration.slope)
+    offset = float(calibration.offset)
+    total = int(calibration.n_samples)
+    if total <= 0:
+        return levels
+
+    for duration in durations:
+        try:
+            value = float(duration)
+        except (TypeError, ValueError):
+            continue
+        if not np.isfinite(value) or value <= 0:
+            continue
+        bin_size = max(1, int(round(fs * value)))
+        if bin_size <= 0:
+            continue
+        bins = int(np.ceil(total / bin_size))
+        if bins <= 0:
+            continue
+        mins = np.empty(bins, dtype=np.float32)
+        maxs = np.empty(bins, dtype=np.float32)
+        for idx in range(bins):
+            start = idx * bin_size
+            stop = min(start + bin_size, total)
+            segment = data[start:stop]
+            if segment.size == 0:
+                mins[idx] = np.nan
+                maxs[idx] = np.nan
+                continue
+            values = segment.astype(np.float32)
+            if slope != 1.0:
+                values = values * slope
+            if offset != 0.0:
+                values = values + offset
+            mins[idx] = float(values.min())
+            maxs[idx] = float(values.max())
+        key = round(value, 9)
+        levels[key] = LODLevel(
+            duration_s=float(bin_size / fs),
+            bin_size=bin_size,
+            data=np.stack((mins, maxs), axis=1),
+        )
+    return levels

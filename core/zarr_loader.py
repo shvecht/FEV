@@ -11,6 +11,7 @@ import zarr
 
 from core.timebase import Timebase
 from core import annotations as annotations_core
+from core.overscan import SignalChunk, chunk_from_arrays, chunk_from_envelope
 
 
 @dataclass(frozen=True)
@@ -19,6 +20,13 @@ class ChannelMeta:
     fs: float
     n_samples: int
     unit: str
+
+
+@dataclass(frozen=True)
+class LodLevel:
+    duration_s: float
+    dataset: zarr.Array
+    bin_size: int
 
 
 class ZarrLoader:
@@ -41,7 +49,7 @@ class ZarrLoader:
 
         self._channel_arrays: List[zarr.Array] = []
         self._channel_meta: List[ChannelMeta] = []
-        self._lod_levels: Dict[int, Dict[float, zarr.Array]] = {}
+        self._lod_levels: Dict[int, Dict[float, LodLevel]] = {}
 
         ch_group = self._root["channels"]
         idx = 0
@@ -74,7 +82,7 @@ class ZarrLoader:
     def fs(self, idx: int) -> float:
         return self._channel_meta[idx].fs
 
-    def read(self, idx: int, t0: float, t1: float) -> Tuple[np.ndarray, np.ndarray]:
+    def read(self, idx: int, t0: float, t1: float) -> SignalChunk:
         meta = self._channel_meta[idx]
         arr = self._channel_arrays[idx]
         t0_c, t1_c = self.timebase.clamp_window(t0, t1)
@@ -82,13 +90,21 @@ class ZarrLoader:
         s0, n = Timebase.sec_to_idx(t0_c, t1_c, meta.fs)
         total = meta.n_samples
         if s0 >= total or n <= 0:
-            return np.zeros(0, dtype=float), np.zeros(0, dtype=np.float32)
+            empty_t = np.zeros(0, dtype=float)
+            empty_x = np.zeros(0, dtype=np.float32)
+            return chunk_from_arrays(empty_t, empty_x)
         n = min(n, total - s0)
         data = arr[s0 : s0 + n]
         if data.dtype != np.float32:
             data = data.astype(np.float32)
         t = Timebase.time_vector(s0, data.size, meta.fs)
-        return t, data
+        source_end = float(t[-1]) if t.size else t0_c
+        return chunk_from_arrays(
+            t,
+            data,
+            source_start=float(t[0]) if t.size else t0_c,
+            source_end=source_end,
+        )
 
     def annotations(self) -> annotations_core.Annotations:
         if self._annotations is None:
@@ -101,25 +117,51 @@ class ZarrLoader:
     # ------------------------------------------------------------------
 
     def lod_levels(self, idx: int) -> List[float]:
+        return list(self.lod_durations(idx))
+
+    def lod_durations(self, idx: int) -> Tuple[float, ...]:
         levels = self._lod_levels.get(idx)
         if not levels:
-            return []
-        return sorted(levels.keys())
+            return ()
+        return tuple(sorted(levels.keys()))
 
     def read_lod(self, idx: int, duration_s: float) -> Tuple[np.ndarray, np.ndarray, float]:
-        levels = self._lod_levels.get(idx)
-        if not levels:
-            raise KeyError(f"no LOD levels for channel {idx}")
-        key = self._lod_key(duration_s)
-        if key not in levels:
-            available = ", ".join(str(v) for v in sorted(levels.keys()))
-            raise KeyError(f"LOD duration {duration_s} not found for channel {idx}; available: {available}")
-        dataset = levels[key]
-        data = dataset[:]
+        level = self._get_lod(idx, duration_s)
+        data = level.dataset[:]
         mins = data[:, 0]
         maxs = data[:, 1]
-        duration = float(dataset.attrs.get("bin_duration_s", duration_s))
-        return mins, maxs, duration
+        return mins, maxs, level.duration_s
+
+    def read_lod_window(
+        self,
+        idx: int,
+        t0: float,
+        t1: float,
+        duration_s: float,
+    ) -> SignalChunk:
+        level = self._get_lod(idx, duration_s)
+        meta = self._channel_meta[idx]
+        t0_c, t1_c = self.timebase.clamp_window(t0, t1)
+        t1_c = min(t0_c + self.max_window_s, t1_c)
+        s0, n = Timebase.sec_to_idx(t0_c, t1_c, meta.fs)
+        total = meta.n_samples
+        if s0 >= total or n <= 0:
+            empty = np.zeros(0, dtype=np.float32)
+            return chunk_from_arrays(np.zeros(0, dtype=np.float64), empty)
+        s1 = min(total, s0 + n)
+        bin_size = level.bin_size
+        bin_start = max(0, s0 // bin_size)
+        bin_stop = min(level.dataset.shape[0], int(np.ceil(s1 / bin_size)))
+        if bin_stop <= bin_start:
+            empty = np.zeros(0, dtype=np.float32)
+            return chunk_from_arrays(np.zeros(0, dtype=np.float64), empty, lod_duration_s=level.duration_s)
+        data = level.dataset[bin_start:bin_stop]
+        if data.dtype != np.float32:
+            data = data.astype(np.float32)
+        mins = data[:, 0]
+        maxs = data[:, 1]
+        start_time = bin_start * level.duration_s
+        return chunk_from_envelope(start_time, level.duration_s, mins, maxs)
 
     def read_lod_window(
         self,
@@ -160,18 +202,38 @@ class ZarrLoader:
             except ValueError:
                 continue
             ch_group = lod_root[name]
-            durations: Dict[float, zarr.Array] = {}
+            durations: Dict[float, LodLevel] = {}
             for level_name in ch_group.array_keys():
                 arr = ch_group[level_name]
                 duration = float(arr.attrs.get("bin_duration_s", 0.0))
                 key = self._lod_key(duration)
-                durations[key] = arr
+                bin_size = int(arr.attrs.get("bin_size", 0))
+                if bin_size <= 0:
+                    fs = float(self._channel_meta[idx].fs)
+                    bin_size = max(1, int(round(fs * duration)))
+                durations[key] = LodLevel(
+                    duration_s=float(duration),
+                    dataset=arr,
+                    bin_size=bin_size,
+                )
             if durations:
                 self._lod_levels[idx] = durations
 
     @staticmethod
     def _lod_key(duration: float) -> float:
         return round(float(duration), 9)
+
+    def _get_lod(self, idx: int, duration_s: float) -> LodLevel:
+        levels = self._lod_levels.get(idx)
+        if not levels:
+            raise KeyError(f"no LOD levels for channel {idx}")
+        key = self._lod_key(duration_s)
+        if key not in levels:
+            available = ", ".join(str(v) for v in sorted(levels.keys()))
+            raise KeyError(
+                f"LOD duration {duration_s} not found for channel {idx}; available: {available}"
+            )
+        return levels[key]
 
 
 __all__ = ["ZarrLoader", "ChannelMeta"]
