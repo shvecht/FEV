@@ -306,3 +306,20 @@ def test_prefetch_cache_tiles_use_cached_loader(monkeypatch):
         assert reader.read_signal_calls == 0
     finally:
         loader.close()
+
+
+def test_edf_loader_exposes_lod_envelopes():
+    loader = edf_module.EdfLoader("dummy.edf")
+    try:
+        assert loader.build_int16_cache(max_mb=1.0, prefer_memmap=False) is True
+        durations = loader.lod_durations(0)
+        assert durations
+        chunk = loader.read_lod_window(0, 0.0, 5.0, durations[-1])
+    finally:
+        loader.close()
+
+    assert hasattr(chunk, "lod_duration_s")
+    assert chunk.lod_duration_s == pytest.approx(durations[-1], rel=1e-3, abs=1e-6)
+    t, x = chunk
+    assert t.size > 0
+    assert x.size == t.size

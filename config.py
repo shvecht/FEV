@@ -16,6 +16,7 @@ class ViewerConfig:
     int16_cache_enabled: bool = False
     int16_cache_max_mb: float = 512.0
     int16_cache_memmap: bool = False
+    lod_envelope_ratio: float = 2.0
     hidden_channels: tuple[int, ...] = ()
     hidden_annotation_channels: tuple[str, ...] = ("stage", "position")
     annotation_focus_only: bool = False
@@ -100,6 +101,11 @@ class ViewerConfig:
                 cfg.int16_cache_memmap = cache_section.getboolean(
                     "memmap", fallback=cfg.int16_cache_memmap
                 )
+            lod_section = parser["lod"] if "lod" in parser else None
+            if lod_section:
+                cfg.lod_envelope_ratio = lod_section.getfloat(
+                    "envelope_ratio", fallback=cfg.lod_envelope_ratio
+                )
         cfg.ini_path = path
         return cfg
 
@@ -138,6 +144,9 @@ class ViewerConfig:
             "enabled": "true" if self.int16_cache_enabled else "false",
             "max_mb": f"{self.int16_cache_max_mb:.3f}",
             "memmap": "true" if self.int16_cache_memmap else "false",
+        }
+        parser["lod"] = {
+            "envelope_ratio": f"{self.lod_envelope_ratio:.3f}",
         }
         with self.ini_path.open("w") as fh:
             parser.write(fh)
