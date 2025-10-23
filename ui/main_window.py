@@ -114,7 +114,8 @@ class _OverscanTile:
     view_duration: float
     raw_channel_data: list[SignalChunk]
     channel_data: list[tuple[np.ndarray, np.ndarray]]
-    max_samples: Optional[int]
+    vertex_data: list[np.ndarray] = field(default_factory=list)
+    max_samples: Optional[int] = None
     pixel_budget: Optional[int] = None
     prepared_mask: list[bool] = field(default_factory=list)
     lod_durations: list[Optional[float]] = field(default_factory=list)
@@ -421,6 +422,16 @@ class MainWindow(QtWidgets.QMainWindow):
         super().__init__()
         self.loader = loader
         self._config = config or ViewerConfig()
+        self.plots: list[pg.PlotItem] = []
+        self.curves: list[pg.PlotDataItem] = []
+        self.channel_labels: list[pg.LabelItem] = []
+        self._cpu_plot_widget: pg.GraphicsLayoutWidget | None = None
+        self._plot_scroll: QtWidgets.QScrollArea | None = None
+        self._plot_container: QtWidgets.QWidget | None = None
+        self._renderer_badge: QtWidgets.QLabel | None = None
+        self._annotation_control_states: dict[QtWidgets.QWidget, bool] = {}
+        self._annotation_control_tooltips: dict[QtWidgets.QWidget, str] = {}
+        self._plot_viewport_filter_installed = False
         self._ingest_thread: QtCore.QThread | None = None
         self._ingest_worker: _ZarrIngestWorker | None = None
         self._zarr_path: Path | None = None
@@ -460,22 +471,38 @@ class MainWindow(QtWidgets.QMainWindow):
         self._config.theme = theme_key
         self._controls_collapsed = bool(getattr(self._config, "controls_collapsed", False))
 
+        self._gpu_probe = VispyChannelCanvas.capability_probe()
+        self._gpu_autoswitch_enabled = bool(self._gpu_probe.available)
+        self._gpu_failure_reason: str | None = (
+            self._gpu_probe.reason if not self._gpu_probe.available else None
+        )
+        base_budget = self._gpu_probe.vertex_budget or VispyChannelCanvas.DEFAULT_VERTEX_BUDGET
+        self._gpu_vertex_promote_threshold = max(300_000, int(base_budget * 0.55))
+        self._gpu_vertex_demote_threshold = max(150_000, int(self._gpu_vertex_promote_threshold * 0.55))
+        if self._gpu_vertex_demote_threshold >= self._gpu_vertex_promote_threshold:
+            self._gpu_vertex_demote_threshold = max(150_000, int(self._gpu_vertex_promote_threshold * 0.5))
+        self._gpu_promote_counter = 0
+        self._gpu_demote_counter = 0
+        self._gpu_last_vertex_count = 0
+        self._gpu_switch_in_progress = False
+
         requested_backend = str(getattr(self._config, "canvas_backend", "pyqtgraph"))
         self._requested_canvas_backend = requested_backend.lower()
+        self._gpu_forced = self._requested_canvas_backend in {"vispy", "gpu", "gpu-vispy"}
         self._gpu_canvas: VispyChannelCanvas | None = None
         self._gpu_init_error: str | None = None
         self._use_gpu_canvas = False
-        if self._requested_canvas_backend in {"vispy", "gpu", "gpu-vispy"}:
-            try:
-                self._gpu_canvas = VispyChannelCanvas()
+        if self._gpu_forced:
+            if self._ensure_gpu_canvas_created():
                 self._use_gpu_canvas = True
                 self._config.canvas_backend = "vispy"
-            except Exception as exc:  # pragma: no cover - GPU fallback
-                LOG.warning("GPU canvas unavailable, falling back to pyqtgraph: %s", exc)
-                self._gpu_init_error = str(exc)
-                self._gpu_canvas = None
-                self._use_gpu_canvas = False
+                self._gpu_failure_reason = None
+            else:
                 self._config.canvas_backend = "pyqtgraph"
+                self._gpu_autoswitch_enabled = False
+        else:
+            if not self._gpu_probe.available and self._gpu_probe.reason:
+                self._gpu_failure_reason = self._gpu_probe.reason
 
         pg.setConfigOptions(antialias=True)
 
@@ -835,55 +862,21 @@ class MainWindow(QtWidgets.QMainWindow):
         controlLayout.addWidget(self.ingestBar)
         controlLayout.addStretch(1)
 
-        if self._use_gpu_canvas and self._gpu_canvas is not None:
+        if self._use_gpu_canvas and self._ensure_gpu_canvas_created():
             self.plotLayout = self._gpu_canvas
             self.plotLayout.setMinimumSize(0, 0)
             self.plotLayout.setSizePolicy(
                 QtWidgets.QSizePolicy.Expanding,
                 QtWidgets.QSizePolicy.Expanding,
             )
-            self._plot_viewport = self.plotLayout
+            self._plot_viewport = self._gpu_canvas
             self._hover_line = None
             self._hover_label = None
             self._hover_plot = None
-            self.plots = []
-            self.curves = []
-            self.channel_labels = []
             self._configure_gpu_canvas()
         else:
-            self.plotLayout = pg.GraphicsLayoutWidget()
-            self.plotLayout.setMinimumSize(0, 0)
-            self.plotLayout.setSizePolicy(
-                QtWidgets.QSizePolicy.Expanding,
-                QtWidgets.QSizePolicy.Expanding,
-            )
-            self.plotLayout.ci.layout.setSpacing(0)
-            self.plotLayout.ci.layout.setContentsMargins(0, 0, 0, 0)
-
-            self._hover_line = pg.InfiniteLine(angle=90, movable=False)
-            self._hover_line.setZValue(1000)
-            self._hover_line.setVisible(False)
-            self._hover_line.setPen(pg.mkPen((240, 240, 240, 220), width=1.0, style=QtCore.Qt.DashLine))
-            self._hover_label_anchor = (0.0, 1.0)
-            self._hover_label = pg.TextItem(anchor=self._hover_label_anchor)
-            self._hover_label.setZValue(1001)
-            self._hover_label.setColor((240, 240, 240))
-            self._hover_label.setVisible(False)
-            scene = self.plotLayout.scene()
-            scene.sigMouseMoved.connect(self._update_hover_indicator)
-            mouse_exited = getattr(scene, "sigMouseExited", None)
-            if mouse_exited is not None:
-                mouse_exited.connect(self._on_plot_scene_mouse_exited)
-            self._plot_viewport = self.plotLayout.viewport()
-            if self._plot_viewport is not None:
-                self._plot_viewport.installEventFilter(self)
-
-            self.plots: list[pg.PlotItem] = []
-            self.curves: list[pg.PlotDataItem] = []
-            self.channel_labels: list[pg.LabelItem] = []
-
-            self._ensure_plot_rows(self.loader.n_channels)
-            self._configure_plots()
+            self._use_gpu_canvas = False
+            self.plotLayout = self._ensure_cpu_canvas()
 
         scroll = QtWidgets.QScrollArea()
         scroll.setWidgetResizable(True)
@@ -894,6 +887,23 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QSizePolicy.Expanding,
         )
         scroll.setWidget(self.plotLayout)
+        self._plot_scroll = scroll
+
+        plot_container = QtWidgets.QWidget()
+        container_layout = QtWidgets.QGridLayout(plot_container)
+        container_layout.setContentsMargins(0, 0, 0, 0)
+        container_layout.setSpacing(0)
+        container_layout.addWidget(scroll, 0, 0)
+        self._renderer_badge = QtWidgets.QLabel("")
+        self._renderer_badge.setObjectName("rendererBadge")
+        self._renderer_badge.setAlignment(QtCore.Qt.AlignCenter)
+        self._renderer_badge.setStyleSheet(
+            "padding: 2px 8px; border-radius: 8px; font-size: 11px; font-weight: 600;"
+        )
+        container_layout.addWidget(
+            self._renderer_badge, 0, 0, QtCore.Qt.AlignTop | QtCore.Qt.AlignRight
+        )
+        self._plot_container = plot_container
 
         control_scroll = QtWidgets.QScrollArea()
         control_scroll.setWidgetResizable(True)
@@ -979,7 +989,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
         splitter.addWidget(control_wrapper)
-        splitter.addWidget(scroll)
+        splitter.addWidget(plot_container)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setSizes([160, 1040])
@@ -997,6 +1007,222 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_control_toggle_icon(self._controls_collapsed)
         self._apply_control_panel_state(self._controls_collapsed)
         QtCore.QTimer.singleShot(0, lambda: self._apply_control_panel_state(self._controls_collapsed))
+        self._update_annotation_controls_for_renderer()
+        self._update_renderer_indicator()
+
+    def _ensure_gpu_canvas_created(self) -> bool:
+        if self._gpu_canvas is not None:
+            return True
+        try:
+            self._gpu_canvas = VispyChannelCanvas()
+        except Exception as exc:  # pragma: no cover - optional GPU path
+            self._gpu_init_error = str(exc)
+            self._gpu_canvas = None
+            self._gpu_autoswitch_enabled = False
+            self._gpu_failure_reason = str(exc)
+            LOG.warning("GPU canvas unavailable: %s", exc)
+            return False
+        return True
+
+    def _ensure_cpu_canvas(self) -> pg.GraphicsLayoutWidget:
+        if self._cpu_plot_widget is None:
+            widget = pg.GraphicsLayoutWidget()
+            widget.setMinimumSize(0, 0)
+            widget.setSizePolicy(
+                QtWidgets.QSizePolicy.Expanding,
+                QtWidgets.QSizePolicy.Expanding,
+            )
+            widget.ci.layout.setSpacing(0)
+            widget.ci.layout.setContentsMargins(0, 0, 0, 0)
+
+            self._hover_line = pg.InfiniteLine(angle=90, movable=False)
+            self._hover_line.setZValue(1000)
+            self._hover_line.setVisible(False)
+            self._hover_line.setPen(
+                pg.mkPen((240, 240, 240, 220), width=1.0, style=QtCore.Qt.DashLine)
+            )
+            self._hover_label_anchor = (0.0, 1.0)
+            self._hover_label = pg.TextItem(anchor=self._hover_label_anchor)
+            self._hover_label.setZValue(1001)
+            self._hover_label.setColor((240, 240, 240))
+            self._hover_label.setVisible(False)
+            self._hover_plot = None
+
+            scene = widget.scene()
+            scene.sigMouseMoved.connect(self._update_hover_indicator)
+            mouse_exited = getattr(scene, "sigMouseExited", None)
+            if mouse_exited is not None:
+                mouse_exited.connect(self._on_plot_scene_mouse_exited)
+
+            self._cpu_plot_widget = widget
+            self.plots = []
+            self.curves = []
+            self.channel_labels = []
+            self._plot_viewport_filter_installed = False
+        else:
+            widget = self._cpu_plot_widget
+
+        self._plot_viewport = widget.viewport()
+        if self._plot_viewport is not None and not self._plot_viewport_filter_installed:
+            self._plot_viewport.installEventFilter(self)
+            self._plot_viewport_filter_installed = True
+
+        self.plotLayout = widget
+        self._ensure_plot_rows(self.loader.n_channels)
+        self._configure_plots()
+        return widget
+
+    def _update_annotation_controls_for_renderer(self) -> None:
+        widgets = [
+            getattr(self, "annotationToggle", None),
+            getattr(self, "annotationFocusOnly", None),
+            getattr(self, "annotationPositionToggle", None),
+        ]
+        widgets = [w for w in widgets if w is not None]
+        if self._use_gpu_canvas:
+            note = "Annotation overlays are unavailable in GPU mode"
+            for widget in widgets:
+                self._annotation_control_states[widget] = widget.isEnabled()
+                self._annotation_control_tooltips[widget] = widget.toolTip()
+                widget.setEnabled(False)
+                widget.setToolTip(note)
+            rail_toggle = getattr(self, "railAnnotationBtn", None)
+            if rail_toggle is not None:
+                self._annotation_control_states[rail_toggle] = rail_toggle.isEnabled()
+                self._annotation_control_tooltips[rail_toggle] = rail_toggle.toolTip()
+                rail_toggle.setEnabled(False)
+                rail_toggle.setToolTip(note)
+        else:
+            for widget in widgets:
+                previous_enabled = self._annotation_control_states.pop(widget, widget.isEnabled())
+                widget.setEnabled(previous_enabled)
+                previous_tip = self._annotation_control_tooltips.pop(widget, "")
+                if previous_tip:
+                    widget.setToolTip(previous_tip)
+            rail_toggle = getattr(self, "railAnnotationBtn", None)
+            if rail_toggle is not None:
+                previous_enabled = self._annotation_control_states.pop(
+                    rail_toggle, rail_toggle.isEnabled()
+                )
+                rail_toggle.setEnabled(previous_enabled)
+                previous_tip = self._annotation_control_tooltips.pop(rail_toggle, "")
+                if previous_tip:
+                    rail_toggle.setToolTip(previous_tip)
+            self._annotation_control_states.clear()
+            self._annotation_control_tooltips.clear()
+
+    def _update_renderer_indicator(self) -> None:
+        if self._renderer_badge is None:
+            return
+        if self._use_gpu_canvas:
+            self._renderer_badge.setText("GPU")
+            style = (
+                "color: #d6e4ff; background-color: rgba(70, 122, 216, 0.4);"
+                "padding: 2px 8px; border-radius: 8px; font-size: 11px; font-weight: 600;"
+            )
+            tooltip = "Active renderer: VisPy (GPU)"
+        else:
+            self._renderer_badge.setText("CPU")
+            style = (
+                "color: #f4d4aa; background-color: rgba(120, 86, 48, 0.45);"
+                "padding: 2px 8px; border-radius: 8px; font-size: 11px; font-weight: 600;"
+            )
+            tooltip = "Active renderer: pyqtgraph (CPU)"
+        self._renderer_badge.setStyleSheet(style)
+        if self._gpu_failure_reason:
+            tooltip += f"\nGPU unavailable: {self._gpu_failure_reason}"
+        elif not self._gpu_autoswitch_enabled and not self._use_gpu_canvas and self._gpu_probe.reason:
+            tooltip += f"\nGPU disabled: {self._gpu_probe.reason}"
+        if self._gpu_last_vertex_count:
+            tooltip += f"\nLast vertex load: {self._gpu_last_vertex_count:,} vertices"
+        self._renderer_badge.setToolTip(tooltip)
+
+    def _switch_to_gpu(self) -> bool:
+        if self._use_gpu_canvas:
+            return True
+        if not self._gpu_autoswitch_enabled and not self._gpu_forced:
+            return False
+        if not self._ensure_gpu_canvas_created():
+            return False
+        if self._plot_scroll is None:
+            return False
+        self._gpu_switch_in_progress = True
+        try:
+            current = self._plot_scroll.widget()
+            if current is not None and current is not self._gpu_canvas:
+                current.setParent(None)
+            self._plot_scroll.setWidget(self._gpu_canvas)
+            self.plotLayout = self._gpu_canvas
+            self._plot_viewport = self._gpu_canvas
+            self._use_gpu_canvas = True
+            self._config.canvas_backend = "vispy"
+            self._gpu_failure_reason = None
+            self._update_annotation_controls_for_renderer()
+            self._configure_gpu_canvas()
+            self._update_renderer_indicator()
+            self._update_data_source_label()
+            return True
+        finally:
+            self._gpu_switch_in_progress = False
+
+    def _switch_to_cpu(self) -> bool:
+        if not self._use_gpu_canvas:
+            return True
+        if self._plot_scroll is None:
+            return False
+        widget = self._ensure_cpu_canvas()
+        self._gpu_switch_in_progress = True
+        try:
+            current = self._plot_scroll.widget()
+            if current is not None and current is not widget:
+                current.setParent(None)
+            self._plot_scroll.setWidget(widget)
+            self.plotLayout = widget
+            self._plot_viewport = widget.viewport()
+            self._use_gpu_canvas = False
+            if not self._gpu_forced:
+                self._config.canvas_backend = "pyqtgraph"
+            self._sync_hover_overlay_target()
+            self._update_annotation_controls_for_renderer()
+            self._update_renderer_indicator()
+            self._update_data_source_label()
+            return True
+        finally:
+            self._gpu_switch_in_progress = False
+
+    def _maybe_autoswitch_renderer(self, vertex_count: int) -> None:
+        self._gpu_last_vertex_count = max(0, int(vertex_count))
+        if not self._gpu_autoswitch_enabled or self._gpu_switch_in_progress:
+            return
+        if self._use_gpu_canvas:
+            self._gpu_promote_counter = 0
+            if self._gpu_forced:
+                return
+            if vertex_count <= self._gpu_vertex_demote_threshold:
+                self._gpu_demote_counter += 1
+            else:
+                self._gpu_demote_counter = 0
+            if self._gpu_demote_counter >= 2:
+                if self._switch_to_cpu():
+                    self._gpu_demote_counter = 0
+        else:
+            self._gpu_demote_counter = 0
+            if vertex_count >= self._gpu_vertex_promote_threshold:
+                self._gpu_promote_counter += 1
+            else:
+                self._gpu_promote_counter = 0
+            if self._gpu_promote_counter >= 2:
+                if self._switch_to_gpu():
+                    self._gpu_promote_counter = 0
+
+    @staticmethod
+    def _make_vertex_payload(t_arr: np.ndarray, x_arr: np.ndarray) -> np.ndarray:
+        if t_arr.size == 0 or x_arr.size == 0:
+            return np.zeros((0, 2), dtype=np.float32)
+        vertices = np.empty((t_arr.size, 2), dtype=np.float32)
+        vertices[:, 0] = t_arr.astype(np.float32, copy=False)
+        vertices[:, 1] = x_arr.astype(np.float32, copy=False)
+        return vertices
 
     def _connect_signals(self):
         self.startSpin.valueChanged.connect(self._on_start_spin_changed)
@@ -2763,6 +2989,9 @@ class MainWindow(QtWidgets.QMainWindow):
         changed = False
         prepared_series: list[tuple[np.ndarray, np.ndarray]] = []
         mask_len = len(tile.prepared_mask)
+        want_vertices = self._use_gpu_canvas or self._gpu_autoswitch_enabled
+        existing_vertices = tile.vertex_data if tile.vertex_data else []
+        vertex_series: list[np.ndarray] = []
 
         for idx, raw in enumerate(tile.raw_channel_data):
             chunk = raw
@@ -2777,10 +3006,18 @@ class MainWindow(QtWidgets.QMainWindow):
             needs_prepare = not same_budget or idx >= mask_len or not tile.prepared_mask[idx]
             if not needs_prepare and idx < len(tile.channel_data):
                 prepared_series.append(tile.channel_data[idx])
+                if want_vertices:
+                    if idx < len(existing_vertices):
+                        vertex_series.append(existing_vertices[idx])
+                    else:
+                        t_prev, x_prev = tile.channel_data[idx]
+                        vertex_series.append(self._make_vertex_payload(t_prev, x_prev))
                 continue
 
             t_slice, x_slice = slice_and_decimate(chunk, None, tile.start, tile.end, budget)
             prepared_series.append((t_slice, x_slice))
+            if want_vertices:
+                vertex_series.append(self._make_vertex_payload(t_slice, x_slice))
             if idx < mask_len:
                 tile.prepared_mask[idx] = True
             else:
@@ -2790,6 +3027,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         tile.channel_data = prepared_series
         tile.pixel_budget = budget
+        if want_vertices:
+            tile.vertex_data = vertex_series
+        else:
+            tile.vertex_data = []
         if not tile.prepared_mask and prepared_series:
             tile.prepared_mask = [True] * len(prepared_series)
         return changed
@@ -2797,17 +3038,41 @@ class MainWindow(QtWidgets.QMainWindow):
     def _apply_tile_to_curves(self, tile: _OverscanTile) -> None:
         self._prepare_tile(tile)
         is_final = bool(getattr(tile, "is_final", True))
+
+        if tile.vertex_data:
+            visible_vertex_count = sum(
+                verts.shape[0]
+                for idx, verts in enumerate(tile.vertex_data)
+                if idx not in self._hidden_channels
+            )
+        else:
+            visible_vertex_count = sum(
+                x_arr.size
+                for idx, (_t_arr, x_arr) in enumerate(tile.channel_data)
+                if idx not in self._hidden_channels
+            )
+
+        self._maybe_autoswitch_renderer(visible_vertex_count)
+
         if self._use_gpu_canvas and self._gpu_canvas is not None:
-            for idx, series in enumerate(tile.channel_data):
-                t_arr, x_arr = series
-                if idx in self._hidden_channels:
-                    self._gpu_canvas.clear_channel(idx)
-                    continue
-                if not is_final and x_arr.size == 0:
-                    continue
-                self._gpu_canvas.set_channel_data(idx, t_arr, x_arr)
+            vertices = tile.vertex_data
+            if not vertices or len(vertices) < len(tile.channel_data):
+                vertices = [
+                    self._make_vertex_payload(t_arr, x_arr)
+                    for (t_arr, x_arr) in tile.channel_data
+                ]
+                tile.vertex_data = vertices
+            self._gpu_canvas.apply_tile_data(
+                tile.request_id,
+                tile.channel_data,
+                vertices,
+                self._hidden_channels,
+                final=is_final,
+            )
             self._current_tile_id = tile.request_id
+            self._update_renderer_indicator()
             return
+
         for idx, series in enumerate(tile.channel_data):
             t_arr, x_arr = series
             if idx < len(self.curves):
@@ -2818,6 +3083,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     continue
                 self.curves[idx].setData(t_arr, x_arr)
         self._current_tile_id = tile.request_id
+        self._update_renderer_indicator()
 
     def closeEvent(self, event):
         self._cleanup_ingest_thread(wait=True)
