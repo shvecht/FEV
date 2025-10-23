@@ -6,7 +6,7 @@ import math
 import os
 import re
 from dataclasses import dataclass, field
-from collections import Counter
+from collections import Counter, OrderedDict
 from functools import partial
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -114,15 +114,46 @@ class _OverscanTile:
     view_duration: float
     raw_channel_data: list[SignalChunk]
     channel_data: list[tuple[np.ndarray, np.ndarray]]
+    channel_indices: tuple[int, ...] = field(default_factory=tuple)
     vertex_data: list[np.ndarray] = field(default_factory=list)
     max_samples: Optional[int] = None
     pixel_budget: Optional[int] = None
     prepared_mask: list[bool] = field(default_factory=list)
     lod_durations: list[Optional[float]] = field(default_factory=list)
+    prepared_cache: dict[int, list[tuple[np.ndarray, np.ndarray]]] = field(
+        default_factory=dict
+    )
+    vertex_cache: dict[int, list[np.ndarray]] = field(default_factory=dict)
     is_final: bool = True
 
     def contains(self, window_start: float, window_end: float) -> bool:
         return window_start >= self.start and window_end <= self.end
+
+    def prepared_for_budget(
+        self, budget: int
+    ) -> list[tuple[np.ndarray, np.ndarray]] | None:
+        if budget is None:
+            return None
+        return self.prepared_cache.get(int(budget))
+
+    def cache_prepared(
+        self,
+        budget: int,
+        series: list[tuple[np.ndarray, np.ndarray]],
+        vertices: list[np.ndarray] | None,
+    ) -> None:
+        self.prepared_cache[int(budget)] = series
+        if vertices is not None:
+            self.vertex_cache[int(budget)] = vertices
+
+    def prepared_vertices(self, budget: int) -> list[np.ndarray] | None:
+        if budget is None:
+            return None
+        return self.vertex_cache.get(int(budget))
+
+    def clear_prepared_caches(self) -> None:
+        self.prepared_cache.clear()
+        self.vertex_cache.clear()
 
 
 class _OverscanWorker(QtCore.QObject):
@@ -236,6 +267,7 @@ class _OverscanWorker(QtCore.QObject):
             view_duration=req.view_duration,
             raw_channel_data=raw_chunks,
             channel_data=payloads,
+            channel_indices=req.channel_indices,
             max_samples=req.max_samples,
             prepared_mask=[False] * len(raw_chunks),
             lod_durations=lod_durations,
@@ -523,6 +555,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._overscan_request_id = 0
         self._overscan_inflight: Optional[int] = None
         self._current_tile_id: Optional[int] = None
+        self._overscan_tile_cache: OrderedDict[
+            tuple[tuple[int, ...], int, int], _OverscanTile
+        ] = OrderedDict()
+        self._overscan_tile_cache_limit = 6
         self._lod_enabled = bool(getattr(self._config, "lod_enabled", True))
         self._lod_min_bin_multiple = max(
             1.0, float(getattr(self._config, "lod_min_bin_multiple", 2.0) or 2.0)
@@ -1744,9 +1780,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.refresh()
         self._manual_annotation_paths.clear()
         self._load_companion_annotations()
-        self._overscan_tile = None
-        self._overscan_inflight = None
-        self._current_tile_id = None
+        self._invalidate_overscan_tile_cache()
         self._init_overscan_worker()
         self._ensure_overscan_for_view()
         self._start_zarr_ingest()
@@ -1889,9 +1923,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._ensure_plot_rows(self.loader.n_channels)
         self._configure_plots()
         self._refresh_limits()
-        self._overscan_tile = None
-        self._overscan_inflight = None
-        self._current_tile_id = None
+        self._invalidate_overscan_tile_cache()
         self._init_overscan_worker()
         self._manual_annotation_paths.clear()
         self._invalidate_stage_curve_cache()
@@ -1906,6 +1938,7 @@ class MainWindow(QtWidgets.QMainWindow):
             old_loader.close()
 
     def _set_view(self, start: float, duration: float, *, sender: str | None = None):
+        old_duration = self._view_duration
         start_new, duration_new = clamp_window(
             start,
             duration,
@@ -1920,6 +1953,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._schedule_refresh()
             return
 
+        duration_changed = abs(duration_new - old_duration) >= 1e-6
         self._view_start = start_new
         self._view_duration = duration_new
         self._refresh_limits()
@@ -1932,6 +1966,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._view_start,
                 self._view_start + self._view_duration,
             )
+        if duration_changed:
+            self._invalidate_overscan_tile_cache()
         self._schedule_refresh()
         self._schedule_prefetch()
         self._ensure_overscan_for_view()
@@ -2146,6 +2182,42 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._request_overscan_tile(window_start, self._view_duration)
 
+    @staticmethod
+    def _cache_span_key(value: float) -> int:
+        return int(round(float(value) * 1_000_000))
+
+    def _tile_cache_key(
+        self, channels: tuple[int, ...], start: float, end: float
+    ) -> tuple[tuple[int, ...], int, int]:
+        return (channels, self._cache_span_key(start), self._cache_span_key(end))
+
+    def _get_cached_tile(
+        self, channels: tuple[int, ...], start: float, end: float
+    ) -> _OverscanTile | None:
+        key = self._tile_cache_key(channels, start, end)
+        tile = self._overscan_tile_cache.get(key)
+        if tile is not None:
+            self._overscan_tile_cache.move_to_end(key)
+        return tile
+
+    def _cache_tile(self, tile: _OverscanTile) -> None:
+        channels = tuple(tile.channel_indices)
+        if not channels:
+            return
+        key = self._tile_cache_key(channels, tile.start, tile.end)
+        self._overscan_tile_cache[key] = tile
+        self._overscan_tile_cache.move_to_end(key)
+        limit = max(1, int(self._overscan_tile_cache_limit or 0))
+        while len(self._overscan_tile_cache) > limit:
+            self._overscan_tile_cache.popitem(last=False)
+
+    def _invalidate_overscan_tile_cache(self) -> None:
+        self._overscan_tile_cache.clear()
+        self._overscan_tile = None
+        self._overscan_inflight = None
+        self._current_tile_id = None
+        self._overscan_request_id += 1
+
     def _request_overscan_tile(self, window_start: float, window_duration: float):
         if self._overscan_worker is None or self.loader.n_channels == 0:
             return
@@ -2153,10 +2225,26 @@ class MainWindow(QtWidgets.QMainWindow):
         start, end = self._compute_overscan_bounds(window_start, window_duration)
         if end <= start:
             return
+        channels = tuple(range(self.loader.n_channels))
+        cached_tile = self._get_cached_tile(channels, start, end)
+        req_id = self._overscan_request_id + 1
+        if cached_tile is not None:
+            self._overscan_request_id = req_id
+            self._overscan_inflight = None
+            cached_tile.request_id = req_id
+            cached_tile.is_final = True
+            self._overscan_tile = cached_tile
+            self._update_tile_view_metadata(cached_tile, window_start, window_duration)
+            self._current_tile_id = None
+            self._apply_tile_to_curves(cached_tile)
+            try:
+                self._schedule_refresh()
+            except AttributeError:
+                pass
+            return
         req_id = self._overscan_request_id + 1
         self._overscan_request_id = req_id
         self._overscan_inflight = req_id
-        channels = tuple(range(self.loader.n_channels))
         request = _OverscanRequest(
             request_id=req_id,
             start=start,
@@ -2206,6 +2294,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_tile_view_metadata(self._overscan_tile, self._view_start, self._view_duration)
         self._current_tile_id = None
         self._apply_tile_to_curves(tile_obj)
+        if is_final:
+            self._cache_tile(tile_obj)
         self._schedule_refresh()
 
     def _update_tile_view_metadata(
@@ -2981,15 +3071,57 @@ class MainWindow(QtWidgets.QMainWindow):
         pixels = self._estimate_pixels() or 0
         overscan_span = 2 * self._overscan_factor + 1
         budget = int(max(200, pixels * overscan_span * 2)) if pixels else 2000
-        same_budget = tile.pixel_budget == budget
-
-        if same_budget and tile.channel_data and tile.prepared_mask and all(tile.prepared_mask):
-            return False
-
+        want_vertices = self._use_gpu_canvas or self._gpu_autoswitch_enabled
         changed = False
+
+        cached_series = tile.prepared_for_budget(budget)
+        if cached_series is not None:
+            tile.channel_data = cached_series
+            tile.pixel_budget = budget
+            tile.prepared_mask = [True] * len(cached_series)
+            if want_vertices:
+                cached_vertices = tile.prepared_vertices(budget)
+                if cached_vertices is None or len(cached_vertices) != len(cached_series):
+                    cached_vertices = [
+                        self._make_vertex_payload(t_arr, x_arr)
+                        for (t_arr, x_arr) in cached_series
+                    ]
+                    tile.vertex_cache[int(budget)] = cached_vertices
+                    changed = True
+                tile.vertex_data = cached_vertices
+            else:
+                if tile.vertex_data:
+                    changed = True
+                tile.vertex_data = []
+            return changed
+
+        same_budget = tile.pixel_budget == budget
+        if same_budget and tile.channel_data and tile.prepared_mask and all(tile.prepared_mask):
+            if want_vertices:
+                if tile.vertex_data and len(tile.vertex_data) == len(tile.channel_data):
+                    tile.vertex_cache[int(budget)] = tile.vertex_data
+                else:
+                    vertices = [
+                        self._make_vertex_payload(t_arr, x_arr)
+                        for (t_arr, x_arr) in tile.channel_data
+                    ]
+                    tile.vertex_data = vertices
+                    tile.vertex_cache[int(budget)] = vertices
+                    changed = True
+            else:
+                if tile.vertex_data:
+                    changed = True
+                tile.vertex_data = []
+            tile.cache_prepared(
+                budget,
+                tile.channel_data,
+                tile.vertex_data if want_vertices else None,
+            )
+            tile.pixel_budget = budget
+            return changed
+
         prepared_series: list[tuple[np.ndarray, np.ndarray]] = []
         mask_len = len(tile.prepared_mask)
-        want_vertices = self._use_gpu_canvas or self._gpu_autoswitch_enabled
         existing_vertices = tile.vertex_data if tile.vertex_data else []
         vertex_series: list[np.ndarray] = []
 
@@ -3005,13 +3137,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
             needs_prepare = not same_budget or idx >= mask_len or not tile.prepared_mask[idx]
             if not needs_prepare and idx < len(tile.channel_data):
-                prepared_series.append(tile.channel_data[idx])
+                series = tile.channel_data[idx]
+                prepared_series.append(series)
                 if want_vertices:
                     if idx < len(existing_vertices):
                         vertex_series.append(existing_vertices[idx])
                     else:
-                        t_prev, x_prev = tile.channel_data[idx]
-                        vertex_series.append(self._make_vertex_payload(t_prev, x_prev))
+                        vertex_series.append(self._make_vertex_payload(*series))
+                        changed = True
                 continue
 
             t_slice, x_slice = slice_and_decimate(chunk, None, tile.start, tile.end, budget)
@@ -3031,8 +3164,15 @@ class MainWindow(QtWidgets.QMainWindow):
             tile.vertex_data = vertex_series
         else:
             tile.vertex_data = []
-        if not tile.prepared_mask and prepared_series:
+        if prepared_series:
             tile.prepared_mask = [True] * len(prepared_series)
+        else:
+            tile.prepared_mask = []
+        tile.cache_prepared(
+            budget,
+            prepared_series,
+            vertex_series if want_vertices else None,
+        )
         return changed
 
     def _apply_tile_to_curves(self, tile: _OverscanTile) -> None:
@@ -3649,6 +3789,8 @@ class MainWindow(QtWidgets.QMainWindow):
         sync_checkbox: bool,
         persist: bool,
     ) -> None:
+        prev_hidden = idx in self._hidden_channels
+        state_changed = False
         if self._use_gpu_canvas and self._gpu_canvas is not None:
             n = self.loader.n_channels
             if idx >= n:
@@ -3660,6 +3802,7 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 self._hidden_channels.add(idx)
                 self._gpu_canvas.clear_channel(idx)
+            state_changed = (idx in self._hidden_channels) != prev_hidden
             self._gpu_canvas.set_channel_visibility(idx, visible)
             self._gpu_canvas.set_channel_label(idx, self._format_label(meta, hidden=not visible))
             if sync_checkbox and idx < len(self.channel_checkboxes):
@@ -3670,6 +3813,8 @@ class MainWindow(QtWidgets.QMainWindow):
             if persist:
                 self._config.hidden_channels = tuple(sorted(self._hidden_channels))
                 self._config.save()
+                if state_changed:
+                    self._invalidate_overscan_tile_cache()
             return
         if idx >= len(self.plots):
             return
@@ -3694,6 +3839,7 @@ class MainWindow(QtWidgets.QMainWindow):
             plot.hide()
             self._hidden_channels.add(idx)
             curve.setData([], [])
+        state_changed = (idx in self._hidden_channels) != prev_hidden
 
         if meta is not None:
             label_item.setVisible(visible)
@@ -3708,6 +3854,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if persist:
             self._config.hidden_channels = tuple(sorted(self._hidden_channels))
             self._config.save()
+            if state_changed:
+                self._invalidate_overscan_tile_cache()
 
     def _attach_hover_overlay(self, plot: pg.PlotItem | None) -> None:
         if self._use_gpu_canvas:

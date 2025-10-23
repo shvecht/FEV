@@ -1,7 +1,11 @@
+from collections import OrderedDict
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
 try:
+    from ui import main_window as main_window_module
     from ui.main_window import _OverscanRequest, _OverscanTile, _OverscanWorker
 except ImportError as exc:  # pragma: no cover - optional dependency guard
     pytest.skip(f"Qt dependencies unavailable: {exc}", allow_module_level=True)
@@ -240,3 +244,149 @@ def test_choose_lod_duration_prefers_coarsest_available():
     assert choose_lod_duration(180.0, durations, ratio=2.0) == 30.0
     assert choose_lod_duration(12.0, durations, ratio=2.0) == 5.0
     assert choose_lod_duration(1.5, durations, ratio=2.0) is None
+
+
+def test_prepare_tile_uses_cached_series(monkeypatch):
+    window = main_window_module.MainWindow
+
+    class DummyWindow:
+        _overscan_factor = 2.0
+        _use_gpu_canvas = False
+        _gpu_autoswitch_enabled = False
+
+        def _estimate_pixels(self):
+            return 100
+
+    dummy = DummyWindow()
+
+    t = np.linspace(0.0, 10.0, 1000)
+    x = np.sin(t).astype(np.float32)
+    chunk = SignalChunk(t, x)
+
+    tile = _OverscanTile(
+        request_id=1,
+        start=0.0,
+        end=10.0,
+        view_start=0.0,
+        view_duration=10.0,
+        raw_channel_data=[chunk],
+        channel_data=[chunk.as_tuple()],
+        channel_indices=(0,),
+        prepared_mask=[False],
+        lod_durations=[None],
+        is_final=True,
+    )
+
+    call_counter = {"count": 0}
+    real_slice = main_window_module.slice_and_decimate
+
+    def counting_slice(*args, **kwargs):
+        call_counter["count"] += 1
+        return real_slice(*args, **kwargs)
+
+    monkeypatch.setattr(main_window_module, "slice_and_decimate", counting_slice)
+
+    changed_first = window._prepare_tile(dummy, tile)
+    assert changed_first is True
+    assert call_counter["count"] == 1
+    budget = tile.pixel_budget
+    assert budget is not None
+    assert budget in tile.prepared_cache
+
+    changed_second = window._prepare_tile(dummy, tile)
+    assert changed_second is False
+    assert call_counter["count"] == 1
+
+
+def test_request_tile_uses_lru_cache():
+    window_cls = main_window_module.MainWindow
+
+    class DummyLoader:
+        duration_s = 120.0
+        n_channels = 2
+        max_window_s = 120.0
+
+    class DummyWindow:
+        def __init__(self):
+            self.loader = DummyLoader()
+            self._overscan_worker = object()
+            self._overscan_factor = 2.0
+            self._overscan_tile = None
+            self._overscan_inflight = None
+            self._overscan_request_id = 0
+            self._current_tile_id = None
+            self._overscan_tile_cache: OrderedDict[
+                tuple[tuple[int, ...], int, int], _OverscanTile
+            ] = OrderedDict()
+            self._overscan_tile_cache_limit = 6
+            self._scheduled_refresh = False
+            self._applied_tiles: list[_OverscanTile] = []
+            self._view_start = 10.0
+            self._view_duration = 10.0
+            self.overscanRequested = SimpleNamespace(
+                calls=[], emit=lambda request: self.overscanRequested.calls.append(request)
+            )
+
+        def _estimate_pixels(self):
+            return 0
+
+        def _update_tile_view_metadata(self, tile, view_start, view_duration):
+            if tile is None:
+                return
+            tile.view_start = view_start
+            tile.view_duration = view_duration
+
+        def _apply_tile_to_curves(self, tile):
+            self._applied_tiles.append(tile)
+
+        def _schedule_refresh(self):
+            self._scheduled_refresh = True
+
+        def _compute_overscan_bounds(self, view_start, view_duration):
+            return window_cls._compute_overscan_bounds(self, view_start, view_duration)
+
+        def _tile_cache_key(self, channels, start, end):
+            return (
+                tuple(channels),
+                int(round(float(start) * 1_000_000)),
+                int(round(float(end) * 1_000_000)),
+            )
+
+        def _get_cached_tile(self, channels, start, end):
+            return window_cls._get_cached_tile(self, channels, start, end)
+
+    dummy = DummyWindow()
+    start, end = dummy._compute_overscan_bounds(dummy._view_start, dummy._view_duration)
+    channels = tuple(range(dummy.loader.n_channels))
+    raw_chunks = [
+        SignalChunk(np.zeros(0, dtype=np.float64), np.zeros(0, dtype=np.float32))
+        for _ in channels
+    ]
+    tile = _OverscanTile(
+        request_id=42,
+        start=start,
+        end=end,
+        view_start=dummy._view_start,
+        view_duration=dummy._view_duration,
+        raw_channel_data=raw_chunks,
+        channel_data=[chunk.as_tuple() for chunk in raw_chunks],
+        channel_indices=channels,
+        prepared_mask=[True] * len(raw_chunks),
+        lod_durations=[None] * len(raw_chunks),
+        is_final=True,
+    )
+    cache_key = dummy._tile_cache_key(channels, start, end)
+    dummy._overscan_tile_cache[cache_key] = tile
+
+    window_cls._request_overscan_tile(dummy, dummy._view_start, dummy._view_duration)
+
+    assert dummy.overscanRequested.calls == []
+    assert dummy._overscan_tile is tile
+    assert dummy._overscan_inflight is None
+    assert dummy._overscan_request_id == 1
+    assert tile.request_id == dummy._overscan_request_id
+    assert dummy._applied_tiles[-1] is tile
+    assert dummy._scheduled_refresh is True
+    assert tile.view_start == pytest.approx(dummy._view_start)
+    assert tile.view_duration == pytest.approx(dummy._view_duration)
+    assert list(dummy._overscan_tile_cache.values())[-1] is tile
