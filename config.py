@@ -114,6 +114,7 @@ class ViewerConfig:
                 )
                 cfg.lod_min_view_duration_s = lod_section.getfloat(
                     "min_view_duration_s", fallback=cfg.lod_min_view_duration_s
+                )
                 cfg.lod_envelope_ratio = lod_section.getfloat(
                     "envelope_ratio", fallback=cfg.lod_envelope_ratio
                 )

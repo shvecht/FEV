@@ -23,8 +23,14 @@ from ui.hover_utils import _sample_at_time
 from ui.gpu_canvas import VispyChannelCanvas
 from config import ViewerConfig
 from core.decimate import min_max_bins
-from core.overscan import envelope_to_series, select_lod_duration, slice_and_decimate
-from core.overscan import SignalChunk, slice_and_decimate, select_lod_duration
+from core.overscan import (
+    SignalChunk,
+    chunk_from_arrays,
+    envelope_to_series,
+    select_lod_duration,
+    slice_and_decimate,
+    choose_lod_duration,
+)
 from core.prefetch import prefetch_service
 from core.view_window import WindowLimits, clamp_window, pan_window, zoom_window
 from core.edf_loader import EdfLoader
@@ -106,10 +112,8 @@ class _OverscanTile:
     end: float
     view_start: float
     view_duration: float
-    raw_channel_data: list[Optional[tuple[np.ndarray, np.ndarray]]]
-    channel_data: list[tuple[np.ndarray, np.ndarray]]
     raw_channel_data: list[SignalChunk]
-    channel_data: list[SignalChunk]
+    channel_data: list[tuple[np.ndarray, np.ndarray]]
     max_samples: Optional[int]
     pixel_budget: Optional[int] = None
     prepared_mask: list[bool] = field(default_factory=list)
@@ -130,6 +134,7 @@ class _OverscanWorker(QtCore.QObject):
         lod_enabled: bool = True,
         lod_min_bin_multiple: float = 2.0,
         lod_min_view_duration: float | None = None,
+        lod_ratio: float | None = None,
     ):
         super().__init__()
         self._loader = loader
@@ -143,9 +148,6 @@ class _OverscanWorker(QtCore.QObject):
             except (TypeError, ValueError):
                 min_view = 0.0
             self._lod_min_view_duration = min_view if min_view > 0.0 else None
-    def __init__(self, loader, *, lod_ratio: float | None = None):
-        super().__init__()
-        self._loader = loader
         self._lod_ratio = float(lod_ratio or 0.0)
 
     @QtCore.Slot(object)
@@ -154,36 +156,20 @@ class _OverscanWorker(QtCore.QObject):
             return
         req: _OverscanRequest = request_obj
         try:
-            raw_payloads: list[Optional[tuple[np.ndarray, np.ndarray]]] = []
-            channel_payloads: list[tuple[np.ndarray, np.ndarray]] = []
-            prepared_mask: list[bool] = []
+            raw_chunks: list[SignalChunk] = []
+            payloads: list[tuple[np.ndarray, np.ndarray]] = []
             lod_durations: list[Optional[float]] = []
             for ch in req.channel_indices:
-                series, prepared, lod_duration = self._read_channel(
+                chunk, lod_duration = self._read_channel(
                     ch,
                     req.start,
                     req.end,
                     req.view_duration,
                     req.max_samples,
                 )
-                if prepared:
-                    raw_payloads.append(None)
-                else:
-                    raw_payloads.append(series)
-                channel_payloads.append(series)
-                prepared_mask.append(prepared)
+                raw_chunks.append(chunk)
+                payloads.append(chunk.as_tuple())
                 lod_durations.append(lod_duration)
-            data: list[SignalChunk] = []
-            for ch in req.channel_indices:
-                data.append(
-                    self._read_channel(
-                        ch,
-                        req.start,
-                        req.end,
-                        req.view_duration,
-                        req.max_samples,
-                    )
-                )
         except Exception as exc:  # pragma: no cover - worker error propagated to UI
             self.failed.emit(req.request_id, str(exc))
             return
@@ -194,10 +180,10 @@ class _OverscanWorker(QtCore.QObject):
             end=req.end,
             view_start=req.view_start,
             view_duration=req.view_duration,
-            raw_channel_data=raw_payloads,
-            channel_data=channel_payloads,
+            raw_channel_data=raw_chunks,
+            channel_data=payloads,
             max_samples=req.max_samples,
-            prepared_mask=prepared_mask,
+            prepared_mask=[False] * len(raw_chunks),
             lod_durations=lod_durations,
         )
         self.finished.emit(req.request_id, tile)
@@ -209,71 +195,19 @@ class _OverscanWorker(QtCore.QObject):
         end: float,
         view_duration: float,
         max_samples: Optional[int],
-    ) -> tuple[tuple[np.ndarray, np.ndarray], bool, Optional[float]]:
-        lod_duration: Optional[float] = None
-        if self._lod_enabled:
-            lod_duration = self._select_lod(channel, view_duration)
-            if lod_duration is not None:
-                envelope = self._read_lod_series(channel, start, end, lod_duration)
-                if envelope is not None:
-                    series, actual_duration = envelope
-                    return series, True, actual_duration
-
-        try:
-            if max_samples is not None:
-                data = self._loader.read(channel, start, end, max_samples=max_samples)
-            else:
-                data = self._loader.read(channel, start, end)
-        except TypeError:
-            data = self._loader.read(channel, start, end)
-        return data, False, None
-
-    def _select_lod(self, channel: int, view_duration: float) -> Optional[float]:
-        levels_fn = getattr(self._loader, "lod_levels", None)
-        if not callable(levels_fn):
-            return None
-        try:
-            levels = levels_fn(channel)
-        except Exception:
-            return None
-        if not levels:
-            return None
-        return select_lod_duration(
-            view_duration,
-            levels,
-            self._lod_min_bin_multiple,
-            min_view_duration=self._lod_min_view_duration,
-        )
-
-    def _read_lod_series(
-        self, channel: int, start: float, end: float, duration: float
-    ) -> Optional[tuple[np.ndarray, np.ndarray]]:
-        read_window = getattr(self._loader, "read_lod_window", None)
-        if not callable(read_window):
-            return None
-        try:
-            data, bin_duration, start_bin = read_window(channel, start, end, duration)
-        except Exception:
-            return None
-        if data.size == 0:
-            return None
-        mins = data[:, 0]
-        maxs = data[:, 1]
-        t, x = envelope_to_series(
-            mins,
-            maxs,
-            bin_duration=bin_duration,
-            start_bin=start_bin,
-            window_start=start,
-            window_end=end,
-        )
-        if t.size == 0 or x.size == 0:
-            return None
-        return (t, x), float(bin_duration)
-    ) -> SignalChunk:
+    ) -> tuple[SignalChunk, Optional[float]]:
         lod_chunk = self._try_read_lod(channel, start, end, view_duration)
         if lod_chunk is not None:
-            return lod_chunk
+            return lod_chunk, lod_chunk.lod_duration_s
+        return self._read_raw_channel(channel, start, end, max_samples), None
+
+    def _read_raw_channel(
+        self,
+        channel: int,
+        start: float,
+        end: float,
+        max_samples: Optional[int],
+    ) -> SignalChunk:
         try:
             if max_samples is not None:
                 result = self._loader.read(channel, start, end, max_samples=max_samples)
@@ -284,7 +218,16 @@ class _OverscanWorker(QtCore.QObject):
         if isinstance(result, SignalChunk):
             return result
         t_arr, x_arr = result
-        return SignalChunk(np.asarray(t_arr), np.asarray(x_arr, dtype=np.float32))
+        t_np = np.asarray(t_arr, dtype=np.float64)
+        x_np = np.asarray(x_arr, dtype=np.float32)
+        source_start = float(t_np[0]) if t_np.size else start
+        source_end = float(t_np[-1]) if t_np.size else end
+        return chunk_from_arrays(
+            t_np,
+            x_np,
+            source_start=source_start,
+            source_end=source_end,
+        )
 
     def _try_read_lod(
         self,
@@ -293,29 +236,100 @@ class _OverscanWorker(QtCore.QObject):
         end: float,
         view_duration: float,
     ) -> SignalChunk | None:
-        ratio = self._lod_ratio
-        if ratio <= 0:
+        if not self._lod_enabled:
             return None
-        durations_fn = getattr(self._loader, "lod_durations", None)
-        read_fn = getattr(self._loader, "read_lod_window", None)
-        if not callable(durations_fn) or not callable(read_fn):
+        lod_duration = self._select_lod(channel, view_duration)
+        if lod_duration is None:
             return None
-        try:
-            durations = durations_fn(channel)
-        except Exception:  # pragma: no cover - defensive
-            return None
+        return self._read_lod_chunk(channel, start, end, lod_duration)
+
+    def _select_lod(self, channel: int, view_duration: float) -> Optional[float]:
+        durations: Optional[Sequence[float]] = None
+        levels_fn = getattr(self._loader, "lod_levels", None)
+        if callable(levels_fn):
+            try:
+                levels = levels_fn(channel)
+            except Exception:
+                levels = None
+            if levels:
+                if isinstance(levels, dict):
+                    durations = tuple(float(k) for k in levels.keys())
+                else:
+                    durations = tuple(float(v) for v in levels)
+        if not durations:
+            durations_fn = getattr(self._loader, "lod_durations", None)
+            if callable(durations_fn):
+                try:
+                    durations = tuple(float(v) for v in durations_fn(channel))
+                except Exception:
+                    durations = None
         if not durations:
             return None
-        selected = select_lod_duration(view_duration, durations, ratio=ratio)
-        if selected is None:
+        min_view = self._lod_min_view_duration
+        if min_view is not None and view_duration < min_view:
+            return None
+        ratio = self._lod_ratio
+        if ratio > 0 and np.isfinite(ratio):
+            selected = choose_lod_duration(view_duration, durations, ratio=ratio)
+            if selected is not None:
+                return selected
+        return select_lod_duration(
+            view_duration,
+            durations,
+            self._lod_min_bin_multiple,
+            min_view_duration=self._lod_min_view_duration,
+        )
+
+    def _read_lod_chunk(
+        self,
+        channel: int,
+        start: float,
+        end: float,
+        duration: float,
+    ) -> SignalChunk | None:
+        read_window = getattr(self._loader, "read_lod_window", None)
+        if not callable(read_window):
             return None
         try:
-            chunk = read_fn(channel, start, end, selected)
+            result = read_window(channel, start, end, duration)
         except KeyError:
             return None
-        except Exception:  # pragma: no cover - defensive
+        except Exception:
             return None
-        return chunk if isinstance(chunk, SignalChunk) else None
+        if isinstance(result, SignalChunk):
+            chunk = result
+        else:
+            data, bin_duration, start_bin = result
+            if getattr(data, "size", 0) == 0:
+                return None
+            mins = np.asarray(data[:, 0], dtype=np.float32)
+            maxs = np.asarray(data[:, 1], dtype=np.float32)
+            t_vals, x_vals = envelope_to_series(
+                mins,
+                maxs,
+                bin_duration=float(bin_duration),
+                start_bin=int(start_bin),
+                window_start=start,
+                window_end=end,
+            )
+            if t_vals.size == 0:
+                return None
+            chunk = chunk_from_arrays(
+                np.asarray(t_vals, dtype=np.float64),
+                np.asarray(x_vals, dtype=np.float32),
+                lod_duration_s=float(bin_duration),
+                source_start=start,
+                source_end=end,
+            )
+        if chunk.lod_duration_s is None:
+            chunk = chunk_from_arrays(
+                np.asarray(chunk.t, dtype=np.float64),
+                np.asarray(chunk.x, dtype=np.float32),
+                lod_duration_s=float(duration),
+                source_start=chunk.source_start,
+                source_end=chunk.source_end,
+            )
+        return chunk
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -1155,14 +1169,14 @@ class MainWindow(QtWidgets.QMainWindow):
     def _init_overscan_worker(self):
         self._shutdown_overscan_worker()
         thread = QtCore.QThread(self)
+        lod_ratio = float(getattr(self._config, "lod_envelope_ratio", 0.0) or 0.0)
         worker = _OverscanWorker(
             self.loader,
             lod_enabled=self._lod_enabled,
             lod_min_bin_multiple=self._lod_min_bin_multiple,
             lod_min_view_duration=self._lod_min_view_duration,
+            lod_ratio=lod_ratio,
         )
-        lod_ratio = float(getattr(self._config, "lod_envelope_ratio", 0.0) or 0.0)
-        worker = _OverscanWorker(self.loader, lod_ratio=lod_ratio)
         worker.moveToThread(thread)
         worker.finished.connect(self._handle_overscan_finished)
         worker.failed.connect(self._handle_overscan_failed)
@@ -2576,48 +2590,43 @@ class MainWindow(QtWidgets.QMainWindow):
         pixels = self._estimate_pixels() or 0
         overscan_span = 2 * self._overscan_factor + 1
         budget = int(max(200, pixels * overscan_span * 2)) if pixels else 2000
-        if tile.pixel_budget == budget:
-            if all(
-                prepared or raw is None
-                for prepared, raw in zip(tile.prepared_mask, tile.raw_channel_data)
-            ):
-                return False
-        else:
-            for idx, raw in enumerate(tile.raw_channel_data):
-                if raw is not None:
-                    tile.prepared_mask[idx] = False
+        same_budget = tile.pixel_budget == budget
+
+        if same_budget and tile.channel_data and tile.prepared_mask and all(tile.prepared_mask):
+            return False
 
         changed = False
+        prepared_series: list[tuple[np.ndarray, np.ndarray]] = []
+        mask_len = len(tile.prepared_mask)
+
         for idx, raw in enumerate(tile.raw_channel_data):
-            if raw is None or tile.prepared_mask[idx]:
-                continue
-            t_arr, x_arr = raw
-            t_slice, x_slice = slice_and_decimate(t_arr, x_arr, tile.start, tile.end, budget)
-            tile.channel_data[idx] = (t_slice, x_slice)
-            tile.prepared_mask[idx] = True
-            changed = True
-        if tile.pixel_budget == budget and tile.channel_data:
-            return False
-        prepared: list[SignalChunk] = []
-        for series in tile.raw_channel_data:
-            if not isinstance(series, SignalChunk):
-                t_arr, x_arr = series
-                series = SignalChunk(
-                    np.asarray(t_arr),
+            chunk = raw
+            if not isinstance(chunk, SignalChunk):
+                t_arr, x_arr = raw
+                chunk = SignalChunk(
+                    np.asarray(t_arr, dtype=np.float64),
                     np.asarray(x_arr, dtype=np.float32),
                 )
-            if series.lod_duration_s is not None:
-                prepared.append(series.slice(tile.start, tile.end))
+                tile.raw_channel_data[idx] = chunk
+
+            needs_prepare = not same_budget or idx >= mask_len or not tile.prepared_mask[idx]
+            if not needs_prepare and idx < len(tile.channel_data):
+                prepared_series.append(tile.channel_data[idx])
                 continue
-            t_slice, x_slice = slice_and_decimate(series, None, tile.start, tile.end, budget)
-            prepared.append(
-                SignalChunk(
-                    np.asarray(t_slice),
-                    np.asarray(x_slice, dtype=np.float32),
-                )
-            )
-        tile.channel_data = prepared
+
+            t_slice, x_slice = slice_and_decimate(chunk, None, tile.start, tile.end, budget)
+            prepared_series.append((t_slice, x_slice))
+            if idx < mask_len:
+                tile.prepared_mask[idx] = True
+            else:
+                tile.prepared_mask.append(True)
+                mask_len += 1
+            changed = True
+
+        tile.channel_data = prepared_series
         tile.pixel_budget = budget
+        if not tile.prepared_mask and prepared_series:
+            tile.prepared_mask = [True] * len(prepared_series)
         return changed
 
     def _apply_tile_to_curves(self, tile: _OverscanTile) -> None:

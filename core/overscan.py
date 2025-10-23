@@ -9,14 +9,13 @@ import numpy as np
 from core.decimate import min_max_bins
 
 __all__ = [
+    "SignalChunk",
+    "chunk_from_arrays",
+    "chunk_from_envelope",
     "slice_and_decimate",
     "select_lod_duration",
     "envelope_to_series",
-    "SignalChunk",
-    "slice_and_decimate",
-    "chunk_from_arrays",
-    "chunk_from_envelope",
-    "select_lod_duration",
+    "choose_lod_duration",
 ]
 
 
@@ -278,6 +277,10 @@ def envelope_to_series(
             x_out[base + 1] = mn
 
     return t_out, x_out
+
+
+def choose_lod_duration(
+    view_duration: float,
     available: Iterable[float],
     *,
     ratio: float,

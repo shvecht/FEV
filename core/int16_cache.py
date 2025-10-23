@@ -17,6 +17,17 @@ Int16Array = NDArray[np.int16]
 
 @dataclass(frozen=True)
 class EnvelopeLevel:
+    duration_s: float
+    bin_size: int
+    data: NDArray[np.float32]
+
+    def slice(self, start: int, stop: int) -> NDArray[np.float32]:
+        start = max(0, int(start))
+        stop = max(start, int(stop))
+        return self.data[start:stop]
+
+
+@dataclass(frozen=True)
 class LODLevel:
     duration_s: float
     bin_size: int
@@ -46,7 +57,7 @@ class Int16Cache:
     calibration: Sequence[ChannelCalibration]
     channel_names: Optional[Sequence[str]] = None
     lod_envelopes: Optional[Sequence[Dict[float, EnvelopeLevel]]] = None
-    lod_levels: Optional[Sequence[Dict[float, LODLevel]]] = None
+    lod_level_maps: Optional[Sequence[Dict[float, LODLevel]]] = None
     _locks: List[threading.RLock] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -70,13 +81,13 @@ class Int16Cache:
                 raise ValueError("lod_envelopes length must match number of channels")
             lod = tuple(dict(levels) for levels in self.lod_envelopes)
         object.__setattr__(self, "lod_envelopes", lod)
-        if self.lod_levels is None:
+        if self.lod_level_maps is None:
             lod_levels = tuple({} for _ in range(channel_count))
         else:
-            if len(self.lod_levels) != channel_count:
-                raise ValueError("lod_levels length must match channels")
-            lod_levels = tuple(dict(levels) for levels in self.lod_levels)
-        object.__setattr__(self, "lod_levels", lod_levels)
+            if len(self.lod_level_maps) != channel_count:
+                raise ValueError("lod_level_maps length must match channels")
+            lod_levels = tuple(dict(levels) for levels in self.lod_level_maps)
+        object.__setattr__(self, "lod_level_maps", lod_levels)
         locks = [threading.RLock() for _ in range(channel_count)]
         object.__setattr__(self, "_locks", locks)
 
@@ -176,7 +187,7 @@ class Int16Cache:
     def _lod_dict(self, channel: int) -> Dict[float, LODLevel]:
         if not 0 <= channel < self.channel_count:
             raise IndexError("channel index out of range")
-        return self.lod_levels[channel]
+        return self.lod_level_maps[channel]
 
 
 def _digital_read_fn(reader: pyedflib.EdfReader) -> Callable[[int], NDArray[np.int64]]:
@@ -194,7 +205,6 @@ def build_int16_cache(
     prefer_memmap: bool,
     memmap_dir: Optional[Path],
     lod_durations: Sequence[float] | None = (1.0, 5.0, 30.0),
-    lod_durations: Sequence[float] = (1.0, 5.0, 30.0),
 ) -> Optional[Int16Cache]:
     if max_bytes <= 0:
         return None
@@ -209,10 +219,11 @@ def build_int16_cache(
 
     channels: List[Int16Array] = []
     calibration: List[ChannelCalibration] = []
-    lod_levels: List[Dict[float, EnvelopeLevel]] = []
-    lod_levels: List[Dict[float, LODLevel]] = []
+    lod_envelopes: List[Dict[float, EnvelopeLevel]] = []
+    lod_level_maps: List[Dict[float, LODLevel]] = []
     running_bytes = 0
     memmap_paths: List[Path] = []
+    durations = tuple(lod_durations) if lod_durations is not None else ()
 
     for ch in range(channel_count):
         expected_bytes = ns[ch] * np.dtype(np.int16).itemsize
@@ -265,18 +276,26 @@ def build_int16_cache(
             )
         )
 
-        lod_levels.append(
-            _compute_envelopes(
-                data,
-                sample_frequency,
-                slope,
-                offset,
-            _compute_lod_levels(
-                channels[-1],
-                calibration[-1],
-                lod_durations,
+        if durations:
+            lod_envelopes.append(
+                _compute_envelopes(
+                    data=data,
+                    fs=sample_frequency,
+                    slope=slope,
+                    offset=offset,
+                    lod_durations=durations,
+                )
             )
-        )
+            lod_level_maps.append(
+                _compute_lod_levels(
+                    data=channels[-1],
+                    calibration=calibration[-1],
+                    durations=durations,
+                )
+            )
+        else:
+            lod_envelopes.append({})
+            lod_level_maps.append({})
 
         running_bytes += expected_bytes
 
@@ -284,7 +303,8 @@ def build_int16_cache(
         channels=channels,
         calibration=calibration,
         channel_names=labels,
-        lod_envelopes=lod_levels,
+        lod_envelopes=lod_envelopes,
+        lod_level_maps=lod_level_maps,
     )
 
 
@@ -344,8 +364,6 @@ def _compute_envelopes(
 
 def _lod_key(duration: float) -> float:
     return round(float(duration), 9)
-        lod_levels=lod_levels,
-    )
 
 
 def _compute_lod_levels(

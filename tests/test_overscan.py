@@ -6,8 +6,13 @@ try:
 except ImportError as exc:  # pragma: no cover - optional dependency guard
     pytest.skip(f"Qt dependencies unavailable: {exc}", allow_module_level=True)
 
-from core.overscan import envelope_to_series, select_lod_duration, slice_and_decimate
-from core.overscan import SignalChunk, slice_and_decimate, select_lod_duration
+from core.overscan import (
+    SignalChunk,
+    choose_lod_duration,
+    envelope_to_series,
+    select_lod_duration,
+    slice_and_decimate,
+)
 
 
 def test_slice_and_decimate_basic():
@@ -104,9 +109,12 @@ def test_overscan_worker_prefers_lod(monkeypatch):
     worker.render(request)
     tile = captured["tile"]
     assert loader.calls and loader.calls[0][0] == "lod"
+    assert len(tile.raw_channel_data) == 1
+    assert isinstance(tile.raw_channel_data[0], SignalChunk)
+    assert tile.raw_channel_data[0].lod_duration_s == pytest.approx(10.0)
     assert tile.prepared_mask == [True]
-    assert tile.raw_channel_data == [None]
-    assert tile.channel_data[0][0].size > 0
+    t_arr, x_arr = tile.channel_data[0]
+    assert t_arr.size == x_arr.size > 0
 
 
 def test_overscan_worker_respects_min_view_duration(monkeypatch):
@@ -156,22 +164,77 @@ def test_overscan_worker_respects_min_view_duration(monkeypatch):
     worker.render(request)
     tile = captured["tile"]
     assert loader.calls and loader.calls[0][0] == "raw"
+    assert isinstance(tile.raw_channel_data[0], SignalChunk)
+    assert tile.raw_channel_data[0].lod_duration_s is None
     assert tile.prepared_mask == [True]
-    assert tile.raw_channel_data[0] is not None
     assert tile.lod_durations == [None]
+
+
+def test_overscan_worker_ratio_respects_min_view(monkeypatch):
+    class FakeLoader:
+        def __init__(self):
+            self.calls: list[tuple[str, float]] = []
+
+        def lod_levels(self, channel: int):
+            return [1.0, 5.0, 30.0]
+
+        def read_lod_window(self, channel: int, start: float, end: float, duration: float):
+            self.calls.append(("lod", duration))
+            bins = int(np.ceil((end - start) / duration))
+            data = np.empty((bins, 2), dtype=np.float32)
+            data[:, 0] = -1.0
+            data[:, 1] = 1.0
+            return data, duration, int(start // duration)
+
+        def read(self, channel: int, start: float, end: float, **_kwargs):
+            self.calls.append(("raw", end - start))
+            t = np.linspace(start, end, 100, endpoint=False)
+            return t, np.sin(t).astype(np.float32)
+
+    loader = FakeLoader()
+    worker = _OverscanWorker(
+        loader,
+        lod_enabled=True,
+        lod_min_bin_multiple=2.0,
+        lod_min_view_duration=200.0,
+        lod_ratio=2.0,
+    )
+    captured: dict[str, _OverscanTile] = {}
+
+    def capture(req_id, tile):
+        captured["tile"] = tile
+
+    worker.finished.emit = capture  # type: ignore[assignment]
+    worker.failed.emit = lambda *_args: None  # type: ignore[assignment]
+    request = _OverscanRequest(
+        request_id=3,
+        start=0.0,
+        end=60.0,
+        view_start=0.0,
+        view_duration=60.0,
+        channel_indices=(0,),
+        max_samples=None,
+    )
+    worker.render(request)
+    tile = captured["tile"]
+    assert loader.calls and loader.calls[0][0] == "raw"
+    assert isinstance(tile.raw_channel_data[0], SignalChunk)
+    assert tile.raw_channel_data[0].lod_duration_s is None
+    assert tile.lod_durations == [None]
+
+
 def test_slice_and_decimate_uses_pre_binned_chunk():
     t = np.linspace(0.0, 100.0, 50)
     x = np.linspace(-1.0, 1.0, 50, dtype=np.float32)
     chunk = SignalChunk(t, x, lod_duration_s=10.0)
-    # Passing a SignalChunk should bypass further decimation
     sub_t, sub_x = slice_and_decimate(chunk, None, 5.0, 45.0, pixels=10)
     assert sub_t[0] >= 5.0 - 1e-6
     assert sub_t[-1] <= 45.0 + 1e-6
     assert sub_t.size == sub_x.size
 
 
-def test_select_lod_duration_prefers_coarsest_available():
+def test_choose_lod_duration_prefers_coarsest_available():
     durations = [1.0, 5.0, 30.0]
-    assert select_lod_duration(180.0, durations, ratio=2.0) == 30.0
-    assert select_lod_duration(12.0, durations, ratio=2.0) == 5.0
-    assert select_lod_duration(1.5, durations, ratio=2.0) is None
+    assert choose_lod_duration(180.0, durations, ratio=2.0) == 30.0
+    assert choose_lod_duration(12.0, durations, ratio=2.0) == 5.0
+    assert choose_lod_duration(1.5, durations, ratio=2.0) is None

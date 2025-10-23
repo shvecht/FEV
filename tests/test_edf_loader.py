@@ -235,11 +235,12 @@ def test_lod_levels_available_after_cache_build():
         levels = loader.lod_levels(0)
         assert levels
         duration = levels[-1]
-        window, bin_duration, start_bin = loader.read_lod_window(0, 0.0, 5.0, duration)
-        assert bin_duration == pytest.approx(duration, rel=1e-6)
-        assert start_bin == 0
-        assert window.shape[1] == 2
-        assert np.isfinite(window).all()
+        chunk = loader.read_lod_window(0, 0.0, 5.0, duration)
+        assert chunk.lod_duration_s == pytest.approx(duration, rel=1e-6)
+        t, x = chunk
+        assert t.size == x.size
+        assert t.size > 0
+        assert np.isfinite(x).all()
     finally:
         loader.close()
 

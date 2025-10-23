@@ -298,9 +298,14 @@ def test_zarr_loader_exposes_lod_levels(tmp_path):
         np.testing.assert_allclose(mins, expected[:, 0], atol=1e-6)
         np.testing.assert_allclose(maxs, expected[:, 1], atol=1e-6)
         assert duration == pytest.approx(1.0)
-        window, bin_duration, start_bin = loader.read_lod_window(0, 0.0, 10.0, 1.0)
-        assert bin_duration == pytest.approx(1.0)
-        assert start_bin == 0
-        assert window.shape[1] == 2
+        chunk = loader.read_lod_window(0, 0.0, 10.0, 1.0)
+        assert chunk.lod_duration_s == pytest.approx(1.0)
+        t_series, x_series = chunk
+        assert t_series.size == x_series.size
+        assert t_series.size > 0
+        pairs = x_series.reshape(-1, 2)
+        expected_pairs = _expected_minmax(data, 100)
+        np.testing.assert_allclose(pairs[:, 0], expected_pairs[: pairs.shape[0], 0], atol=1e-5)
+        np.testing.assert_allclose(pairs[:, 1], expected_pairs[: pairs.shape[0], 1], atol=1e-5)
     finally:
         loader.close()

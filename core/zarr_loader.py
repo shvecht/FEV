@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
-import math
 
 import numpy as np
 import zarr
@@ -163,32 +162,6 @@ class ZarrLoader:
         start_time = bin_start * level.duration_s
         return chunk_from_envelope(start_time, level.duration_s, mins, maxs)
 
-    def read_lod_window(
-        self,
-        idx: int,
-        t0: float,
-        t1: float,
-        duration_s: float,
-    ) -> Tuple[np.ndarray, float, int]:
-        levels = self._lod_levels.get(idx)
-        if not levels:
-            raise KeyError(f"no LOD levels for channel {idx}")
-        key = self._lod_key(duration_s)
-        if key not in levels:
-            available = ", ".join(str(v) for v in sorted(levels.keys()))
-            raise KeyError(f"LOD duration {duration_s} not found for channel {idx}; available: {available}")
-        dataset = levels[key]
-        bin_duration = float(dataset.attrs.get("bin_duration_s", duration_s))
-        if bin_duration <= 0:
-            raise ValueError("LOD bin duration must be positive")
-        total_bins = dataset.shape[0]
-        start_bin = max(0, int(math.floor(t0 / bin_duration)))
-        end_bin = int(math.ceil(t1 / bin_duration))
-        if end_bin <= start_bin:
-            return dataset[:0], bin_duration, start_bin
-        start_bin = min(start_bin, total_bins)
-        end_bin = min(max(start_bin, end_bin), total_bins)
-        return dataset[start_bin:end_bin], bin_duration, start_bin
 
     def close(self):
         pass
