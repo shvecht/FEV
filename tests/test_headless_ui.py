@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -40,10 +41,16 @@ def qt_app():
 @dataclass
 class _DummyPrefetchCache:
     fetch: Callable[[int, float, float], tuple[np.ndarray, np.ndarray]]
-    requests: list[tuple[int, float, float]]
+    preview_fetch: Callable[[int, float, float], tuple[np.ndarray, np.ndarray]] | None
+    requests: list[tuple[str, int, float, float]]
 
-    def __init__(self, fetch: Callable[[int, float, float], tuple[np.ndarray, np.ndarray]]):
+    def __init__(
+        self,
+        fetch: Callable[[int, float, float], tuple[np.ndarray, np.ndarray]],
+        preview_fetch: Callable[[int, float, float], tuple[np.ndarray, np.ndarray]] | None,
+    ):
         self.fetch = fetch
+        self.preview_fetch = preview_fetch
         self.requests = []
 
     def start(self) -> None:  # pragma: no cover - interface compatibility
@@ -56,7 +63,9 @@ class _DummyPrefetchCache:
         self.requests.clear()
 
     def prefetch_window(self, channel: int, start: float, duration: float) -> None:
-        self.requests.append((channel, start, duration))
+        if self.preview_fetch is not None:
+            self.requests.append(("preview", channel, start, duration))
+        self.requests.append(("final", channel, start, duration))
 
 
 class _DummyPrefetchService:
@@ -76,9 +85,12 @@ class _DummyPrefetchService:
         self.last_config = (tile_duration, max_tiles, max_mb)
 
     def create_cache(
-        self, fetch: Callable[[int, float, float], tuple[np.ndarray, np.ndarray]]
+        self,
+        fetch: Callable[[int, float, float], tuple[np.ndarray, np.ndarray]],
+        *,
+        preview_fetch: Callable[[int, float, float], tuple[np.ndarray, np.ndarray]] | None = None,
     ) -> _DummyPrefetchCache:
-        cache = _DummyPrefetchCache(fetch)
+        cache = _DummyPrefetchCache(fetch, preview_fetch)
         self.last_cache = cache
         return cache
 
@@ -229,5 +241,84 @@ def test_main_window_headless_smoke(qt_app, monkeypatch, tmp_path):
 
     assert refresh_durations and max(refresh_durations) < 1.0
 
+    window.close()
+    _process_events(qt_app)
+
+
+def test_main_window_overscan_preview_then_final(qt_app, monkeypatch):
+    from ui import main_window as mw
+
+    dummy_service = _DummyPrefetchService()
+    monkeypatch.setattr(mw, "prefetch_service", dummy_service)
+
+    class PreviewLoader(FakeHeadlessLoader):
+        def __init__(self):
+            super().__init__(duration_s=60.0, base_fs=60.0, n_channels=1)
+
+        def lod_levels(self, channel: int):
+            return [1.0, 8.0]
+
+        def read_lod_window(self, channel: int, start: float, end: float, duration: float):
+            bins = int(np.ceil((end - start) / duration))
+            data = np.empty((bins, 2), dtype=np.float32)
+            data[:, 0] = -0.25
+            data[:, 1] = 0.25
+            return data, duration, int(start // duration)
+
+        def read(self, channel: int, start: float, end: float, **kwargs):
+            # Simulate heavier raw reads so previews arrive first.
+            time.sleep(0.05)
+            return super().read(channel, start, end, **kwargs)
+
+    loader = PreviewLoader()
+    config = ViewerConfig(
+        prefetch_tile_s=1.0,
+        prefetch_max_tiles=2,
+        prefetch_max_mb=1.0,
+        controls_collapsed=False,
+        canvas_backend="pyqtgraph",
+        lod_enabled=True,
+        lod_min_bin_multiple=2.0,
+        lod_min_view_duration_s=0.0,
+    )
+
+    window = mw.MainWindow(loader, config=config)
+    window.show()
+
+    stages: dict[int, list[bool]] = {}
+    sample_counts: dict[int, list[int]] = {}
+
+    def capture(request_id: int, tile):
+        stages.setdefault(request_id, []).append(bool(getattr(tile, "is_final", True)))
+        if tile.channel_data:
+            count = int(tile.channel_data[0][0].size)
+        else:
+            count = 0
+        sample_counts.setdefault(request_id, []).append(count)
+
+    window._overscan_worker.finished.connect(capture)  # type: ignore[arg-type]
+
+    timer = QtCore.QElapsedTimer()
+    timer.start()
+    matched_id: int | None = None
+
+    while timer.elapsed() < 4000:
+        _process_events(qt_app)
+        for req_id, seen in stages.items():
+            if any(not flag for flag in seen) and any(flag for flag in seen):
+                matched_id = req_id
+                break
+        if matched_id is not None:
+            break
+    assert matched_id is not None, "Timed out waiting for preview and final overscan tiles"
+
+    seen_stages = stages[matched_id]
+    assert seen_stages[0] is False, "Preview should arrive before refinement"
+    assert seen_stages[-1] is True
+    counts = sample_counts[matched_id]
+    assert counts and counts[-1] >= counts[0]
+
+    window._overscan_worker.finished.disconnect(capture)  # type: ignore[arg-type]
+    window._shutdown_overscan_worker()
     window.close()
     _process_events(qt_app)

@@ -30,6 +30,36 @@ def test_prefetch_enqueue_and_worker():
         cache.stop()
 
 
+def test_prefetch_preview_runs_before_final():
+    calls: list[tuple[str, float, float]] = []
+
+    def preview_fetch(channel: int, start: float, end: float):
+        calls.append(("preview", start, end))
+        t = np.linspace(start, end, num=4, endpoint=False)
+        x = np.full_like(t, fill_value=-1)
+        return t, x
+
+    def final_fetch(channel: int, start: float, end: float):
+        calls.append(("final", start, end))
+        return fake_fetch(channel, start, end)
+
+    cache = PrefetchCache(
+        final_fetch,
+        PrefetchConfig(tile_duration=1.0, max_tiles=4),
+        preview_fetch=preview_fetch,
+    )
+    cache.start()
+    try:
+        cache.prefetch_window(0, 0.0, 2.0)
+        time.sleep(0.3)
+    finally:
+        cache.stop()
+
+    assert calls, "prefetch should invoke preview and final stages"
+    assert calls[0][0] == "preview"
+    assert any(stage == "final" for stage, *_ in calls)
+
+
 def test_prefetch_service_configures_caches():
     service = PrefetchService()
     service.configure(tile_duration=2.0, max_tiles=5, max_mb=1.0)
