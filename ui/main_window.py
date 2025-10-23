@@ -22,7 +22,7 @@ from ui.hover_utils import _sample_at_time
 from ui.gpu_canvas import VispyChannelCanvas
 from config import ViewerConfig
 from core.decimate import min_max_bins
-from core.overscan import slice_and_decimate
+from core.overscan import SignalChunk, slice_and_decimate, select_lod_duration
 from core.prefetch import prefetch_service
 from core.view_window import WindowLimits, clamp_window, pan_window, zoom_window
 from core.edf_loader import EdfLoader
@@ -104,8 +104,8 @@ class _OverscanTile:
     end: float
     view_start: float
     view_duration: float
-    raw_channel_data: list[tuple[np.ndarray, np.ndarray]]
-    channel_data: list[tuple[np.ndarray, np.ndarray]]
+    raw_channel_data: list[SignalChunk]
+    channel_data: list[SignalChunk]
     max_samples: Optional[int]
     pixel_budget: Optional[int] = None
 
@@ -117,9 +117,10 @@ class _OverscanWorker(QtCore.QObject):
     finished = QtCore.Signal(int, object)
     failed = QtCore.Signal(int, str)
 
-    def __init__(self, loader):
+    def __init__(self, loader, *, lod_ratio: float | None = None):
         super().__init__()
         self._loader = loader
+        self._lod_ratio = float(lod_ratio or 0.0)
 
     @QtCore.Slot(object)
     def render(self, request_obj):
@@ -127,9 +128,17 @@ class _OverscanWorker(QtCore.QObject):
             return
         req: _OverscanRequest = request_obj
         try:
-            data: list[tuple[np.ndarray, np.ndarray]] = []
+            data: list[SignalChunk] = []
             for ch in req.channel_indices:
-                data.append(self._read_channel(ch, req.start, req.end, req.max_samples))
+                data.append(
+                    self._read_channel(
+                        ch,
+                        req.start,
+                        req.end,
+                        req.view_duration,
+                        req.max_samples,
+                    )
+                )
         except Exception as exc:  # pragma: no cover - worker error propagated to UI
             self.failed.emit(req.request_id, str(exc))
             return
@@ -146,13 +155,59 @@ class _OverscanWorker(QtCore.QObject):
         )
         self.finished.emit(req.request_id, tile)
 
-    def _read_channel(self, channel: int, start: float, end: float, max_samples: Optional[int]):
+    def _read_channel(
+        self,
+        channel: int,
+        start: float,
+        end: float,
+        view_duration: float,
+        max_samples: Optional[int],
+    ) -> SignalChunk:
+        lod_chunk = self._try_read_lod(channel, start, end, view_duration)
+        if lod_chunk is not None:
+            return lod_chunk
         try:
             if max_samples is not None:
-                return self._loader.read(channel, start, end, max_samples=max_samples)
+                result = self._loader.read(channel, start, end, max_samples=max_samples)
+            else:
+                result = self._loader.read(channel, start, end)
         except TypeError:
-            pass
-        return self._loader.read(channel, start, end)
+            result = self._loader.read(channel, start, end)
+        if isinstance(result, SignalChunk):
+            return result
+        t_arr, x_arr = result
+        return SignalChunk(np.asarray(t_arr), np.asarray(x_arr, dtype=np.float32))
+
+    def _try_read_lod(
+        self,
+        channel: int,
+        start: float,
+        end: float,
+        view_duration: float,
+    ) -> SignalChunk | None:
+        ratio = self._lod_ratio
+        if ratio <= 0:
+            return None
+        durations_fn = getattr(self._loader, "lod_durations", None)
+        read_fn = getattr(self._loader, "read_lod_window", None)
+        if not callable(durations_fn) or not callable(read_fn):
+            return None
+        try:
+            durations = durations_fn(channel)
+        except Exception:  # pragma: no cover - defensive
+            return None
+        if not durations:
+            return None
+        selected = select_lod_duration(view_duration, durations, ratio=ratio)
+        if selected is None:
+            return None
+        try:
+            chunk = read_fn(channel, start, end, selected)
+        except KeyError:
+            return None
+        except Exception:  # pragma: no cover - defensive
+            return None
+        return chunk if isinstance(chunk, SignalChunk) else None
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -981,7 +1036,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _init_overscan_worker(self):
         self._shutdown_overscan_worker()
         thread = QtCore.QThread(self)
-        worker = _OverscanWorker(self.loader)
+        lod_ratio = float(getattr(self._config, "lod_envelope_ratio", 0.0) or 0.0)
+        worker = _OverscanWorker(self.loader, lod_ratio=lod_ratio)
         worker.moveToThread(thread)
         worker.finished.connect(self._handle_overscan_finished)
         worker.failed.connect(self._handle_overscan_failed)
@@ -1498,7 +1554,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def _fetch_tile(self, channel: int, start: float, end: float):
         loader = self.loader
         start, duration = clamp_window(start, end - start, total=loader.duration_s, limits=self._limits)
-        return loader.read(channel, start, start + duration)
+        result = loader.read(channel, start, start + duration)
+        if isinstance(result, SignalChunk):
+            return result.as_tuple()
+        return result
 
     def _ensure_overscan_for_view(self):
         if self._overscan_worker is None or self.loader.n_channels == 0:
@@ -2351,10 +2410,24 @@ class MainWindow(QtWidgets.QMainWindow):
         budget = int(max(200, pixels * overscan_span * 2)) if pixels else 2000
         if tile.pixel_budget == budget and tile.channel_data:
             return False
-        prepared: list[tuple[np.ndarray, np.ndarray]] = []
-        for t_arr, x_arr in tile.raw_channel_data:
-            t_slice, x_slice = slice_and_decimate(t_arr, x_arr, tile.start, tile.end, budget)
-            prepared.append((t_slice, x_slice))
+        prepared: list[SignalChunk] = []
+        for series in tile.raw_channel_data:
+            if not isinstance(series, SignalChunk):
+                t_arr, x_arr = series
+                series = SignalChunk(
+                    np.asarray(t_arr),
+                    np.asarray(x_arr, dtype=np.float32),
+                )
+            if series.lod_duration_s is not None:
+                prepared.append(series.slice(tile.start, tile.end))
+                continue
+            t_slice, x_slice = slice_and_decimate(series, None, tile.start, tile.end, budget)
+            prepared.append(
+                SignalChunk(
+                    np.asarray(t_slice),
+                    np.asarray(x_slice, dtype=np.float32),
+                )
+            )
         tile.channel_data = prepared
         tile.pixel_budget = budget
         return True
@@ -2362,14 +2435,16 @@ class MainWindow(QtWidgets.QMainWindow):
     def _apply_tile_to_curves(self, tile: _OverscanTile) -> None:
         self._prepare_tile(tile)
         if self._use_gpu_canvas and self._gpu_canvas is not None:
-            for idx, (t_arr, x_arr) in enumerate(tile.channel_data):
+            for idx, series in enumerate(tile.channel_data):
+                t_arr, x_arr = series
                 if idx in self._hidden_channels:
                     self._gpu_canvas.clear_channel(idx)
                     continue
                 self._gpu_canvas.set_channel_data(idx, t_arr, x_arr)
             self._current_tile_id = tile.request_id
             return
-        for idx, (t_arr, x_arr) in enumerate(tile.channel_data):
+        for idx, series in enumerate(tile.channel_data):
+            t_arr, x_arr = series
             if idx < len(self.curves):
                 if idx in self._hidden_channels:
                     self.curves[idx].setData([], [])

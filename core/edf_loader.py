@@ -9,6 +9,7 @@ import pyedflib
 from core.int16_cache import Int16Cache, build_int16_cache as _build_int16_cache
 from core.timebase import Timebase
 from core import annotations as annotations_core
+from core.overscan import SignalChunk, chunk_from_arrays, chunk_from_envelope
 
 @dataclass
 class ChannelInfo:
@@ -101,7 +102,7 @@ class EdfLoader:
             self._scratch_float32.clear()
             return True
 
-    def read(self, i: int, t0: float, t1: float):
+    def read(self, i: int, t0: float, t1: float) -> SignalChunk:
         raw_idx = self._channel_map[i]
         fs = self._fs[i]
         with self._lock:
@@ -110,10 +111,14 @@ class EdfLoader:
             s0, n = Timebase.sec_to_idx(t0_c, t1_c, fs)
             total = self._ns[i]
             if s0 >= total:
-                return np.zeros(0, dtype=float), np.zeros(0, dtype=np.float32)
+                empty_t = np.zeros(0, dtype=float)
+                empty_x = np.zeros(0, dtype=np.float32)
+                return chunk_from_arrays(empty_t, empty_x)
             n = min(n, max(0, total - s0))
             if n <= 0:
-                return np.zeros(0, dtype=float), np.zeros(0, dtype=np.float32)
+                empty_t = np.zeros(0, dtype=float)
+                empty_x = np.zeros(0, dtype=np.float32)
+                return chunk_from_arrays(empty_t, empty_x)
             cache = self._cache
             if cache is not None:
                 scratch = self._scratch_float32.get(i)
@@ -125,7 +130,49 @@ class EdfLoader:
             else:
                 x = self._r.readSignal(raw_idx, start=s0, n=n).astype(np.float32)
         t = Timebase.time_vector(s0, x.size, fs)
-        return t, x
+        source_end = float(t[-1]) if t.size else t0_c
+        return chunk_from_arrays(
+            t,
+            x,
+            source_start=float(t[0]) if t.size else t0_c,
+            source_end=source_end,
+        )
+
+    # ------------------------------------------------------------------
+
+    def lod_durations(self, i: int) -> tuple[float, ...]:
+        cache = self._cache
+        if cache is None:
+            return ()
+        raw_idx = self._channel_map[i]
+        return cache.lod_durations(raw_idx)
+
+    def read_lod_window(self, i: int, t0: float, t1: float, duration_s: float) -> SignalChunk:
+        cache = self._cache
+        if cache is None:
+            raise KeyError("LOD data unavailable; build_int16_cache first")
+        raw_idx = self._channel_map[i]
+        fs = self._fs[i]
+        with self._lock:
+            t0_c, t1_c = self.timebase.clamp_window(t0, t1)
+            t1_c = min(t0_c + self.max_window_s, t1_c)
+            s0, n = Timebase.sec_to_idx(t0_c, t1_c, fs)
+            total = self._ns[i]
+            if s0 >= total or n <= 0:
+                empty = np.zeros(0, dtype=np.float32)
+                return chunk_from_arrays(np.zeros(0, dtype=np.float64), empty)
+            s1 = min(total, s0 + n)
+            level = cache.lod_level(raw_idx, duration_s)
+            bin_size = level.bin_size
+            bin_start = max(0, s0 // bin_size)
+            bin_stop = min(level.data.shape[0], int(np.ceil(s1 / bin_size)))
+            if bin_stop <= bin_start:
+                empty = np.zeros(0, dtype=np.float32)
+                return chunk_from_arrays(np.zeros(0, dtype=np.float64), empty, lod_duration_s=level.duration_s)
+            mins = level.data[bin_start:bin_stop, 0]
+            maxs = level.data[bin_start:bin_stop, 1]
+            start_time = bin_start * level.duration_s
+            return chunk_from_envelope(start_time, level.duration_s, mins, maxs)
 
     def annotations(self) -> annotations_core.Annotations:
         with self._lock:

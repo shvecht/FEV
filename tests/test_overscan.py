@@ -1,5 +1,5 @@
 import numpy as np
-from core.overscan import slice_and_decimate
+from core.overscan import SignalChunk, slice_and_decimate, select_lod_duration
 
 
 def test_slice_and_decimate_basic():
@@ -25,3 +25,21 @@ def test_slice_and_decimate_respects_pixel_budget():
     sub_t, sub_x = slice_and_decimate(t, x, 0.2, 0.8, pixels=100)
     assert sub_t.size <= 200
     assert sub_t.size == sub_x.size
+
+
+def test_slice_and_decimate_uses_pre_binned_chunk():
+    t = np.linspace(0.0, 100.0, 50)
+    x = np.linspace(-1.0, 1.0, 50, dtype=np.float32)
+    chunk = SignalChunk(t, x, lod_duration_s=10.0)
+    # Passing a SignalChunk should bypass further decimation
+    sub_t, sub_x = slice_and_decimate(chunk, None, 5.0, 45.0, pixels=10)
+    assert sub_t[0] >= 5.0 - 1e-6
+    assert sub_t[-1] <= 45.0 + 1e-6
+    assert sub_t.size == sub_x.size
+
+
+def test_select_lod_duration_prefers_coarsest_available():
+    durations = [1.0, 5.0, 30.0]
+    assert select_lod_duration(180.0, durations, ratio=2.0) == 30.0
+    assert select_lod_duration(12.0, durations, ratio=2.0) == 5.0
+    assert select_lod_duration(1.5, durations, ratio=2.0) is None
