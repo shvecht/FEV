@@ -6,6 +6,8 @@ import logging
 from dataclasses import dataclass
 from typing import Sequence
 
+import contextlib
+
 import numpy as np
 from PySide6 import QtCore, QtWidgets
 
@@ -29,6 +31,18 @@ class _ChannelState:
     x: np.ndarray
 
 
+@dataclass(frozen=True, slots=True)
+class VispyCapability:
+    """Result of probing VisPy/OpenGL readiness."""
+
+    available: bool
+    reason: str | None = None
+    vertex_budget: int = 0
+    vendor: str | None = None
+    renderer: str | None = None
+    backend: str | None = None
+
+
 class VispyChannelCanvas(QtWidgets.QWidget):
     """Stacked multichannel canvas rendered via VisPy.
 
@@ -40,6 +54,74 @@ class VispyChannelCanvas(QtWidgets.QWidget):
 
     hoverMoved = QtCore.Signal(float, float, int)
     hoverExited = QtCore.Signal()
+
+    DEFAULT_VERTEX_BUDGET = 900_000
+
+    @classmethod
+    def capability_probe(cls) -> VispyCapability:
+        """Attempt to create a minimal canvas to gauge readiness."""
+
+        if _vispy_app is None or scene is None:
+            return VispyCapability(False, reason="VisPy import failed")
+
+        try:
+            _vispy_app.use_app("pyside6")
+        except RuntimeError:
+            # Already initialised – safe to ignore.
+            pass
+
+        try:
+            canvas = scene.SceneCanvas(show=False, size=(4, 4), bgcolor="#000000")
+        except Exception as exc:  # pragma: no cover - headless or driver issues
+            LOG.debug("VisPy capability probe failed to create canvas: %s", exc)
+            return VispyCapability(False, reason=str(exc))
+
+        try:
+            context = getattr(canvas, "context", None)
+            info_dict = {}
+            backend = renderer = vendor = None
+            if context is not None:
+                info_dict = getattr(context, "gl_info", {}) or {}
+                if isinstance(info_dict, dict):
+                    backend = info_dict.get("backend")
+                    renderer = info_dict.get("renderer")
+                    vendor = info_dict.get("vendor")
+
+            vertex_budget = 0
+            shared = getattr(context, "shared", None)
+            limits_dict = None
+            if shared is not None:
+                parser = getattr(shared, "parser", None)
+                limits_dict = getattr(parser, "_limits", None)
+            if isinstance(limits_dict, dict):
+                for key in (
+                    "max_elements_vertices",
+                    "max_vertices",
+                    "GL_MAX_ELEMENTS_VERTICES",
+                    "GL_MAX_ELEMENTS_INDICES",
+                ):
+                    value = limits_dict.get(key)
+                    if isinstance(value, (int, float)) and value > 0:
+                        vertex_budget = int(value)
+                        break
+
+            if not vertex_budget:
+                vertex_budget = cls.DEFAULT_VERTEX_BUDGET
+
+            return VispyCapability(
+                True,
+                reason=None,
+                vertex_budget=int(vertex_budget),
+                vendor=vendor,
+                renderer=renderer,
+                backend=backend,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            LOG.debug("VisPy capability probe failed: %s", exc)
+            return VispyCapability(False, reason=str(exc))
+        finally:
+            with contextlib.suppress(Exception):
+                canvas.close()
 
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
@@ -182,12 +264,12 @@ class VispyChannelCanvas(QtWidgets.QWidget):
         if idx >= len(self._lines):
             return
         if t.size == 0 or x.size == 0:
-            self._lines[idx].set_data(pos=np.zeros((0, 2), dtype=np.float32))
+            self._lines[idx].set_data(pos=self._empty_vertices())
             if idx < len(self._channel_states):
                 self._channel_states[idx] = _ChannelState(t=np.array([]), x=np.array([]))
             return
 
-        pos = np.column_stack((t.astype(np.float32), x.astype(np.float32)))
+        pos = self._prepare_vertices(t, x)
         if idx < len(self._channel_colors):
             color = self._channel_colors[idx]
         else:
@@ -201,10 +283,51 @@ class VispyChannelCanvas(QtWidgets.QWidget):
             self._channel_states.append(state)
         self._update_channel_range(idx, state)
 
+    def apply_tile_data(
+        self,
+        tile_id: int,
+        series: Sequence[tuple[np.ndarray, np.ndarray]],
+        vertices: Sequence[np.ndarray],
+        hidden_indices: set[int],
+        *,
+        final: bool,
+    ) -> None:
+        del tile_id  # reserved for future use
+
+        limit = min(len(series), len(self._lines))
+        for idx in range(limit):
+            hidden = idx in hidden_indices
+            if idx < len(self._channel_visible) and not self._channel_visible[idx]:
+                hidden = True
+            if hidden:
+                self.clear_channel(idx)
+                continue
+
+            t_arr, x_arr = series[idx]
+            vertex = vertices[idx] if idx < len(vertices) else None
+            if vertex is None:
+                vertex = self._prepare_vertices(t_arr, x_arr)
+
+            if not final and vertex.size == 0:
+                continue
+
+            color = self._channel_colors[idx] if idx < len(self._channel_colors) else Color("#66aaff")
+            self._lines[idx].set_data(pos=vertex, color=color, width=1.2)
+
+            state = _ChannelState(t=t_arr.copy(), x=x_arr.copy())
+            if idx < len(self._channel_states):
+                self._channel_states[idx] = state
+            else:
+                self._channel_states.append(state)
+            self._update_channel_range(idx, state)
+
+        for idx in range(limit, len(self._lines)):
+            self.clear_channel(idx)
+
     def clear_channel(self, idx: int) -> None:
         if idx >= len(self._lines):
             return
-        self._lines[idx].set_data(pos=np.zeros((0, 2), dtype=np.float32))
+        self._lines[idx].set_data(pos=self._empty_vertices())
         if idx < len(self._channel_states):
             self._channel_states[idx] = _ChannelState(t=np.array([]), x=np.array([]))
 
@@ -389,4 +512,17 @@ class VispyChannelCanvas(QtWidgets.QWidget):
         alpha = (t_val - t0) / (t1 - t0)
         value = x0 + alpha * (x1 - x0)
         return float(t_val), float(value)
+
+    @staticmethod
+    def _prepare_vertices(t: np.ndarray, x: np.ndarray) -> np.ndarray:
+        if t.size == 0 or x.size == 0:
+            return VispyChannelCanvas._empty_vertices()
+        pos = np.empty((t.size, 2), dtype=np.float32)
+        pos[:, 0] = np.asarray(t, dtype=np.float32)
+        pos[:, 1] = np.asarray(x, dtype=np.float32)
+        return pos
+
+    @staticmethod
+    def _empty_vertices() -> np.ndarray:
+        return np.zeros((0, 2), dtype=np.float32)
 
