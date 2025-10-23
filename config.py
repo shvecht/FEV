@@ -22,6 +22,9 @@ class ViewerConfig:
     annotation_focus_only: bool = False
     theme: str = "Midnight"
     canvas_backend: str = "pyqtgraph"
+    lod_enabled: bool = True
+    lod_min_bin_multiple: float = 2.0
+    lod_min_view_duration_s: float = 240.0
     ini_path: Path | None = None
 
     @classmethod
@@ -103,6 +106,14 @@ class ViewerConfig:
                 )
             lod_section = parser["lod"] if "lod" in parser else None
             if lod_section:
+                cfg.lod_enabled = lod_section.getboolean(
+                    "enabled", fallback=cfg.lod_enabled
+                )
+                cfg.lod_min_bin_multiple = lod_section.getfloat(
+                    "min_bin_multiple", fallback=cfg.lod_min_bin_multiple
+                )
+                cfg.lod_min_view_duration_s = lod_section.getfloat(
+                    "min_view_duration_s", fallback=cfg.lod_min_view_duration_s
                 cfg.lod_envelope_ratio = lod_section.getfloat(
                     "envelope_ratio", fallback=cfg.lod_envelope_ratio
                 )
@@ -146,6 +157,9 @@ class ViewerConfig:
             "memmap": "true" if self.int16_cache_memmap else "false",
         }
         parser["lod"] = {
+            "enabled": "true" if self.lod_enabled else "false",
+            "min_bin_multiple": f"{self.lod_min_bin_multiple:.3f}",
+            "min_view_duration_s": f"{self.lod_min_view_duration_s:.3f}",
             "envelope_ratio": f"{self.lod_envelope_ratio:.3f}",
         }
         with self.ini_path.open("w") as fh:

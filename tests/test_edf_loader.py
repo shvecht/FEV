@@ -228,6 +228,31 @@ def test_build_int16_cache_and_cached_reads_bypass_pyedflib(monkeypatch):
         loader.close()
 
 
+def test_lod_levels_available_after_cache_build():
+    loader = edf_module.EdfLoader("dummy.edf")
+    try:
+        assert loader.build_int16_cache(max_mb=10.0, prefer_memmap=False)
+        levels = loader.lod_levels(0)
+        assert levels
+        duration = levels[-1]
+        window, bin_duration, start_bin = loader.read_lod_window(0, 0.0, 5.0, duration)
+        assert bin_duration == pytest.approx(duration, rel=1e-6)
+        assert start_bin == 0
+        assert window.shape[1] == 2
+        assert np.isfinite(window).all()
+    finally:
+        loader.close()
+
+
+def test_read_lod_window_requires_cache():
+    loader = edf_module.EdfLoader("dummy.edf")
+    try:
+        with pytest.raises(KeyError):
+            loader.read_lod_window(0, 0.0, 1.0, 1.0)
+    finally:
+        loader.close()
+
+
 def test_build_int16_cache_size_guard_and_streaming():
     loader = edf_module.EdfLoader("dummy.edf")
     try:

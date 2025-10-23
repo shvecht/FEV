@@ -298,5 +298,9 @@ def test_zarr_loader_exposes_lod_levels(tmp_path):
         np.testing.assert_allclose(mins, expected[:, 0], atol=1e-6)
         np.testing.assert_allclose(maxs, expected[:, 1], atol=1e-6)
         assert duration == pytest.approx(1.0)
+        window, bin_duration, start_bin = loader.read_lod_window(0, 0.0, 10.0, 1.0)
+        assert bin_duration == pytest.approx(1.0)
+        assert start_bin == 0
+        assert window.shape[1] == 2
     finally:
         loader.close()
