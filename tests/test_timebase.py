@@ -1,5 +1,5 @@
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from core.timebase import Timebase
 
@@ -71,3 +71,24 @@ def test_to_seconds_inverse():
     tb = make_timebase()
     dt = tb.start_dt + timedelta(seconds=42.25)
     assert tb.to_seconds(dt) == 42.25
+
+
+def test_to_seconds_accepts_naive_input_when_start_has_timezone():
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    tb = Timebase(start, duration_s=10.0)
+    naive = datetime(2024, 1, 1, 0, 0, 3)
+    assert tb.to_seconds(naive) == 3.0
+
+
+def test_to_seconds_accepts_aware_input_when_start_is_naive():
+    start = datetime(2024, 1, 1, 0, 0, 0)
+    tb = Timebase(start, duration_s=10.0)
+    aware = datetime(2024, 1, 1, 0, 0, 4, tzinfo=timezone(timedelta(hours=2)))
+    assert tb.to_seconds(aware) == 4.0
+
+
+def test_to_seconds_handles_mismatched_timezones():
+    start = datetime(2024, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+    tb = Timebase(start, duration_s=10.0)
+    other = datetime(2024, 1, 1, 1, 0, 0, tzinfo=timezone(timedelta(hours=1)))
+    assert tb.to_seconds(other) == 0.0
