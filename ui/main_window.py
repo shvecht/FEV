@@ -115,7 +115,7 @@ class _OverscanTile:
     raw_channel_data: list[SignalChunk]
     channel_data: list[tuple[np.ndarray, np.ndarray]]
     vertex_data: list[np.ndarray] = field(default_factory=list)
-    max_samples: Optional[int] = None
+    max_samples: Optional[int]
     pixel_budget: Optional[int] = None
     prepared_mask: list[bool] = field(default_factory=list)
     lod_durations: list[Optional[float]] = field(default_factory=list)
