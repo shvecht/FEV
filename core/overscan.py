@@ -121,12 +121,24 @@ def chunk_from_envelope(
         return SignalChunk(empty, empty.astype(np.float32), lod_duration_s=float(bin_duration))
 
     edges = bin_start + np.arange(n_bins + 1, dtype=np.float64) * float(bin_duration)
-    t = np.empty(n_bins * 2, dtype=np.float64)
-    x = np.empty(n_bins * 2, dtype=np.float32)
-    t[0::2] = edges[:-1]
-    t[1::2] = edges[1:]
-    x[0::2] = mins_arr
-    x[1::2] = maxs_arr
+    starts = edges[:-1]
+    ends = edges[1:]
+
+    t = np.empty(n_bins * 4, dtype=np.float64)
+    x = np.empty(n_bins * 4, dtype=np.float32)
+
+    t[0::4] = starts
+    t[1::4] = starts
+    t[2::4] = ends
+    t[3::4] = ends
+
+    lows = np.fmin(mins_arr, maxs_arr)
+    highs = np.fmax(mins_arr, maxs_arr)
+
+    x[0::4] = lows
+    x[1::4] = highs
+    x[2::4] = highs
+    x[3::4] = lows
     return SignalChunk(
         t,
         x,
@@ -269,20 +281,21 @@ def envelope_to_series(
     maxs = maxs[span_mask]
 
     count = bin_starts.size
-    t_out = np.empty(count * 2, dtype=np.float64)
-    x_out = np.empty(count * 2, dtype=np.float32)
+    t_out = np.empty(count * 4, dtype=np.float64)
+    x_out = np.empty(count * 4, dtype=np.float32)
 
-    for idx, (t_start, t_end, mn, mx) in enumerate(zip(bin_starts, bin_ends, mins, maxs)):
-        base = idx * 2
-        t_out[base] = t_start
-        t_out[base + 1] = t_end
-        if mn <= mx:
-            x_out[base] = mn
-            x_out[base + 1] = mx
-        else:
-            # Handle inverted calibration slopes defensively.
-            x_out[base] = mx
-            x_out[base + 1] = mn
+    t_out[0::4] = bin_starts
+    t_out[1::4] = bin_starts
+    t_out[2::4] = bin_ends
+    t_out[3::4] = bin_ends
+
+    lows = np.fmin(mins, maxs)
+    highs = np.fmax(mins, maxs)
+
+    x_out[0::4] = lows
+    x_out[1::4] = highs
+    x_out[2::4] = highs
+    x_out[3::4] = lows
 
     return t_out, x_out
 

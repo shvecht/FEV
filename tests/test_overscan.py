@@ -69,10 +69,60 @@ def test_envelope_to_series_clamps_bounds():
         window_end=25.0,
     )
     assert t[0] == pytest.approx(5.0)
+    assert t[1] == pytest.approx(5.0)
     assert t[-1] == pytest.approx(25.0)
     assert x.dtype == np.float32
-    assert t.size == x.size == 6
-    assert x[0] <= x[1]
+    assert t.size == x.size == 12
+
+    t_loops = t.reshape(-1, 4)
+    x_loops = x.reshape(-1, 4)
+
+    expected_times = np.array(
+        [
+            [5.0, 5.0, 10.0, 10.0],
+            [10.0, 10.0, 20.0, 20.0],
+            [20.0, 20.0, 25.0, 25.0],
+        ],
+        dtype=np.float64,
+    )
+    np.testing.assert_allclose(t_loops, expected_times)
+
+    expected_values = np.array(
+        [
+            [-1.0, 1.0, 1.0, -1.0],
+            [-0.5, 0.5, 0.5, -0.5],
+            [-0.25, 0.25, 0.25, -0.25],
+        ],
+        dtype=np.float32,
+    )
+    np.testing.assert_allclose(x_loops, expected_values)
+
+
+def test_chunk_from_envelope_emits_loops():
+    mins = np.array([-1.0, -0.5], dtype=np.float32)
+    maxs = np.array([1.0, 0.5], dtype=np.float32)
+    chunk = chunk_from_envelope(2.0, 0.5, mins, maxs)
+    t, x = chunk.as_tuple()
+
+    assert t.dtype == np.float64
+    assert x.dtype == np.float32
+    assert t.size == x.size == 8
+    assert chunk.lod_duration_s == pytest.approx(0.5)
+    assert chunk.source_start == pytest.approx(2.0)
+    assert chunk.source_end == pytest.approx(3.0)
+
+    t_loops = t.reshape(-1, 4)
+    x_loops = x.reshape(-1, 4)
+
+    expected_times = np.array(
+        [[2.0, 2.0, 2.5, 2.5], [2.5, 2.5, 3.0, 3.0]], dtype=np.float64
+    )
+    np.testing.assert_allclose(t_loops, expected_times)
+
+    expected_values = np.array(
+        [[-1.0, 1.0, 1.0, -1.0], [-0.5, 0.5, 0.5, -0.5]], dtype=np.float32
+    )
+    np.testing.assert_allclose(x_loops, expected_values)
 
 
 def test_overscan_worker_prefers_lod(monkeypatch):
