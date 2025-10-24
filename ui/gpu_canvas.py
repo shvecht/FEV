@@ -541,7 +541,7 @@ class VispyChannelCanvas(QtWidgets.QWidget):
             label_transform = transforms.STTransform(translate=(4, 4))
             label.transform = label_transform
 
-            view = self._grid.add_view(row=row, col=1, camera="panzoom")
+            view = self._grid.add_view(row=row, col=0, camera="panzoom")
             view.camera.interactive = False
             view.border_color = None
             view.padding = 0.0
@@ -572,7 +572,7 @@ class VispyChannelCanvas(QtWidgets.QWidget):
         self._x_axis.axis.scale_type = "linear"
         self._x_axis.height_max = 32
         self._x_axis.height_min = 28
-        self._grid.add_widget(self._x_axis, row=len(self._views), col=1)
+        self._grid.add_widget(self._x_axis, row=len(self._views), col=0)
         if self._views:
             self._x_axis.link_view(self._views[0])
         self._install_axis_formatter()
