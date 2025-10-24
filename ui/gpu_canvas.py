@@ -10,7 +10,7 @@ from typing import Sequence
 import contextlib
 
 import numpy as np
-from PySide6 import QtCore, QtWidgets
+from PySide6 import QtCore, QtWidgets, QtGui
 
 LOG = logging.getLogger(__name__)
 
@@ -146,6 +146,17 @@ class VispyChannelCanvas(QtWidgets.QWidget):
         layout.setSpacing(0)
         layout.addWidget(self._canvas.native)
 
+        self.setMinimumSize(0, 0)
+        self.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding,
+            QtWidgets.QSizePolicy.Expanding,
+        )
+        self._canvas.native.setMinimumSize(0, 0)
+        self._canvas.native.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding,
+            QtWidgets.QSizePolicy.Expanding,
+        )
+
         self._grid = self._canvas.central_widget.add_grid(margin=0, bgcolor=None)
         self._grid.spacing = 0
 
@@ -197,6 +208,20 @@ class VispyChannelCanvas(QtWidgets.QWidget):
             mouse_leave_emitter.connect(self._on_mouse_leave)
         else:  # pragma: no cover - depends on VisPy backend
             LOG.debug("VisPy canvas has no mouse_leave event; hover will persist until next move")
+
+    def sizeHint(self) -> QtCore.QSize:  # pragma: no cover - simple geometry hint
+        return QtCore.QSize(960, 720)
+
+    def minimumSizeHint(self) -> QtCore.QSize:  # pragma: no cover - simple geometry hint
+        return QtCore.QSize(320, 240)
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:  # pragma: no cover - GUI only
+        super().resizeEvent(event)
+        try:
+            size = event.size()
+            self._canvas.size = (size.width(), size.height())
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Public control surface
@@ -647,8 +672,10 @@ class VispyChannelCanvas(QtWidgets.QWidget):
         return Color((float(base[0]), float(base[1]), float(base[2]), alpha))
 
     def _update_grid_palette(self) -> None:
+        rgba = tuple(self._grid_line_color.rgba)
         for idx, grid in enumerate(self._grid_lines):
-            grid.color = self._grid_line_color
+            with contextlib.suppress(Exception):
+                grid.set_data(color=rgba)
             grid.visible = idx < len(self._channel_visible) and self._channel_visible[idx]
 
     # ------------------------------------------------------------------

@@ -562,6 +562,51 @@ class MainWindow(QtWidgets.QMainWindow):
         themeRow.addWidget(self.themeCombo, 1)
         appearanceLayout.addLayout(themeRow)
 
+        rendererRow = QtWidgets.QHBoxLayout()
+        rendererRow.setSpacing(6)
+        rendererLabel = QtWidgets.QLabel("Renderer")
+        rendererRow.addWidget(rendererLabel)
+
+        rendererToggle = QtWidgets.QWidget()
+        toggleLayout = QtWidgets.QHBoxLayout(rendererToggle)
+        toggleLayout.setContentsMargins(0, 0, 0, 0)
+        toggleLayout.setSpacing(4)
+
+        def _make_renderer_button(label: str) -> QtWidgets.QToolButton:
+            btn = QtWidgets.QToolButton()
+            btn.setText(label)
+            btn.setCheckable(True)
+            btn.setAutoRaise(True)
+            btn.setCursor(QtCore.Qt.PointingHandCursor)
+            btn.setMinimumWidth(64)
+            return btn
+
+        self.rendererCpuBtn = _make_renderer_button("CPU")
+        self.rendererGpuBtn = _make_renderer_button("GPU")
+        self.rendererCpuBtn.clicked.connect(partial(self._on_renderer_toggle_requested, "cpu"))
+        self.rendererGpuBtn.clicked.connect(partial(self._on_renderer_toggle_requested, "gpu"))
+
+        toggleLayout.addWidget(self.rendererCpuBtn)
+        toggleLayout.addWidget(self.rendererGpuBtn)
+        rendererRow.addWidget(rendererToggle, 1)
+        appearanceLayout.addLayout(rendererRow)
+
+        self._renderer_button_group = QtWidgets.QButtonGroup(self)
+        self._renderer_button_group.setExclusive(True)
+        self._renderer_button_group.addButton(self.rendererCpuBtn)
+        self._renderer_button_group.addButton(self.rendererGpuBtn)
+
+        if not self._gpu_probe.available:
+            reason = self._gpu_probe.reason or "GPU backend unavailable"
+            self.rendererGpuBtn.setEnabled(False)
+            self.rendererGpuBtn.setToolTip(reason)
+
+        current_backend = "gpu" if (self._use_gpu_canvas or self._gpu_forced) else "cpu"
+        if current_backend == "gpu":
+            self.rendererGpuBtn.setChecked(True)
+        else:
+            self.rendererCpuBtn.setChecked(True)
+
         self.themePreviewWidget = QtWidgets.QWidget()
         previewLayout = QtWidgets.QHBoxLayout(self.themePreviewWidget)
         previewLayout.setContentsMargins(0, 0, 0, 0)
@@ -892,6 +937,66 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._gpu_last_vertex_count:
             tooltip += f"\nLast vertex load: {self._gpu_last_vertex_count:,} vertices"
         self._renderer_badge.setToolTip(tooltip)
+        self._update_renderer_selector()
+
+    def _update_renderer_selector(self) -> None:
+        cpu_btn = getattr(self, "rendererCpuBtn", None)
+        gpu_btn = getattr(self, "rendererGpuBtn", None)
+        if cpu_btn is None or gpu_btn is None:
+            return
+        cpu_block = QtCore.QSignalBlocker(cpu_btn)
+        gpu_block = QtCore.QSignalBlocker(gpu_btn)
+        gpu_btn.setChecked(self._use_gpu_canvas)
+        cpu_btn.setChecked(not self._use_gpu_canvas)
+        del cpu_block, gpu_block
+
+    def _on_renderer_toggle_requested(self, backend: str) -> None:
+        if backend == "gpu":
+            if self._use_gpu_canvas and self._gpu_canvas is not None:
+                return
+            if not self._gpu_probe.available and not self._ensure_gpu_canvas_created():
+                reason = self._gpu_probe.reason or "GPU renderer unavailable on this system."
+                QtWidgets.QMessageBox.warning(self, "GPU renderer unavailable", reason)
+                self._update_renderer_selector()
+                return
+            self._gpu_forced = True
+            self._gpu_autoswitch_enabled = True
+            if not self._switch_to_gpu():
+                reason = self._gpu_init_error or self._gpu_failure_reason or "VisPy failed to initialise."
+                QtWidgets.QMessageBox.warning(self, "GPU renderer unavailable", reason)
+                self._gpu_forced = False
+                self._gpu_autoswitch_enabled = False
+                self._update_renderer_selector()
+                return
+            self._config.canvas_backend = "vispy"
+            self._config.save()
+            self._gpu_failure_reason = None
+            self._update_renderer_indicator()
+            return
+
+        if not self._use_gpu_canvas:
+            self._update_renderer_selector()
+            return
+        self._gpu_forced = False
+        self._gpu_autoswitch_enabled = False
+        self._gpu_promote_counter = 0
+        self._gpu_demote_counter = 0
+        if self._switch_to_cpu():
+            self._config.canvas_backend = "pyqtgraph"
+            self._config.save()
+        self._update_renderer_indicator()
+
+    def _assign_plot_widget(self, widget: QtWidgets.QWidget) -> bool:
+        if self._plot_scroll is None or widget is None:
+            return False
+        current = self._plot_scroll.takeWidget()
+        if current is not None and current is not widget:
+            current.hide()
+            current.setParent(None)
+        widget.setParent(None)
+        self._plot_scroll.setWidget(widget)
+        widget.show()
+        return True
 
     def _switch_to_gpu(self) -> bool:
         if self._use_gpu_canvas:
@@ -904,10 +1009,8 @@ class MainWindow(QtWidgets.QMainWindow):
             return False
         self._gpu_switch_in_progress = True
         try:
-            current = self._plot_scroll.widget()
-            if current is not None and current is not self._gpu_canvas:
-                current.setParent(None)
-            self._plot_scroll.setWidget(self._gpu_canvas)
+            if not self._assign_plot_widget(self._gpu_canvas):
+                return False
             self.plotLayout = self._gpu_canvas
             self._plot_viewport = self._gpu_canvas
             self._use_gpu_canvas = True
@@ -929,10 +1032,8 @@ class MainWindow(QtWidgets.QMainWindow):
         widget = self._ensure_cpu_canvas()
         self._gpu_switch_in_progress = True
         try:
-            current = self._plot_scroll.widget()
-            if current is not None and current is not widget:
-                current.setParent(None)
-            self._plot_scroll.setWidget(widget)
+            if not self._assign_plot_widget(widget):
+                return False
             self.plotLayout = widget
             self._plot_viewport = widget.viewport()
             self._use_gpu_canvas = False
