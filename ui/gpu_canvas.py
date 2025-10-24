@@ -151,11 +151,13 @@ class VispyChannelCanvas(QtWidgets.QWidget):
             QtWidgets.QSizePolicy.Expanding,
             QtWidgets.QSizePolicy.Expanding,
         )
-        self._canvas.native.setMinimumSize(0, 0)
-        self._canvas.native.setSizePolicy(
+        native = self._canvas.native
+        native.setMinimumSize(0, 0)
+        native.setSizePolicy(
             QtWidgets.QSizePolicy.Expanding,
             QtWidgets.QSizePolicy.Expanding,
         )
+        native.setAttribute(QtCore.Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
 
         self._grid = self._canvas.central_widget.add_grid(margin=0, bgcolor=None)
         self._grid.spacing = 0
@@ -215,11 +217,54 @@ class VispyChannelCanvas(QtWidgets.QWidget):
     def minimumSizeHint(self) -> QtCore.QSize:  # pragma: no cover - simple geometry hint
         return QtCore.QSize(320, 240)
 
+    def showEvent(self, event: QtGui.QShowEvent) -> None:  # pragma: no cover - GUI only
+        super().showEvent(event)
+        self._sync_canvas_geometry()
+
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:  # pragma: no cover - GUI only
         super().resizeEvent(event)
+        self._sync_canvas_geometry(event.size())
+
+    def event(self, event: QtCore.QEvent) -> bool:  # pragma: no cover - GUI only
+        event_type = event.type()
+        dpi_events: tuple[QtCore.QEvent.Type, ...] = tuple(
+            t
+            for t in (
+                getattr(QtCore.QEvent.Type, "DevicePixelRatioChange", None),
+                getattr(QtCore.QEvent.Type, "DpiChange", None),
+                getattr(QtCore.QEvent.Type, "ScreenChangeInternal", None),
+            )
+            if t is not None
+        )
+        if dpi_events and event_type in dpi_events:
+            QtCore.QTimer.singleShot(0, self._sync_canvas_geometry)
+        return super().event(event)
+
+    def _sync_canvas_geometry(self, size: QtCore.QSize | None = None) -> None:
+        if size is None:
+            size = self.size()
+        width = max(1, size.width())
+        height = max(1, size.height())
+        native = self._canvas.native
+        device_ratio = 1.0
+        ratio_getter = getattr(native, "devicePixelRatioF", None)
+        if callable(ratio_getter):
+            try:
+                device_ratio = float(ratio_getter())
+            except Exception:
+                device_ratio = 1.0
+        elif hasattr(native, "devicePixelRatio"):
+            try:
+                device_ratio = float(native.devicePixelRatio())
+            except Exception:
+                device_ratio = 1.0
+        device_ratio = max(device_ratio, 1.0)
+        physical_width = max(1, int(round(width * device_ratio)))
+        physical_height = max(1, int(round(height * device_ratio)))
         try:
-            size = event.size()
-            self._canvas.size = (size.width(), size.height())
+            self._canvas.size = (physical_width, physical_height)
+            with contextlib.suppress(AttributeError, TypeError):
+                self._canvas.pixel_scale = device_ratio
         except Exception:
             pass
 
