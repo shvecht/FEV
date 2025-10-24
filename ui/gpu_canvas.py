@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import types
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -125,7 +126,7 @@ class VispyChannelCanvas(QtWidgets.QWidget):
 
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
-        if _vispy_app is None or scene is None:
+        if _vispy_app is None or scene is None or Color is None:
             raise RuntimeError("VisPy is not available")
 
         try:
@@ -154,10 +155,20 @@ class VispyChannelCanvas(QtWidgets.QWidget):
         self._views: list[scene.widgets.ViewBox] = []
         self._lines: list[scene.visuals.Line] = []
         self._label_nodes: list[scene.visuals.Text] = []
+        self._grid_lines: list[scene.visuals.GridLines] = []
         self._channel_states: list[_ChannelState] = []
         self._channel_visible: list[bool] = []
         self._channel_colors: list[Color] = []
         self._view_y_ranges: list[tuple[float, float]] = []
+        self._label_hidden: list[bool] = []
+
+        self._background_color = Color("#10141a")
+        self._label_active_color = Color("#dfe7ff")
+        self._label_hidden_color = Color("#6c788f")
+        self._grid_line_color = Color((0.45, 0.52, 0.68, 0.2))
+        self._axis_formatter_installed = False
+        self._timebase = None
+        self._time_mode = "relative"
 
         self._hover_line = scene.visuals.Line(
             pos=self._empty_vertices(),
@@ -195,24 +206,47 @@ class VispyChannelCanvas(QtWidgets.QWidget):
         *,
         background: str,
         curve_colors: Sequence[str],
-        label_color: str,
+        label_active: str,
+        label_hidden: str | None = None,
+        axis_color: str | None = None,
     ) -> None:
         """Update canvas palette."""
 
-        self._canvas.bgcolor = Color(background)
+        self._background_color = Color(background)
+        self._canvas.bgcolor = self._background_color
         self._channel_colors = [Color(code) for code in curve_colors]
-        for idx, text in enumerate(self._label_nodes):
-            text.color = Color(label_color)
+        self._label_active_color = Color(label_active)
+        if label_hidden:
+            self._label_hidden_color = Color(label_hidden)
+        else:
+            rgba = np.array(self._label_active_color.rgba)
+            rgba[3] = max(0.25, float(rgba[3]) * 0.6)
+            self._label_hidden_color = Color(rgba)
+        self._grid_line_color = self._compute_grid_color()
+        for idx in range(len(self._label_nodes)):
             if idx < len(self._channel_colors):
-                line = self._lines[idx]
-                line.set_data(color=self._channel_colors[idx])
+                self._lines[idx].set_data(color=self._channel_colors[idx])
+            self._apply_label_style(idx)
         if self._x_axis is not None:
-            axis_color = Color(label_color)
+            axis_color_obj = Color(axis_color or label_active)
             # Update available color properties without assigning new attributes.
             with contextlib.suppress(AttributeError):
-                self._x_axis.axis.tick_color = axis_color
+                self._x_axis.axis.tick_color = axis_color_obj
             with contextlib.suppress(AttributeError):
-                self._x_axis.axis.text_color = axis_color
+                self._x_axis.axis.text_color = axis_color_obj
+            with contextlib.suppress(AttributeError):
+                self._x_axis.axis.axis_color = axis_color_obj
+            with contextlib.suppress(AttributeError):
+                self._x_axis.axis.tick_width = 1.0
+            with contextlib.suppress(AttributeError):
+                self._x_axis.axis.axis_width = 1.0
+            with contextlib.suppress(AttributeError):
+                self._x_axis.axis.tick_font_size = 11
+            with contextlib.suppress(AttributeError):
+                self._x_axis.bgcolor = self._background_color
+            self._install_axis_formatter()
+            self._request_axis_update()
+        self._update_grid_palette()
 
     def configure_channels(
         self,
@@ -232,13 +266,24 @@ class VispyChannelCanvas(QtWidgets.QWidget):
             if unit:
                 label = f"{label} [{unit}]"
             self._label_nodes[idx].text = label
-            self._views[idx].visible = self._channel_visible[idx]
-            self._lines[idx].visible = self._channel_visible[idx]
+            visible = self._channel_visible[idx]
+            self._views[idx].visible = visible
+            self._lines[idx].visible = visible
+            if idx < len(self._grid_lines):
+                self._grid_lines[idx].visible = visible
+            if idx < len(self._label_hidden):
+                self._label_hidden[idx] = not visible
+            self._apply_label_style(idx)
 
         for idx in range(count, len(self._views)):
             self._views[idx].visible = False
             self._lines[idx].visible = False
             self._label_nodes[idx].text = ""
+            if idx < len(self._grid_lines):
+                self._grid_lines[idx].visible = False
+            if idx < len(self._label_hidden):
+                self._label_hidden[idx] = False
+                self._apply_label_style(idx)
 
     def set_channel_visibility(self, idx: int, visible: bool) -> None:
         if idx >= len(self._views):
@@ -246,12 +291,20 @@ class VispyChannelCanvas(QtWidgets.QWidget):
         self._channel_visible[idx] = visible
         self._views[idx].visible = visible
         self._lines[idx].visible = visible
+        if idx < len(self._grid_lines):
+            self._grid_lines[idx].visible = visible
+        if idx < len(self._label_hidden):
+            self._label_hidden[idx] = not visible
+            self._apply_label_style(idx)
         if not visible:
             self._lines[idx].set_data(pos=np.zeros((0, 2), dtype=np.float32))
 
-    def set_channel_label(self, idx: int, text: str) -> None:
+    def set_channel_label(self, idx: int, text: str, *, hidden: bool | None = None) -> None:
         if idx < len(self._label_nodes):
             self._label_nodes[idx].text = text
+            if hidden is not None and idx < len(self._label_hidden):
+                self._label_hidden[idx] = bool(hidden)
+            self._apply_label_style(idx)
 
     def set_curve_color(self, idx: int, color: str) -> None:
         if idx >= len(self._lines):
@@ -349,6 +402,8 @@ class VispyChannelCanvas(QtWidgets.QWidget):
             self._view_y_ranges[idx] = (-1.0, 1.0)
             if idx < len(self._views):
                 self._views[idx].camera.set_range(y=(-1.0, 1.0))
+        if idx < len(self._grid_lines):
+            self._grid_lines[idx].visible = False
 
     def set_view(self, start: float, duration: float) -> None:
         self._view_start = start
@@ -363,6 +418,7 @@ class VispyChannelCanvas(QtWidgets.QWidget):
             # AxisWidget follows the first linked view; ensure linkage stays intact.
             with contextlib.suppress(Exception):
                 self._x_axis.link_view(self._views[0])
+            self._request_axis_update()
 
     def estimate_pixels(self) -> int:
         native = self._canvas.native
@@ -408,6 +464,9 @@ class VispyChannelCanvas(QtWidgets.QWidget):
             view.padding = 0.0
 
             view.add(label)
+            grid = scene.visuals.GridLines(color=self._grid_line_color, scale=(1.0, 1.0))
+            grid.set_gl_state(depth_test=False)
+            view.add(grid)
             line = scene.visuals.Line(method="gl")
             line.set_data(pos=self._empty_vertices())
             line.visible = False
@@ -418,10 +477,12 @@ class VispyChannelCanvas(QtWidgets.QWidget):
             self._views.append(view)
             self._lines.append(line)
             self._label_nodes.append(label)
+            self._grid_lines.append(grid)
             self._channel_states.append(_ChannelState(t=np.array([]), x=np.array([])))
             self._channel_visible.append(True)
             self._channel_colors.append(Color("#66aaff"))
             self._view_y_ranges.append((-1.0, 1.0))
+            self._label_hidden.append(False)
 
         # Re-append axis under the populated rows.
         self._x_axis = scene.AxisWidget(orientation="bottom")
@@ -431,6 +492,8 @@ class VispyChannelCanvas(QtWidgets.QWidget):
         self._grid.add_widget(self._x_axis, row=len(self._views), col=1)
         if self._views:
             self._x_axis.link_view(self._views[0])
+        self._install_axis_formatter()
+        self._update_axis_theme()
         self.set_view(self._view_start, self._view_duration)
 
     def _update_channel_range(self, idx: int, state: _ChannelState) -> None:
@@ -557,3 +620,120 @@ class VispyChannelCanvas(QtWidgets.QWidget):
     def _empty_vertices() -> np.ndarray:
         # Two nearly coincident vertices keep VisPy bounds finite without rendering a visible segment.
         return np.array([[0.0, 0.0], [1e-6, 0.0]], dtype=np.float32)
+
+    # ------------------------------------------------------------------
+    # Palette helpers
+
+    def _apply_label_style(self, idx: int) -> None:
+        if idx >= len(self._label_nodes):
+            return
+        label = self._label_nodes[idx]
+        hidden = self._label_hidden[idx] if idx < len(self._label_hidden) else False
+        color = self._label_hidden_color if hidden else self._label_active_color
+        label.color = color
+        label.bold = not hidden
+        label.italic = hidden
+
+    def _compute_grid_color(self) -> Color:
+        fg = np.array(self._label_active_color.rgba)
+        bg = np.array(self._background_color.rgba)
+        luminance = float(np.dot(bg[:3], np.array([0.2126, 0.7152, 0.0722])))
+        if luminance > 0.5:
+            base = np.clip(bg[:3] * 0.4, 0.0, 1.0)
+            alpha = 0.25
+        else:
+            base = np.clip(fg[:3] * 0.7 + 0.1, 0.0, 1.0)
+            alpha = 0.2
+        return Color((float(base[0]), float(base[1]), float(base[2]), alpha))
+
+    def _update_grid_palette(self) -> None:
+        for idx, grid in enumerate(self._grid_lines):
+            grid.color = self._grid_line_color
+            grid.visible = idx < len(self._channel_visible) and self._channel_visible[idx]
+
+    # ------------------------------------------------------------------
+    # Axis helpers
+
+    def set_timebase(self, timebase) -> None:
+        self._timebase = timebase
+        self._request_axis_update()
+
+    def set_time_mode(self, mode: str) -> None:
+        mode_lower = str(mode).lower()
+        self._time_mode = "absolute" if mode_lower == "absolute" else "relative"
+        self._request_axis_update()
+
+    def _format_tick_label(self, value: float) -> str:
+        if not np.isfinite(value):
+            return ""
+        if self._time_mode == "absolute" and self._timebase is not None:
+            try:
+                dt = self._timebase.to_datetime(float(value))
+            except Exception:
+                dt = None
+            if dt is not None:
+                with contextlib.suppress(Exception):
+                    return dt.strftime("%H:%M:%S")
+        seconds = float(value)
+        sign = "-" if seconds < 0 else ""
+        total = int(round(abs(seconds)))
+        hours, rem = divmod(total, 3600)
+        minutes, secs = divmod(rem, 60)
+        return f"{sign}{hours:02d}:{minutes:02d}:{secs:02d}"
+
+    def _install_axis_formatter(self) -> None:
+        if self._axis_formatter_installed or self._x_axis is None:
+            return
+        axis = getattr(self._x_axis, "axis", None)
+        if axis is None:
+            return
+        original = getattr(axis, "_get_tick_frac_labels", None)
+        if original is None:
+            return
+
+        def patched(self_axis):
+            major_frac, minor_frac, labels = original()
+            if major_frac is None or len(major_frac) == 0:
+                return major_frac, minor_frac, labels
+            domain = getattr(self_axis, "domain", None)
+            if not domain or len(domain) != 2:
+                return major_frac, minor_frac, labels
+            try:
+                start = float(domain[0])
+                end = float(domain[1])
+            except Exception:
+                return major_frac, minor_frac, labels
+            span = end - start
+            if abs(span) < 1e-12:
+                values = [start for _ in major_frac]
+            else:
+                values = [start + frac * span for frac in major_frac]
+            formatted = [self._format_tick_label(val) for val in values]
+            return major_frac, minor_frac, formatted
+
+        axis._get_tick_frac_labels = types.MethodType(patched, axis)
+        self._axis_formatter_installed = True
+
+    def _update_axis_theme(self) -> None:
+        if self._x_axis is None:
+            return
+        axis = getattr(self._x_axis, "axis", None)
+        if axis is None:
+            return
+        axis.tick_font_size = 11
+        axis.axis_width = 1.0
+        axis.tick_width = 1.0
+        axis.tick_color = self._label_active_color
+        axis.text_color = self._label_active_color
+        axis.axis_color = self._label_active_color
+        self._x_axis.bgcolor = self._background_color
+
+    def _request_axis_update(self) -> None:
+        if self._x_axis is None:
+            return
+        axis = getattr(self._x_axis, "axis", None)
+        if axis is not None:
+            with contextlib.suppress(Exception):
+                axis.update()
+        with contextlib.suppress(Exception):
+            self._x_axis.update()

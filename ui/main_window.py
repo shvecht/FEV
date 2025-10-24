@@ -1130,10 +1130,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if self._use_gpu_canvas and self._gpu_canvas is not None:
             colors = theme.curve_colors or ("#5f8bff",)
+            label_active = theme.channel_label_active or theme.pg_foreground
+            label_hidden = theme.channel_label_hidden or theme.pg_foreground
             self._gpu_canvas.set_theme(
                 background=theme.pg_background,
                 curve_colors=colors,
-                label_color=theme.pg_foreground,
+                label_active=label_active,
+                label_hidden=label_hidden,
+                axis_color=theme.pg_foreground,
             )
         else:
             self.plotLayout.setBackground(theme.pg_background)
@@ -1196,7 +1200,11 @@ class MainWindow(QtWidgets.QMainWindow):
             infos = getattr(self.loader, "info", [])
             for idx, meta in enumerate(infos):
                 hidden = idx in self._hidden_channels
-                self._gpu_canvas.set_channel_label(idx, self._format_label(meta, hidden=hidden))
+                self._gpu_canvas.set_channel_label(
+                    idx,
+                    self._format_label(meta, hidden=hidden),
+                    hidden=hidden,
+                )
             return
 
         if not self.channel_labels:
@@ -1563,6 +1571,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self.time_axis.set_timebase(self.loader.timebase)
             if self.loader.timebase.start_dt is not None:
                 self.time_axis.set_mode("absolute")
+            if self._use_gpu_canvas and self._gpu_canvas is not None:
+                self._gpu_canvas.set_timebase(self.loader.timebase)
+                if self.loader.timebase.start_dt is not None:
+                    self._gpu_canvas.set_time_mode("absolute")
+                else:
+                    self._gpu_canvas.set_time_mode("relative")
             self._update_limits_from_loader()
             self._view_start, self._view_duration = clamp_window(
                 0.0,
@@ -1721,6 +1735,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.time_axis.set_timebase(self.loader.timebase)
         if self.loader.timebase.start_dt is not None:
             self.time_axis.set_mode("absolute")
+        if self._use_gpu_canvas and self._gpu_canvas is not None:
+            self._gpu_canvas.set_timebase(self.loader.timebase)
+            if self.loader.timebase.start_dt is not None:
+                self._gpu_canvas.set_time_mode("absolute")
+            else:
+                self._gpu_canvas.set_time_mode("relative")
 
         self._ensure_plot_rows(self.loader.n_channels)
         self._configure_plots()
@@ -3606,11 +3626,28 @@ class MainWindow(QtWidgets.QMainWindow):
         self._gpu_canvas.set_view(self._view_start, self._view_duration)
         theme = self._theme
         colors = theme.curve_colors or ("#5f8bff",)
+        label_active = theme.channel_label_active or theme.pg_foreground
+        label_hidden = theme.channel_label_hidden or theme.pg_foreground
         self._gpu_canvas.set_theme(
             background=theme.pg_background,
             curve_colors=colors,
-            label_color=theme.pg_foreground,
+            label_active=label_active,
+            label_hidden=label_hidden,
+            axis_color=theme.pg_foreground,
         )
+        timebase = getattr(self.loader, "timebase", None)
+        self._gpu_canvas.set_timebase(timebase)
+        if getattr(timebase, "start_dt", None) is not None:
+            self._gpu_canvas.set_time_mode("absolute")
+        else:
+            self._gpu_canvas.set_time_mode("relative")
+        for idx, meta in enumerate(infos):
+            hidden_flag = idx in hidden
+            self._gpu_canvas.set_channel_label(
+                idx,
+                self._format_label(meta, hidden=hidden_flag),
+                hidden=hidden_flag,
+            )
         self._gpu_canvas.set_hover_enabled(False)
 
     def _sync_channel_controls(self) -> None:
@@ -3669,7 +3706,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._gpu_canvas.clear_channel(idx)
             state_changed = (idx in self._hidden_channels) != prev_hidden
             self._gpu_canvas.set_channel_visibility(idx, visible)
-            self._gpu_canvas.set_channel_label(idx, self._format_label(meta, hidden=not visible))
+            self._gpu_canvas.set_channel_label(
+                idx,
+                self._format_label(meta, hidden=not visible),
+                hidden=not visible,
+            )
             if sync_checkbox and idx < len(self.channel_checkboxes):
                 checkbox = self.channel_checkboxes[idx]
                 checkbox.blockSignals(True)
