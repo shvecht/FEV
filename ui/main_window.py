@@ -1321,7 +1321,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 hidden = idx in self._hidden_channels
                 self._gpu_canvas.set_channel_label(
                     idx,
-                    self._format_label(meta, hidden=hidden),
+                    self._channel_label_text(meta, hidden=hidden),
                     hidden=hidden,
                 )
             return
@@ -3745,7 +3745,7 @@ class MainWindow(QtWidgets.QMainWindow):
             hidden_flag = idx in hidden
             backend.set_channel_label(
                 idx,
-                self._format_label(meta, hidden=hidden_flag),
+                self._channel_label_text(meta, hidden=hidden_flag),
                 hidden=hidden_flag,
             )
         backend.set_hover_enabled(False)
@@ -3808,7 +3808,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._gpu_canvas.set_channel_visibility(idx, visible)
             self._gpu_canvas.set_channel_label(
                 idx,
-                self._format_label(meta, hidden=not visible),
+                self._channel_label_text(meta, hidden=not visible),
                 hidden=not visible,
             )
             if sync_checkbox and idx < len(self.channel_checkboxes):
@@ -3992,11 +3992,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self._apply_channel_visible(idx, bool(visible), sync_checkbox=True, persist=True)
         self.refresh()
 
-    def _format_label(self, meta, *, hidden: bool = False) -> str:
+    def _channel_label_text(self, meta, *, hidden: bool = False) -> str:
         unit = f" [{meta.unit}]" if getattr(meta, "unit", "") else ""
         text = f"{meta.name}{unit}"
         if hidden:
             text = f"{text} (hidden)"
+        return text
+
+    def _format_label(self, meta, *, hidden: bool = False) -> str:
+        text = self._channel_label_text(meta, hidden=hidden)
 
         if self._use_gpu_canvas and self._gpu_canvas is not None:
             return text

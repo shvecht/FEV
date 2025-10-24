@@ -169,6 +169,7 @@ class VispyChannelCanvas(QtWidgets.QWidget):
         # We'll insert an AxisWidget at the bottom row when channels exist.
         self._x_axis: scene.AxisWidget | None = None
 
+        self._gutter_views: list[scene.widgets.ViewBox] = []
         self._views: list[scene.widgets.ViewBox] = []
         self._lines: list[scene.visuals.Line] = []
         self._label_nodes: list[scene.visuals.Text] = []
@@ -178,6 +179,7 @@ class VispyChannelCanvas(QtWidgets.QWidget):
         self._channel_colors: list[Color] = []
         self._view_y_ranges: list[tuple[float, float]] = []
         self._label_hidden: list[bool] = []
+        self._gutter_axis_placeholder: scene.widgets.Widget | None = None
 
         self._background_color = Color("#10141a")
         self._label_active_color = Color("#dfe7ff")
@@ -310,6 +312,9 @@ class VispyChannelCanvas(QtWidgets.QWidget):
             rgba[3] = max(0.25, float(rgba[3]) * 0.6)
             self._label_hidden_color = Color(rgba)
         self._grid_line_color = self._compute_grid_color()
+        for gutter in self._gutter_views:
+            with contextlib.suppress(Exception):
+                gutter.bgcolor = self._background_color
         for idx in range(len(self._label_nodes)):
             if idx < len(self._channel_colors):
                 self._lines[idx].set_data(color=self._channel_colors[idx])
@@ -354,6 +359,8 @@ class VispyChannelCanvas(QtWidgets.QWidget):
                 label = f"{label} [{unit}]"
             self._label_nodes[idx].text = label
             visible = self._channel_visible[idx]
+            if idx < len(self._gutter_views):
+                self._gutter_views[idx].visible = visible
             self._views[idx].visible = visible
             self._lines[idx].visible = visible
             if idx < len(self._grid_lines):
@@ -363,6 +370,8 @@ class VispyChannelCanvas(QtWidgets.QWidget):
             self._apply_label_style(idx)
 
         for idx in range(count, len(self._views)):
+            if idx < len(self._gutter_views):
+                self._gutter_views[idx].visible = False
             self._views[idx].visible = False
             self._lines[idx].visible = False
             self._label_nodes[idx].text = ""
@@ -376,6 +385,8 @@ class VispyChannelCanvas(QtWidgets.QWidget):
         if idx >= len(self._views):
             return
         self._channel_visible[idx] = visible
+        if idx < len(self._gutter_views):
+            self._gutter_views[idx].visible = visible
         self._views[idx].visible = visible
         self._lines[idx].visible = visible
         if idx < len(self._grid_lines):
@@ -552,9 +563,22 @@ class VispyChannelCanvas(QtWidgets.QWidget):
         if self._x_axis is not None:
             self._grid.remove_widget(self._x_axis)
             self._x_axis = None
+        if self._gutter_axis_placeholder is not None:
+            self._grid.remove_widget(self._gutter_axis_placeholder)
+            self._gutter_axis_placeholder = None
 
         while len(self._views) < count:
             row = len(self._views)
+            gutter = self._grid.add_view(row=row, col=0, camera="panzoom")
+            gutter.camera.interactive = False
+            gutter.border_color = None
+            gutter.padding = 0.0
+            gutter.bgcolor = None
+            with contextlib.suppress(Exception):
+                gutter.width_min = 72
+            with contextlib.suppress(Exception):
+                gutter.width_max = 220
+
             label = scene.visuals.Text(
                 text="",
                 anchor_x="left",
@@ -562,15 +586,14 @@ class VispyChannelCanvas(QtWidgets.QWidget):
                 color="white",
                 font_size=12,
             )
-            label_transform = transforms.STTransform(translate=(4, 4))
-            label.transform = label_transform
+            label.transform = transforms.STTransform(translate=(8, 8))
+            gutter.add(label)
 
-            view = self._grid.add_view(row=row, col=0, camera="panzoom")
+            view = self._grid.add_view(row=row, col=1, camera="panzoom")
             view.camera.interactive = False
             view.border_color = None
             view.padding = 0.0
 
-            view.add(label)
             grid = scene.visuals.GridLines(color=self._grid_line_color, scale=(1.0, 1.0))
             grid.set_gl_state(depth_test=False)
             view.add(grid)
@@ -581,6 +604,7 @@ class VispyChannelCanvas(QtWidgets.QWidget):
             view.add(self._hover_line)
             view.add(self._hover_marker)
 
+            self._gutter_views.append(gutter)
             self._views.append(view)
             self._lines.append(line)
             self._label_nodes.append(label)
@@ -596,7 +620,15 @@ class VispyChannelCanvas(QtWidgets.QWidget):
         self._x_axis.axis.scale_type = "linear"
         self._x_axis.height_max = 32
         self._x_axis.height_min = 28
-        self._grid.add_widget(self._x_axis, row=len(self._views), col=0)
+        self._grid.add_widget(self._x_axis, row=len(self._views), col=1)
+        with contextlib.suppress(Exception):
+            placeholder = scene.widgets.Widget()
+            placeholder.height_max = self._x_axis.height_max
+            placeholder.height_min = self._x_axis.height_min
+            placeholder.border_color = None
+            placeholder.bgcolor = None
+            self._grid.add_widget(placeholder, row=len(self._views), col=0)
+            self._gutter_axis_placeholder = placeholder
         if self._views:
             self._x_axis.link_view(self._views[0])
         self._install_axis_formatter()
