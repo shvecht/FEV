@@ -1,12 +1,13 @@
 # ui/main_window.py
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 import os
 import re
-from dataclasses import dataclass, field
 from collections import Counter, OrderedDict
+from concurrent.futures import Future
 from functools import partial
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -25,6 +26,10 @@ from config import ViewerConfig
 from core.decimate import min_max_bins
 from core.overscan import (
     SignalChunk,
+    OverscanRequest,
+    OverscanTile,
+    OverscanTileBuilder,
+    AsyncTileWorker,
     chunk_from_arrays,
     envelope_to_series,
     select_lod_duration,
@@ -94,68 +99,6 @@ class _ZarrIngestWorker(QtCore.QObject):
         self.progress.emit(done, total)
 
 
-@dataclass(frozen=True)
-class _OverscanRequest:
-    request_id: int
-    start: float
-    end: float
-    view_start: float
-    view_duration: float
-    channel_indices: tuple[int, ...]
-    max_samples: Optional[int]
-
-
-@dataclass
-class _OverscanTile:
-    request_id: int
-    start: float
-    end: float
-    view_start: float
-    view_duration: float
-    raw_channel_data: list[SignalChunk]
-    channel_data: list[tuple[np.ndarray, np.ndarray]]
-    channel_indices: tuple[int, ...] = field(default_factory=tuple)
-    vertex_data: list[np.ndarray] = field(default_factory=list)
-    max_samples: Optional[int] = None
-    pixel_budget: Optional[int] = None
-    prepared_mask: list[bool] = field(default_factory=list)
-    lod_durations: list[Optional[float]] = field(default_factory=list)
-    prepared_cache: dict[int, list[tuple[np.ndarray, np.ndarray]]] = field(
-        default_factory=dict
-    )
-    vertex_cache: dict[int, list[np.ndarray]] = field(default_factory=dict)
-    is_final: bool = True
-
-    def contains(self, window_start: float, window_end: float) -> bool:
-        return window_start >= self.start and window_end <= self.end
-
-    def prepared_for_budget(
-        self, budget: int
-    ) -> list[tuple[np.ndarray, np.ndarray]] | None:
-        if budget is None:
-            return None
-        return self.prepared_cache.get(int(budget))
-
-    def cache_prepared(
-        self,
-        budget: int,
-        series: list[tuple[np.ndarray, np.ndarray]],
-        vertices: list[np.ndarray] | None,
-    ) -> None:
-        self.prepared_cache[int(budget)] = series
-        if vertices is not None:
-            self.vertex_cache[int(budget)] = vertices
-
-    def prepared_vertices(self, budget: int) -> list[np.ndarray] | None:
-        if budget is None:
-            return None
-        return self.vertex_cache.get(int(budget))
-
-    def clear_prepared_caches(self) -> None:
-        self.prepared_cache.clear()
-        self.vertex_cache.clear()
-
-
 class _OverscanWorker(QtCore.QObject):
     finished = QtCore.Signal(int, object)
     failed = QtCore.Signal(int, str)
@@ -171,283 +114,35 @@ class _OverscanWorker(QtCore.QObject):
         owns_loader: bool = False,
     ):
         super().__init__()
+        self._builder = OverscanTileBuilder(
+            loader,
+            lod_enabled=lod_enabled,
+            lod_min_bin_multiple=lod_min_bin_multiple,
+            lod_min_view_duration=lod_min_view_duration,
+            lod_ratio=lod_ratio,
+        )
         self._loader = loader
         self._owns_loader = bool(owns_loader)
-        self._lod_enabled = bool(lod_enabled)
-        self._lod_min_bin_multiple = max(1.0, float(lod_min_bin_multiple))
-        if lod_min_view_duration is None:
-            self._lod_min_view_duration: float | None = None
-        else:
-            try:
-                min_view = float(lod_min_view_duration)
-            except (TypeError, ValueError):
-                min_view = 0.0
-            self._lod_min_view_duration = min_view if min_view > 0.0 else None
-        self._lod_ratio = float(lod_ratio or 0.0)
-        self._preview_sample_cap = 4096
+        self._preview_sample_cap = getattr(self._builder, "_preview_sample_cap", 4096)
 
     @QtCore.Slot(object)
     def render(self, request_obj):
-        if not isinstance(request_obj, _OverscanRequest):
+        if not isinstance(request_obj, OverscanRequest):
             return
-        req: _OverscanRequest = request_obj
-        preview_tile: _OverscanTile | None = None
+        req: OverscanRequest = request_obj
         try:
-            preview_tile = self._build_tile(req, preview=True)
-        except Exception as exc:  # pragma: no cover - preview errors stay silent
+            preview_tile = self._builder.build_tile(req, preview=True)
+        except Exception as exc:  # pragma: no cover - preview failures are non fatal
             LOG.debug("Overscan preview failed: %s", exc)
             preview_tile = None
         if preview_tile is not None:
             self.finished.emit(req.request_id, preview_tile)
-
         try:
-            final_tile = self._build_tile(req, preview=False)
+            final_tile = self._builder.build_tile(req, preview=False)
         except Exception as exc:  # pragma: no cover - worker error propagated to UI
             self.failed.emit(req.request_id, str(exc))
             return
         self.finished.emit(req.request_id, final_tile)
-
-    def _read_channel(
-        self,
-        channel: int,
-        start: float,
-        end: float,
-        view_duration: float,
-        max_samples: Optional[int],
-    ) -> tuple[SignalChunk, Optional[float]]:
-        lod_chunk = self._try_read_lod(channel, start, end, view_duration)
-        if lod_chunk is not None:
-            return lod_chunk, lod_chunk.lod_duration_s
-        return self._read_raw_channel(channel, start, end, max_samples), None
-
-    def _build_tile(self, req: _OverscanRequest, *, preview: bool) -> _OverscanTile | None:
-        raw_chunks: list[SignalChunk] = []
-        payloads: list[tuple[np.ndarray, np.ndarray]] = []
-        lod_durations: list[Optional[float]] = []
-        has_samples = False
-        for ch in req.channel_indices:
-            if preview:
-                chunk = self._read_preview_channel(
-                    ch,
-                    req.start,
-                    req.end,
-                    req.view_duration,
-                )
-                lod_duration = chunk.lod_duration_s if chunk is not None else None
-                if chunk is None:
-                    empty_t = np.zeros(0, dtype=np.float64)
-                    empty_x = np.zeros(0, dtype=np.float32)
-                    chunk = chunk_from_arrays(
-                        empty_t,
-                        empty_x,
-                        source_start=req.start,
-                        source_end=req.end,
-                    )
-            else:
-                chunk, lod_duration = self._read_channel(
-                    ch,
-                    req.start,
-                    req.end,
-                    req.view_duration,
-                    req.max_samples,
-                )
-            raw_chunks.append(chunk)
-            payload = chunk.as_tuple()
-            payloads.append(payload)
-            lod_durations.append(lod_duration)
-            if payload[1].size > 0:
-                has_samples = True
-
-        if preview and not has_samples:
-            return None
-
-        tile = _OverscanTile(
-            request_id=req.request_id,
-            start=req.start,
-            end=req.end,
-            view_start=req.view_start,
-            view_duration=req.view_duration,
-            raw_channel_data=raw_chunks,
-            channel_data=payloads,
-            channel_indices=req.channel_indices,
-            max_samples=req.max_samples,
-            prepared_mask=[False] * len(raw_chunks),
-            lod_durations=lod_durations,
-            is_final=not preview,
-        )
-        return tile
-
-    def _lod_durations_for_channel(self, channel: int) -> tuple[float, ...]:
-        durations: Sequence[float] | None = None
-        levels_fn = getattr(self._loader, "lod_levels", None)
-        if callable(levels_fn):
-            try:
-                levels = levels_fn(channel)
-            except Exception:
-                levels = None
-            if levels:
-                if isinstance(levels, dict):
-                    durations = tuple(float(k) for k in levels.keys())
-                else:
-                    durations = tuple(float(v) for v in levels)
-        if not durations:
-            durations_fn = getattr(self._loader, "lod_durations", None)
-            if callable(durations_fn):
-                try:
-                    durations = tuple(float(v) for v in durations_fn(channel))
-                except Exception:
-                    durations = None
-        if not durations:
-            return tuple()
-        filtered = [float(v) for v in durations if float(v) > 0.0]
-        return tuple(sorted(filtered))
-
-    def _read_preview_channel(
-        self,
-        channel: int,
-        start: float,
-        end: float,
-        view_duration: float,
-    ) -> SignalChunk | None:
-        durations = self._lod_durations_for_channel(channel)
-        if durations:
-            min_view = self._lod_min_view_duration
-            if min_view is None or view_duration >= min_view:
-                coarse = durations[-1]
-                chunk = self._read_lod_chunk(channel, start, end, coarse)
-                if chunk is not None and chunk.x.size > 0:
-                    return chunk
-        return self._read_raw_channel(
-            channel,
-            start,
-            end,
-            min(self._preview_sample_cap, self._safe_max_samples(view_duration, channel)),
-        )
-
-    def _safe_max_samples(self, view_duration: float, channel: int) -> int:
-        fs = getattr(self._loader, "channel_fs", None)
-        if callable(fs):
-            try:
-                rate = float(fs(channel))
-            except Exception:
-                rate = 0.0
-        else:
-            rate = float(getattr(self._loader, "fs", 0.0) or 0.0)
-        if rate <= 0.0:
-            return self._preview_sample_cap
-        return int(min(self._preview_sample_cap, max(1, int(math.ceil(rate * view_duration)))))
-
-    def _read_raw_channel(
-        self,
-        channel: int,
-        start: float,
-        end: float,
-        max_samples: Optional[int],
-    ) -> SignalChunk:
-        try:
-            if max_samples is not None:
-                result = self._loader.read(channel, start, end, max_samples=max_samples)
-            else:
-                result = self._loader.read(channel, start, end)
-        except TypeError:
-            result = self._loader.read(channel, start, end)
-        if isinstance(result, SignalChunk):
-            return result
-        t_arr, x_arr = result
-        t_np = np.asarray(t_arr, dtype=np.float64)
-        x_np = np.asarray(x_arr, dtype=np.float32)
-        source_start = float(t_np[0]) if t_np.size else start
-        source_end = float(t_np[-1]) if t_np.size else end
-        return chunk_from_arrays(
-            t_np,
-            x_np,
-            source_start=source_start,
-            source_end=source_end,
-        )
-
-    def _try_read_lod(
-        self,
-        channel: int,
-        start: float,
-        end: float,
-        view_duration: float,
-    ) -> SignalChunk | None:
-        if not self._lod_enabled:
-            return None
-        lod_duration = self._select_lod(channel, view_duration)
-        if lod_duration is None:
-            return None
-        return self._read_lod_chunk(channel, start, end, lod_duration)
-
-    def _select_lod(self, channel: int, view_duration: float) -> Optional[float]:
-        durations = self._lod_durations_for_channel(channel)
-        if not durations:
-            return None
-        min_view = self._lod_min_view_duration
-        if min_view is not None and view_duration < min_view:
-            return None
-        ratio = self._lod_ratio
-        if ratio > 0 and np.isfinite(ratio):
-            selected = choose_lod_duration(view_duration, durations, ratio=ratio)
-            if selected is not None:
-                return selected
-        return select_lod_duration(
-            view_duration,
-            durations,
-            self._lod_min_bin_multiple,
-            min_view_duration=self._lod_min_view_duration,
-        )
-
-    def _read_lod_chunk(
-        self,
-        channel: int,
-        start: float,
-        end: float,
-        duration: float,
-    ) -> SignalChunk | None:
-        read_window = getattr(self._loader, "read_lod_window", None)
-        if not callable(read_window):
-            return None
-        try:
-            result = read_window(channel, start, end, duration)
-        except KeyError:
-            return None
-        except Exception:
-            return None
-        if isinstance(result, SignalChunk):
-            chunk = result
-        else:
-            data, bin_duration, start_bin = result
-            if getattr(data, "size", 0) == 0:
-                return None
-            mins = np.asarray(data[:, 0], dtype=np.float32)
-            maxs = np.asarray(data[:, 1], dtype=np.float32)
-            t_vals, x_vals = envelope_to_series(
-                mins,
-                maxs,
-                bin_duration=float(bin_duration),
-                start_bin=int(start_bin),
-                window_start=start,
-                window_end=end,
-            )
-            if t_vals.size == 0:
-                return None
-            chunk = chunk_from_arrays(
-                np.asarray(t_vals, dtype=np.float64),
-                np.asarray(x_vals, dtype=np.float32),
-                lod_duration_s=float(bin_duration),
-                source_start=start,
-                source_end=end,
-            )
-        if chunk.lod_duration_s is None:
-            chunk = chunk_from_arrays(
-                np.asarray(chunk.t, dtype=np.float64),
-                np.asarray(chunk.x, dtype=np.float32),
-                lod_duration_s=float(duration),
-                source_start=chunk.source_start,
-                source_end=chunk.source_end,
-            )
-        return chunk
 
     @QtCore.Slot()
     def shutdown(self):
@@ -569,12 +264,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._plot_viewport: QtWidgets.QWidget | None = None
         self._overscan_factor = 2.0  # windows per side
         self._overscan_zoom_reuse_ratio = 0.7
-        self._overscan_tile: _OverscanTile | None = None
+        self._overscan_tile: OverscanTile | None = None
         self._overscan_request_id = 0
         self._overscan_inflight: Optional[int] = None
         self._current_tile_id: Optional[int] = None
         self._overscan_tile_cache: OrderedDict[
-            tuple[tuple[int, ...], int, int], _OverscanTile
+            tuple[tuple[int, ...], int, int], OverscanTile
         ] = OrderedDict()
         self._overscan_tile_cache_limit = 6
         self._lod_enabled = bool(getattr(self._config, "lod_enabled", True))
@@ -588,8 +283,11 @@ class MainWindow(QtWidgets.QMainWindow):
             min_view = 0.0
         self._lod_min_view_duration = min_view if min_view > 0.0 else None
         self._config.lod_min_view_duration_s = min_view if min_view > 0.0 else 0.0
-        self._overscan_thread: QtCore.QThread | None = None
-        self._overscan_worker: _OverscanWorker | None = None
+        self._overscan_worker: AsyncTileWorker | None = None
+        self._overscan_worker_loader: object | None = None
+        self._overscan_worker_owned: bool = False
+        self._overscan_future: Future | None = None
+        self._overscan_preview_cap = 4096
         self._init_overscan_worker()
 
         self._hidden_channels: set[int] = set(getattr(self._config, "hidden_channels", ()))
@@ -1603,56 +1301,51 @@ class MainWindow(QtWidgets.QMainWindow):
             LOG.warning(
                 "Overscan worker disabled: unable to clone loader for background rendering."
             )
-            self._overscan_thread = None
             self._overscan_worker = None
+            self._overscan_worker_loader = None
+            self._overscan_worker_owned = False
             self._overscan_inflight = None
             self._current_tile_id = None
             return
-        thread = QtCore.QThread(self)
         lod_ratio = float(getattr(self._config, "lod_envelope_ratio", 0.0) or 0.0)
-        worker = _OverscanWorker(
+        worker = AsyncTileWorker(
             worker_loader,
             lod_enabled=self._lod_enabled,
             lod_min_bin_multiple=self._lod_min_bin_multiple,
             lod_min_view_duration=self._lod_min_view_duration,
             lod_ratio=lod_ratio,
-            owns_loader=owns_loader,
         )
-        worker.moveToThread(thread)
-        worker.finished.connect(self._handle_overscan_finished)
-        worker.failed.connect(self._handle_overscan_failed)
-        thread.finished.connect(worker.shutdown)
-        thread.finished.connect(worker.deleteLater)
-        thread.start()
-        self._overscan_thread = thread
         self._overscan_worker = worker
-        self.overscanRequested.connect(worker.render)
+        self._overscan_worker_loader = worker_loader
+        self._overscan_worker_owned = owns_loader
         self._overscan_request_id = 0
         self._overscan_inflight = None
+        self._overscan_future = None
         self._current_tile_id = None
 
     def _shutdown_overscan_worker(self):
-        thread = self._overscan_thread
         worker = self._overscan_worker
-        self._overscan_thread = None
         self._overscan_worker = None
+        future = self._overscan_future
+        self._overscan_future = None
+        if future is not None:
+            future.cancel()
         if worker is not None:
             try:
-                self.overscanRequested.disconnect(worker.render)
-            except (TypeError, RuntimeError):
-                pass
-        if thread is not None:
-            thread.quit()
-            thread.wait()
-        if worker is not None:
-            try:
-                worker.shutdown()
+                worker.close()
             except Exception:
                 pass
-            try:
-                worker.deleteLater()
-            except RuntimeError:
-                pass
+        loader = self._overscan_worker_loader
+        owned = self._overscan_worker_owned
+        self._overscan_worker_loader = None
+        self._overscan_worker_owned = False
+        if owned and loader is not None:
+            close_fn = getattr(loader, "close", None)
+            if callable(close_fn):
+                try:
+                    close_fn()
+                except Exception:
+                    pass
 
     def _available_lod_durations(self, channel: int, loader=None) -> tuple[float, ...]:
         durations: list[float] = []
@@ -2232,7 +1925,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 if chunk is not None and chunk.x.size > 0:
                     return chunk.as_tuple()
 
-        sample_cap = getattr(self._overscan_worker, "_preview_sample_cap", 2048)
+        sample_cap = getattr(self, "_overscan_preview_cap", 2048)
         try:
             result = loader.read(
                 channel,
@@ -2298,14 +1991,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _get_cached_tile(
         self, channels: tuple[int, ...], start: float, end: float
-    ) -> _OverscanTile | None:
+    ) -> OverscanTile | None:
         key = self._tile_cache_key(channels, start, end)
         tile = self._overscan_tile_cache.get(key)
         if tile is not None:
             self._overscan_tile_cache.move_to_end(key)
         return tile
 
-    def _cache_tile(self, tile: _OverscanTile) -> None:
+    def _cache_tile(self, tile: OverscanTile) -> None:
         channels = tuple(tile.channel_indices)
         if not channels:
             return
@@ -2350,7 +2043,7 @@ class MainWindow(QtWidgets.QMainWindow):
         req_id = self._overscan_request_id + 1
         self._overscan_request_id = req_id
         self._overscan_inflight = req_id
-        request = _OverscanRequest(
+        request = OverscanRequest(
             request_id=req_id,
             start=start,
             end=end,
@@ -2359,7 +2052,27 @@ class MainWindow(QtWidgets.QMainWindow):
             channel_indices=channels,
             max_samples=None,
         )
-        self.overscanRequested.emit(request)
+        if self._overscan_future is not None:
+            self._overscan_future.cancel()
+        future = self._overscan_worker.submit(
+            request,
+            on_preview=lambda tile: self._dispatch_to_main_thread(
+                self._handle_async_tile_result, tile
+            ),
+        )
+        self._overscan_future = future
+
+        def _handle_completion(done_future: Future, req_id=req_id):
+            try:
+                tile = done_future.result()
+            except Exception as exc:
+                self._dispatch_to_main_thread(
+                    self._handle_async_tile_error, req_id, exc
+                )
+                return
+            self._dispatch_to_main_thread(self._handle_async_tile_result, tile)
+
+        future.add_done_callback(_handle_completion)
 
     def _compute_overscan_bounds(self, view_start: float, view_duration: float) -> tuple[float, float]:
         total = self.loader.duration_s
@@ -2385,8 +2098,24 @@ class MainWindow(QtWidgets.QMainWindow):
         end = min(total, view_start + view_duration + right)
         return start, end
 
+    def _dispatch_to_main_thread(self, func, *args, **kwargs) -> None:
+        QtCore.QTimer.singleShot(0, partial(func, *args, **kwargs))
+
+    def _handle_async_tile_result(self, tile: OverscanTile) -> None:
+        if not isinstance(tile, OverscanTile):
+            return
+        self._handle_overscan_finished(tile.request_id, tile)
+        if tile.is_final:
+            self._overscan_future = None
+
+    def _handle_async_tile_error(self, request_id: int, exc: Exception) -> None:
+        if isinstance(exc, asyncio.CancelledError):
+            return
+        self._overscan_future = None
+        self._handle_overscan_failed(request_id, str(exc))
+
     def _handle_overscan_finished(self, request_id: int, tile_obj):
-        if not isinstance(tile_obj, _OverscanTile):
+        if not isinstance(tile_obj, OverscanTile):
             return
         is_final = bool(getattr(tile_obj, "is_final", True))
         if request_id != self._overscan_request_id:
@@ -2404,7 +2133,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._schedule_refresh()
 
     def _update_tile_view_metadata(
-        self, tile: _OverscanTile | None, view_start: float, view_duration: float
+        self, tile: OverscanTile | None, view_start: float, view_duration: float
     ) -> None:
         if tile is None:
             return
@@ -3172,7 +2901,7 @@ class MainWindow(QtWidgets.QMainWindow):
             )
         )
 
-    def _prepare_tile(self, tile: _OverscanTile) -> bool:
+    def _prepare_tile(self, tile: OverscanTile) -> bool:
         pixels = self._estimate_pixels() or 0
         overscan_span = 2 * self._overscan_factor + 1
         budget = int(max(200, pixels * overscan_span * 2)) if pixels else 2000
@@ -3280,7 +3009,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         return changed
 
-    def _apply_tile_to_curves(self, tile: _OverscanTile) -> None:
+    def _apply_tile_to_curves(self, tile: OverscanTile) -> None:
         self._prepare_tile(tile)
         is_final = bool(getattr(tile, "is_final", True))
 
