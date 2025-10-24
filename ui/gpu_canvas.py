@@ -416,6 +416,8 @@ class VispyChannelCanvas(QtWidgets.QWidget):
             self._apply_label_style(idx)
         if not visible:
             self._lines[idx].set_data(pos=np.zeros((0, 2), dtype=np.float32))
+            if self._hover_channel == idx:
+                self._hide_hover()
 
     def set_channel_label(self, idx: int, text: str, *, hidden: bool | None = None) -> None:
         if idx < len(self._label_nodes):
@@ -722,6 +724,8 @@ class VispyChannelCanvas(QtWidgets.QWidget):
                 self._views[idx].camera.set_range(y=(-1.0, 1.0))
         if idx < len(self._grid_lines):
             self._grid_lines[idx].visible = False
+        if self._hover_channel == idx:
+            self._hide_hover()
 
     def set_view(self, start: float, duration: float) -> None:
         self._view_start = start
