@@ -1,5 +1,6 @@
 from collections import OrderedDict
 from types import SimpleNamespace
+from typing import Sequence
 
 import numpy as np
 import pytest
@@ -12,7 +13,10 @@ except ImportError as exc:  # pragma: no cover - optional dependency guard
 
 from core.overscan import (
     SignalChunk,
+    OverscanRenderer,
     choose_lod_duration,
+    chunk_from_arrays,
+    chunk_from_envelope,
     envelope_to_series,
     select_lod_duration,
     slice_and_decimate,
@@ -244,6 +248,68 @@ def test_choose_lod_duration_prefers_coarsest_available():
     assert choose_lod_duration(180.0, durations, ratio=2.0) == 30.0
     assert choose_lod_duration(12.0, durations, ratio=2.0) == 5.0
     assert choose_lod_duration(1.5, durations, ratio=2.0) is None
+
+
+class _SyntheticLoader:
+    def __init__(self, *, fs: float, lod_durations: Sequence[float]):
+        self._fs = float(fs)
+        self._lod = tuple(float(v) for v in lod_durations)
+        self.duration_s = 600.0
+        self.max_window_s = 120.0
+        self.info = [SimpleNamespace(fs=self._fs, n_samples=int(self._fs * self.duration_s), unit="u")]
+        self.channels = ["synthetic"]
+        self.calls: list[tuple[str, float]] = []
+
+    def fs(self, idx: int) -> float:
+        assert idx == 0
+        return self._fs
+
+    def lod_durations(self, idx: int) -> tuple[float, ...]:
+        assert idx == 0
+        return self._lod
+
+    def read_lod_window(self, idx: int, start: float, end: float, duration: float) -> SignalChunk:
+        assert idx == 0
+        self.calls.append(("lod", float(duration)))
+        bins = int(np.ceil(max(0.0, end - start) / float(duration)))
+        mins = np.full(bins, -1.0, dtype=np.float32)
+        maxs = np.full(bins, 1.0, dtype=np.float32)
+        return chunk_from_envelope(float(start), float(duration), mins, maxs)
+
+    def read(self, idx: int, start: float, end: float) -> SignalChunk:
+        assert idx == 0
+        self.calls.append(("raw", float(end - start)))
+        sample_count = max(0, int(round((end - start) * self._fs)))
+        t = np.linspace(start, end, sample_count, endpoint=False, dtype=np.float64)
+        x = np.zeros_like(t, dtype=np.float32)
+        return chunk_from_arrays(t, x)
+
+
+def test_overscan_renderer_chooses_coarsest_envelope():
+    loader = _SyntheticLoader(fs=100.0, lod_durations=(0.5, 1.0, 5.0))
+    renderer = OverscanRenderer(loader)
+    chunk = renderer.render(0, 0.0, 500.0, plot_width_px=100)
+    assert isinstance(chunk, SignalChunk)
+    assert loader.calls[0] == ("lod", pytest.approx(5.0))
+
+
+def test_overscan_renderer_falls_back_to_raw_for_zoom():
+    loader = _SyntheticLoader(fs=100.0, lod_durations=(0.5, 1.0, 5.0))
+    renderer = OverscanRenderer(loader)
+    chunk = renderer.render(0, 0.0, 5.0, plot_width_px=1000)
+    assert isinstance(chunk, SignalChunk)
+    assert loader.calls[0][0] == "raw"
+
+
+def test_choose_envelope_duration_prefers_stride_threshold():
+    loader = _SyntheticLoader(fs=200.0, lod_durations=(0.25, 1.0, 2.0, 4.0))
+    renderer = OverscanRenderer(loader)
+    duration = renderer.choose_envelope_duration(0, window_duration=120.0, plot_width_px=400)
+    # samples per px = 120 * 200 / 400 = 60 -> best bin <= 60 is 0.25 s (50 samples)
+    assert duration == pytest.approx(0.25)
+    duration_zoomed = renderer.choose_envelope_duration(0, window_duration=120.0, plot_width_px=20)
+    # samples per px = 120 * 200 / 20 = 1200 -> allows up to 4.0 s bins (800 samples)
+    assert duration_zoomed == pytest.approx(4.0)
 
 
 def test_prepare_tile_uses_cached_series(monkeypatch):
