@@ -7,7 +7,8 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Iterable, Optional, Sequence
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -319,6 +320,187 @@ def test_main_window_overscan_preview_then_final(qt_app, monkeypatch):
     assert counts and counts[-1] >= counts[0]
 
     window._overscan_worker.finished.disconnect(capture)  # type: ignore[arg-type]
+    window._shutdown_overscan_worker()
+    window.close()
+    _process_events(qt_app)
+
+
+def test_gpu_hover_signal_updates_state(qt_app, monkeypatch):
+    from ui import main_window as mw
+
+    class _StubVispyCanvas(QtWidgets.QWidget):
+        hoverMoved = QtCore.Signal(float, float, int)
+        hoverExited = QtCore.Signal()
+        DEFAULT_VERTEX_BUDGET = 250_000
+        supports_annotations = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.configured_infos: Sequence[object] | None = None
+            self.configured_hidden: set[int] = set()
+            self.view_state: tuple[float, float] | None = None
+            self.theme_state: dict[str, object] | None = None
+            self.timebase = None
+            self.time_mode: str | None = None
+            self.channel_labels: dict[int, tuple[str, bool]] = {}
+            self.hover_enabled_history: list[bool] = []
+            self.channel_visibility: dict[int, bool] = {}
+            self.channel_data: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+            self.channel_colors: dict[int, str] = {}
+            self.cleared_channels: list[int] = []
+            self.series_calls: list[tuple[int, Sequence[tuple[np.ndarray, np.ndarray]], tuple[int, ...], bool]] = []
+            self.annotation_updates: list[tuple[Sequence[dict[str, object]] | None, float, float]] = []
+            self.hypnogram_updates: list[tuple[object | None, bool, float, float]] = []
+            self._hover_enabled = False
+
+        @property
+        def widget(self) -> QtWidgets.QWidget:
+            return self
+
+        @classmethod
+        def capability_probe(cls):  # pragma: no cover - simple stub
+            return SimpleNamespace(
+                available=True,
+                reason=None,
+                vertex_budget=cls.DEFAULT_VERTEX_BUDGET,
+                vendor="stub",
+                renderer="stub",
+                backend="stub",
+            )
+
+        def configure_channels(
+            self, *, infos: Sequence[object], hidden_indices: set[int]
+        ) -> None:
+            self.configured_infos = tuple(infos)
+            self.configured_hidden = set(hidden_indices)
+            for idx in range(len(infos)):
+                self.channel_visibility[idx] = idx not in hidden_indices
+
+        def set_view(self, start: float, duration: float) -> None:
+            self.view_state = (float(start), float(duration))
+
+        def set_theme(self, **kwargs) -> None:
+            self.theme_state = dict(kwargs)
+
+        def set_timebase(self, timebase) -> None:
+            self.timebase = timebase
+
+        def set_time_mode(self, mode: str) -> None:
+            self.time_mode = mode
+
+        def set_channel_label(self, idx: int, text: str, *, hidden: bool) -> None:
+            self.channel_labels[idx] = (text, hidden)
+
+        def set_hover_enabled(self, enabled: bool) -> None:
+            self._hover_enabled = bool(enabled)
+            self.hover_enabled_history.append(self._hover_enabled)
+
+        def apply_series(
+            self,
+            request_id: int,
+            series: Sequence[tuple[np.ndarray, np.ndarray]],
+            hidden_indices: Iterable[int],
+            *,
+            final: bool,
+            vertices: Sequence[np.ndarray] | None = None,
+        ) -> None:
+            self.series_calls.append((request_id, series, tuple(hidden_indices), final))
+
+        def estimate_pixels(self) -> int:
+            return 1024
+
+        def clear_channel(self, idx: int) -> None:
+            self.cleared_channels.append(idx)
+            if self._hover_enabled:
+                self.hoverExited.emit()
+
+        def set_channel_visibility(self, idx: int, visible: bool) -> None:
+            self.channel_visibility[idx] = bool(visible)
+            if not visible and self._hover_enabled:
+                self.hoverExited.emit()
+
+        def set_channel_data(self, idx: int, t: np.ndarray, x: np.ndarray) -> None:
+            self.channel_data[idx] = (np.asarray(t), np.asarray(x))
+
+        def set_curve_color(self, idx: int, color: str) -> None:
+            self.channel_colors[idx] = color
+
+        def update_annotations(
+            self,
+            events: Sequence[dict[str, object]] | None,
+            *,
+            view_start: float,
+            view_end: float,
+        ) -> None:
+            self.annotation_updates.append((events, float(view_start), float(view_end)))
+
+        def update_hypnogram(
+            self,
+            payload: object | None,
+            *,
+            visible: bool,
+            view_start: float,
+            view_end: float,
+        ) -> None:
+            self.hypnogram_updates.append((payload, bool(visible), float(view_start), float(view_end)))
+
+    dummy_service = _DummyPrefetchService()
+    monkeypatch.setattr(mw, "prefetch_service", dummy_service)
+    monkeypatch.setattr(mw, "VispyChannelCanvas", _StubVispyCanvas)
+
+    loader = FakeHeadlessLoader(duration_s=45.0, base_fs=50.0, n_channels=2)
+    config = ViewerConfig(
+        prefetch_tile_s=1.5,
+        prefetch_max_tiles=2,
+        prefetch_max_mb=1.0,
+        controls_collapsed=False,
+        canvas_backend="vispy",
+        lod_enabled=False,
+    )
+
+    window = mw.MainWindow(loader, config=config)
+    _process_events(qt_app)
+
+    assert window._use_gpu_canvas
+    canvas = window._gpu_canvas
+    assert isinstance(canvas, _StubVispyCanvas)
+    assert canvas.hover_enabled_history and canvas.hover_enabled_history[-1] is True
+
+    canvas.hoverMoved.emit(12.0, 3.5, 0)
+    _process_events(qt_app)
+    sample = window._hover_sample
+    assert sample is not None
+    assert sample.channel == 0
+    assert sample.time == pytest.approx(12.0)
+    assert sample.value == pytest.approx(3.5)
+
+    window._set_channel_visible(0, False)
+    _process_events(qt_app)
+    assert window._hover_sample is None
+    assert canvas.channel_visibility.get(0) is False
+
+    window._set_channel_visible(0, True)
+    _process_events(qt_app)
+    canvas.hoverMoved.emit(8.5, -1.25, 0)
+    _process_events(qt_app)
+    sample = window._hover_sample
+    assert sample is not None
+    assert sample.value == pytest.approx(-1.25)
+
+    canvas.hoverExited.emit()
+    _process_events(qt_app)
+    assert window._hover_sample is None
+
+    window._set_view(window._view_start, 360.0, sender="tests")
+    _process_events(qt_app)
+    assert not window._hover_backend_enabled
+    assert canvas.hover_enabled_history[-1] is False
+
+    window._set_view(window._view_start, 30.0, sender="tests")
+    _process_events(qt_app)
+    assert window._hover_backend_enabled
+    assert canvas.hover_enabled_history[-1] is True
+
     window._shutdown_overscan_worker()
     window.close()
     _process_events(qt_app)

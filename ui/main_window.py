@@ -8,6 +8,7 @@ import os
 import re
 from collections import Counter, OrderedDict
 from concurrent.futures import Future
+from dataclasses import dataclass
 from functools import partial
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -58,6 +59,13 @@ DEFAULT_STAGE_COLOR = "#4c5d73"
 
 STAGE_TEXT_MARGIN = 26.0
 PANEL_MAX_WIDTH = 400  # hard cap for the controls sidebar width
+
+
+@dataclass(slots=True)
+class _HoverSample:
+    channel: int
+    time: float
+    value: float
 
 
 class _ZarrIngestWorker(QtCore.QObject):
@@ -244,6 +252,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._gpu_canvas: VispyChannelCanvas | None = None
         self._gpu_init_error: str | None = None
         self._use_gpu_canvas = False
+        self._gpu_hover_connected = False
         if self._gpu_forced:
             if self._ensure_gpu_canvas_created():
                 self._use_gpu_canvas = True
@@ -268,6 +277,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._hover_label: pg.TextItem | None = None
         self._hover_plot: pg.PlotItem | None = None
         self._hover_label_anchor: tuple[float, float] = (0.0, 1.0)
+        self._hover_sample: _HoverSample | None = None
+        self._hover_backend_enabled: bool = False
         self._plot_viewport: QtWidgets.QWidget | None = None
         self._overscan_factor = 2.0  # windows per side
         self._overscan_zoom_reuse_ratio = 0.7
@@ -826,7 +837,16 @@ class MainWindow(QtWidgets.QMainWindow):
             self._gpu_autoswitch_enabled = False
             self._gpu_failure_reason = str(exc)
             LOG.warning("GPU canvas unavailable: %s", exc)
+            self._gpu_hover_connected = False
             return False
+        if not self._gpu_hover_connected:
+            try:
+                self._gpu_canvas.hoverMoved.connect(self._on_gpu_hover_moved)
+                self._gpu_canvas.hoverExited.connect(self._on_gpu_hover_exited)
+            except Exception:  # pragma: no cover - defensive guard
+                LOG.debug("Failed to connect GPU hover signals", exc_info=True)
+            else:
+                self._gpu_hover_connected = True
         return True
 
     def _ensure_cpu_canvas(self) -> pg.GraphicsLayoutWidget:
@@ -1916,6 +1936,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._schedule_refresh()
         self._schedule_prefetch()
         self._ensure_overscan_for_view()
+        self._sync_backend_hover_state()
 
     def _pan_fraction(self, fraction: float):
         delta = fraction * self._view_duration
@@ -3895,6 +3916,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._primary_plot = None
             self._ensure_hypnogram_plot()
             self._update_hypnogram_axis()
+            self._sync_backend_hover_state()
             return
 
         new_primary = self.plots[n - 1]
@@ -3933,6 +3955,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 plot.setAxisItems({"bottom": pg.AxisItem(orientation="bottom")})
 
         self._sync_hover_overlay_target()
+        self._sync_backend_hover_state()
 
     def _configure_gpu_canvas(self) -> None:
         backend = self._channel_backend if self._use_gpu_canvas else None
@@ -3966,7 +3989,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._channel_label_text(meta, hidden=hidden_flag),
                 hidden=hidden_flag,
             )
-        backend.set_hover_enabled(False)
+        self._sync_backend_hover_state()
 
     def _sync_channel_controls(self) -> None:
         if not hasattr(self, "channelSection"):
@@ -4039,6 +4062,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._config.save()
                 if state_changed:
                     self._invalidate_overscan_tile_cache()
+            if not visible and self._hover_sample is not None and self._hover_sample.channel == idx:
+                self._clear_hover_sample()
+            self._sync_backend_hover_state()
             return
         if idx >= len(self.plots):
             return
@@ -4075,11 +4101,15 @@ class MainWindow(QtWidgets.QMainWindow):
             checkbox.setChecked(visible)
             checkbox.blockSignals(False)
 
+        if not visible and self._hover_sample is not None and self._hover_sample.channel == idx:
+            self._hide_hover_indicator(detach=True)
+
         if persist:
             self._config.hidden_channels = tuple(sorted(self._hidden_channels))
             self._config.save()
             if state_changed:
                 self._invalidate_overscan_tile_cache()
+        self._sync_backend_hover_state()
 
     def _attach_hover_overlay(self, plot: pg.PlotItem | None) -> None:
         if self._use_gpu_canvas:
@@ -4119,7 +4149,35 @@ class MainWindow(QtWidgets.QMainWindow):
         if target_vb is not None and line_vb is not target_vb:
             self._attach_hover_overlay(plot)
 
+    def _sync_backend_hover_state(self) -> None:
+        backend = self._channel_backend
+        if backend is None:
+            self._hover_backend_enabled = False
+            self._clear_hover_sample()
+            return
+
+        visible_channels = any(
+            idx not in self._hidden_channels for idx in range(self.loader.n_channels)
+        )
+        enabled = (
+            visible_channels
+            and self._view_duration <= 300.0
+            and self.loader.n_channels > 0
+        )
+
+        if enabled != self._hover_backend_enabled:
+            self._hover_backend_enabled = enabled
+            try:
+                backend.set_hover_enabled(enabled)
+            except Exception:  # pragma: no cover - backend hook failures are non-fatal
+                LOG.debug("Failed to toggle hover on backend", exc_info=True)
+            if not enabled:
+                self._clear_hover_sample()
+                if not self._use_gpu_canvas:
+                    self._hide_hover_indicator(detach=True)
+
     def _hide_hover_indicator(self, *, detach: bool = False) -> None:
+        self._clear_hover_sample()
         if self._use_gpu_canvas:
             return
         if self._hover_line is not None:
@@ -4135,13 +4193,51 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._hide_hover_indicator()
 
+    def _handle_hover_sample(
+        self, channel_idx: int, sample_time: float, sample_value: float
+    ) -> bool:
+        if not self._hover_backend_enabled:
+            self._clear_hover_sample()
+            return False
+        if channel_idx < 0 or channel_idx >= self.loader.n_channels:
+            self._clear_hover_sample()
+            return False
+        if channel_idx in self._hidden_channels:
+            self._clear_hover_sample()
+            return False
+        if not (math.isfinite(sample_time) and math.isfinite(sample_value)):
+            self._clear_hover_sample()
+            return False
+        self._hover_sample = _HoverSample(channel_idx, float(sample_time), float(sample_value))
+        return True
+
+    def _clear_hover_sample(self) -> None:
+        if self._hover_sample is None:
+            return
+        self._hover_sample = None
+
+    @QtCore.Slot(float, float, int)
+    def _on_gpu_hover_moved(
+        self, sample_time: float, sample_value: float, channel_idx: int
+    ) -> None:
+        if not self._hover_backend_enabled:
+            return
+        if not self._handle_hover_sample(int(channel_idx), float(sample_time), float(sample_value)):
+            return
+
+    @QtCore.Slot()
+    def _on_gpu_hover_exited(self) -> None:
+        if not self._hover_backend_enabled:
+            return
+        self._clear_hover_sample()
+
     @QtCore.Slot(QtCore.QPointF)
     def _update_hover_indicator(self, scene_pos: QtCore.QPointF) -> None:
         if self._use_gpu_canvas:
             return
         if self._hover_line is None or self._hover_label is None:
             return
-        if self._view_duration > 300 or self._primary_plot is None:
+        if (not self._hover_backend_enabled) or self._primary_plot is None:
             self._hide_hover_indicator(detach=True)
             return
 
@@ -4179,6 +4275,9 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         sample_time, sample_value = sample
+        if not self._handle_hover_sample(active_idx, sample_time, sample_value):
+            self._hide_hover_indicator(detach=True)
+            return
         meta = self.loader.info[active_idx]
         unit = getattr(meta, "unit", "") or ""
         value_text = f"{sample_value:.3f}"
