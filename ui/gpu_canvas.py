@@ -261,12 +261,25 @@ class VispyChannelCanvas(QtWidgets.QWidget):
         device_ratio = max(device_ratio, 1.0)
         physical_width = max(1, int(round(width * device_ratio)))
         physical_height = max(1, int(round(height * device_ratio)))
+
         try:
-            self._canvas.size = (physical_width, physical_height)
-            with contextlib.suppress(AttributeError, TypeError):
-                self._canvas.pixel_scale = device_ratio
+            self._canvas.size = (width, height)
         except Exception:
             pass
+
+        backend = getattr(self._canvas, "_backend", None)
+        if backend is not None:
+            set_physical = getattr(backend, "_vispy_set_physical_size", None)
+            if callable(set_physical):
+                with contextlib.suppress(Exception):
+                    set_physical(physical_width, physical_height)
+
+        with contextlib.suppress(Exception):
+            context = getattr(self._canvas, "context", None)
+            if context is not None:
+                context.set_viewport(0, 0, physical_width, physical_height)
+        with contextlib.suppress(Exception):
+            self._canvas.update()
 
     # ------------------------------------------------------------------
     # Public control surface
