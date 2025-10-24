@@ -164,7 +164,20 @@ class ZarrLoader:
 
 
     def close(self):
-        pass
+        store = getattr(self._root, "store", None)
+        close_fn = getattr(store, "close", None)
+        if callable(close_fn):
+            try:
+                close_fn()
+            except Exception:
+                pass
+
+    def clone(self) -> "ZarrLoader":
+        return ZarrLoader(
+            self.path,
+            max_window_s=self.max_window_s,
+            annotations=self._annotations,
+        )
 
     # ------------------------------------------------------------------
 

@@ -168,9 +168,11 @@ class _OverscanWorker(QtCore.QObject):
         lod_min_bin_multiple: float = 2.0,
         lod_min_view_duration: float | None = None,
         lod_ratio: float | None = None,
+        owns_loader: bool = False,
     ):
         super().__init__()
         self._loader = loader
+        self._owns_loader = bool(owns_loader)
         self._lod_enabled = bool(lod_enabled)
         self._lod_min_bin_multiple = max(1.0, float(lod_min_bin_multiple))
         if lod_min_view_duration is None:
@@ -447,6 +449,19 @@ class _OverscanWorker(QtCore.QObject):
             )
         return chunk
 
+    @QtCore.Slot()
+    def shutdown(self):
+        loader = self._loader
+        self._loader = None
+        if not self._owns_loader or loader is None:
+            return
+        close_fn = getattr(loader, "close", None)
+        if callable(close_fn):
+            try:
+                close_fn()
+            except Exception:
+                pass
+
 
 class MainWindow(QtWidgets.QMainWindow):
     overscanRequested = QtCore.Signal(object)
@@ -485,6 +500,9 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self._updating_viewbox = False
         self._maybe_build_int16_cache()
+        self._prefetch_loader: object | None = None
+        self._prefetch_loader_owned: bool = False
+        self._prefetch_loader, self._prefetch_loader_owned = self._make_background_loader(self.loader)
         prefetch_service.configure(
             tile_duration=self._config.prefetch_tile_s,
             max_tiles=self._config.prefetch_max_tiles,
@@ -1513,20 +1531,97 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addStretch(1)
         self.themePreviewWidget.setVisible(bool(colors))
 
+    def _make_background_loader(self, base_loader):
+        clone_fn = getattr(base_loader, "clone", None)
+        if callable(clone_fn):
+            try:
+                clone = clone_fn()
+            except Exception as exc:
+                LOG.debug("Loader clone via clone() failed: %s", exc)
+            else:
+                return clone, True
+        path = getattr(base_loader, "path", None)
+        if not path:
+            return base_loader, False
+        cls = type(base_loader)
+        kwargs = {}
+        max_window = getattr(base_loader, "max_window_s", None)
+        if isinstance(max_window, (int, float)):
+            kwargs["max_window_s"] = float(max_window)
+        try:
+            clone = cls(path, **kwargs)
+        except TypeError:
+            try:
+                clone = cls(path)
+            except Exception as exc:
+                LOG.warning(
+                    "Failed to clone loader %s from %s: %s",
+                    cls.__name__,
+                    path,
+                    exc,
+                )
+                return base_loader, False
+        except Exception as exc:
+            LOG.warning(
+                "Failed to clone loader %s from %s: %s",
+                cls.__name__,
+                path,
+                exc,
+            )
+            return base_loader, False
+        return clone, True
+
+    def _release_prefetch_loader(self) -> None:
+        loader = getattr(self, "_prefetch_loader", None)
+        if loader is None:
+            return
+        if getattr(self, "_prefetch_loader_owned", False):
+            close_fn = getattr(loader, "close", None)
+            if callable(close_fn):
+                try:
+                    close_fn()
+                except Exception:
+                    pass
+        self._prefetch_loader = None
+        self._prefetch_loader_owned = False
+
+    def _reset_prefetch_loader(self) -> None:
+        if getattr(self, "_prefetch", None) is not None:
+            self._prefetch.stop()
+        self._release_prefetch_loader()
+        self._prefetch_loader, self._prefetch_loader_owned = self._make_background_loader(
+            self.loader
+        )
+        if getattr(self, "_prefetch", None) is not None:
+            self._prefetch.clear()
+            self._prefetch.start()
+
     def _init_overscan_worker(self):
         self._shutdown_overscan_worker()
+        worker_loader, owns_loader = self._make_background_loader(self.loader)
+        if not owns_loader and worker_loader is self.loader:
+            LOG.warning(
+                "Overscan worker disabled: unable to clone loader for background rendering."
+            )
+            self._overscan_thread = None
+            self._overscan_worker = None
+            self._overscan_inflight = None
+            self._current_tile_id = None
+            return
         thread = QtCore.QThread(self)
         lod_ratio = float(getattr(self._config, "lod_envelope_ratio", 0.0) or 0.0)
         worker = _OverscanWorker(
-            self.loader,
+            worker_loader,
             lod_enabled=self._lod_enabled,
             lod_min_bin_multiple=self._lod_min_bin_multiple,
             lod_min_view_duration=self._lod_min_view_duration,
             lod_ratio=lod_ratio,
+            owns_loader=owns_loader,
         )
         worker.moveToThread(thread)
         worker.finished.connect(self._handle_overscan_finished)
         worker.failed.connect(self._handle_overscan_failed)
+        thread.finished.connect(worker.shutdown)
         thread.finished.connect(worker.deleteLater)
         thread.start()
         self._overscan_thread = thread
@@ -1551,13 +1646,18 @@ class MainWindow(QtWidgets.QMainWindow):
             thread.wait()
         if worker is not None:
             try:
+                worker.shutdown()
+            except Exception:
+                pass
+            try:
                 worker.deleteLater()
             except RuntimeError:
                 pass
 
-    def _available_lod_durations(self, channel: int) -> tuple[float, ...]:
+    def _available_lod_durations(self, channel: int, loader=None) -> tuple[float, ...]:
         durations: list[float] = []
-        levels_fn = getattr(self.loader, "lod_levels", None)
+        source = loader or self.loader
+        levels_fn = getattr(source, "lod_levels", None)
         if callable(levels_fn):
             try:
                 levels = levels_fn(channel)
@@ -1569,7 +1669,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 else:
                     durations.extend(float(val) for val in levels)
         if not durations:
-            durations_fn = getattr(self.loader, "lod_durations", None)
+            durations_fn = getattr(source, "lod_durations", None)
             if callable(durations_fn):
                 try:
                     extra = durations_fn(channel)
@@ -1745,6 +1845,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 else:
                     self.loader = restored
                     self._update_data_source_label()
+                    self._invalidate_overscan_tile_cache()
+                    self._init_overscan_worker()
+                    self._reset_prefetch_loader()
+                    self._schedule_prefetch()
+                    self._ensure_overscan_for_view()
             return
 
         if not same_path:
@@ -1782,10 +1887,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._load_companion_annotations()
         self._invalidate_overscan_tile_cache()
         self._init_overscan_worker()
+        self._reset_prefetch_loader()
+        self._schedule_prefetch()
         self._ensure_overscan_for_view()
         self._start_zarr_ingest()
-        self._prefetch.clear()
-        self._schedule_prefetch()
 
     def _create_loader_for_path(self, path: str) -> object:
         candidate = Path(path)
@@ -1930,7 +2035,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.refresh()
         self._load_companion_annotations()
         self._update_data_source_label()
-        self._prefetch.clear()
+        self._reset_prefetch_loader()
         self._schedule_prefetch()
         self._ensure_overscan_for_view()
 
@@ -2080,7 +2185,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_view(0.0, self.loader.duration_s, sender="buttons")
 
     def _fetch_tile(self, channel: int, start: float, end: float):
-        loader = self.loader
+        loader = self._prefetch_loader or self.loader
         start, duration = clamp_window(start, end - start, total=loader.duration_s, limits=self._limits)
         result = loader.read(channel, start, start + duration)
         if isinstance(result, SignalChunk):
@@ -2088,13 +2193,13 @@ class MainWindow(QtWidgets.QMainWindow):
         return result
 
     def _fetch_tile_preview(self, channel: int, start: float, end: float):
-        loader = self.loader
+        loader = self._prefetch_loader or self.loader
         start, duration = clamp_window(start, end - start, total=loader.duration_s, limits=self._limits)
         if duration <= 0:
             empty = np.zeros(0, dtype=np.float64)
             return empty, empty.astype(np.float32)
         window_end = start + duration
-        durations = self._available_lod_durations(channel)
+        durations = self._available_lod_durations(channel, loader)
         read_window = getattr(loader, "read_lod_window", None)
         if durations and callable(read_window):
             coarse = durations[-1]
@@ -3227,7 +3332,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def closeEvent(self, event):
         self._cleanup_ingest_thread(wait=True)
-        self._prefetch.stop()
+        if getattr(self, "_prefetch", None) is not None:
+            self._prefetch.stop()
+        self._release_prefetch_loader()
         self._shutdown_overscan_worker()
         super().closeEvent(event)
 

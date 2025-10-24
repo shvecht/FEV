@@ -42,6 +42,19 @@ class EdfLoader:
         self._scratch_float32: Dict[int, np.ndarray] = {}
         self._annotations: annotations_core.Annotations | None = None
 
+    def close(self) -> None:
+        with self._lock:
+            try:
+                self._r.close()
+            except Exception:
+                pass
+
+    def clone(self) -> "EdfLoader":
+        return EdfLoader(
+            self.path,
+            max_window_s=self.max_window_s,
+        )
+
     def _build_channel_metadata(
         self,
     ) -> Tuple[List[str], List[float], List[int], List[ChannelInfo], Tuple[int, ...]]:
