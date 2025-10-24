@@ -21,6 +21,22 @@ performance changes. The steps assume the synthetic fixtures already ship with
 3. If any window exceeds 1.0 s for the refined draw, capture a profiler trace
    (e.g. `python -m cProfile -o overscan.prof scripts/profile_draw.py ...`).
 
+## GPU vs CPU parity (overscan overlays)
+
+1. Ensure the overscan cache matches production defaults: `overscan.window_preload=2`
+   and `overscan.preview_stride=2` in `config.ini` (no overrides in your
+   environment variables).
+2. Launch the renderer benchmark with representative channel counts:
+   ``python scripts/benchmark_renderers.py --channels 6 --channels 12 --channels 24 --iterations 6``.
+3. For GPU-equipped workstations, re-run without `--skip-gpu`; on CPU-only CI,
+   keep the flag so the harness still exercises the CPU overlays.
+4. Record both the average frame time and reported vertex totals for each batch
+   (values are printed to stdout).  Investigate any GPU frame time that trails
+   the CPU by more than 15 % or increases the peak Python memory footprint by
+   ≥25 %.
+5. When investigating a regression, repeat the run with `QT_QPA_PLATFORM=offscreen`
+   to eliminate desktop compositor differences.
+
 ## Screenshot regression check
 
 1. With the viewer still pointed at `raw/test.edf`, grab a headless screenshot

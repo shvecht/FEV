@@ -237,13 +237,16 @@ class MainWindow(QtWidgets.QMainWindow):
             self._gpu_probe.reason if not self._gpu_probe.available else None
         )
         base_budget = self._gpu_probe.vertex_budget or VispyChannelCanvas.DEFAULT_VERTEX_BUDGET
-        self._gpu_vertex_promote_threshold = max(300_000, int(base_budget * 0.55))
-        self._gpu_vertex_demote_threshold = max(150_000, int(self._gpu_vertex_promote_threshold * 0.55))
+        self._gpu_vertex_promote_threshold = max(360_000, int(base_budget * 0.6))
+        self._gpu_vertex_demote_threshold = max(210_000, int(self._gpu_vertex_promote_threshold * 0.6))
         if self._gpu_vertex_demote_threshold >= self._gpu_vertex_promote_threshold:
-            self._gpu_vertex_demote_threshold = max(150_000, int(self._gpu_vertex_promote_threshold * 0.5))
+            self._gpu_vertex_demote_threshold = max(210_000, int(self._gpu_vertex_promote_threshold * 0.55))
         self._gpu_promote_counter = 0
         self._gpu_demote_counter = 0
+        self._gpu_promote_required = 3
+        self._gpu_demote_required = 3
         self._gpu_last_vertex_count = 0
+        self._gpu_vertex_log_bucket: int | None = None
         self._gpu_switch_in_progress = False
 
         requested_backend = str(getattr(self._config, "canvas_backend", "pyqtgraph"))
@@ -1094,6 +1097,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self._gpu_last_vertex_count = max(0, int(vertex_count))
         if not self._gpu_autoswitch_enabled or self._gpu_switch_in_progress:
             return
+        bucket = int(self._gpu_last_vertex_count / 100_000) if self._gpu_last_vertex_count else 0
+        if bucket != self._gpu_vertex_log_bucket:
+            LOG.info(
+                "Renderer autoswitch load: %s vertices (promote ≥ %s, demote ≤ %s)",
+                f"{self._gpu_last_vertex_count:,}",
+                f"{self._gpu_vertex_promote_threshold:,}",
+                f"{self._gpu_vertex_demote_threshold:,}",
+            )
+            self._gpu_vertex_log_bucket = bucket
         if self._use_gpu_canvas:
             self._gpu_promote_counter = 0
             if self._gpu_forced:
@@ -1102,7 +1114,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._gpu_demote_counter += 1
             else:
                 self._gpu_demote_counter = 0
-            if self._gpu_demote_counter >= 2:
+            if self._gpu_demote_counter >= self._gpu_demote_required:
+                LOG.info(
+                    "Renderer autoswitch demote after %d frames ≤ %s vertices",
+                    self._gpu_demote_counter,
+                    f"{self._gpu_vertex_demote_threshold:,}",
+                )
                 if self._switch_to_cpu():
                     self._gpu_demote_counter = 0
         else:
@@ -1111,7 +1128,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._gpu_promote_counter += 1
             else:
                 self._gpu_promote_counter = 0
-            if self._gpu_promote_counter >= 2:
+            if self._gpu_promote_counter >= self._gpu_promote_required:
+                LOG.info(
+                    "Renderer autoswitch promote after %d frames ≥ %s vertices",
+                    self._gpu_promote_counter,
+                    f"{self._gpu_vertex_promote_threshold:,}",
+                )
                 if self._switch_to_gpu():
                     self._gpu_promote_counter = 0
 
