@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import types
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -11,6 +10,8 @@ import contextlib
 
 import numpy as np
 from PySide6 import QtCore, QtWidgets, QtGui
+
+from ui.time_axis_formatter import TimeTickFormatter
 
 LOG = logging.getLogger(__name__)
 
@@ -185,7 +186,7 @@ class VispyChannelCanvas(QtWidgets.QWidget):
         self._label_active_color = Color("#dfe7ff")
         self._label_hidden_color = Color("#6c788f")
         self._grid_line_color = Color((0.45, 0.52, 0.68, 0.2))
-        self._axis_formatter_installed = False
+        self._axis_formatter = TimeTickFormatter()
         self._timebase = None
         self._time_mode = "relative"
 
@@ -631,7 +632,7 @@ class VispyChannelCanvas(QtWidgets.QWidget):
             self._gutter_axis_placeholder = placeholder
         if self._views:
             self._x_axis.link_view(self._views[0])
-        self._install_axis_formatter()
+        self._apply_axis_formatter()
         self._update_axis_theme()
         self.set_view(self._view_start, self._view_duration)
 
@@ -797,63 +798,22 @@ class VispyChannelCanvas(QtWidgets.QWidget):
 
     def set_timebase(self, timebase) -> None:
         self._timebase = timebase
+        self._axis_formatter.set_timebase(timebase)
         self._request_axis_update()
 
     def set_time_mode(self, mode: str) -> None:
         mode_lower = str(mode).lower()
         self._time_mode = "absolute" if mode_lower == "absolute" else "relative"
+        self._axis_formatter.set_mode(self._time_mode)
         self._request_axis_update()
 
-    def _format_tick_label(self, value: float) -> str:
-        if not np.isfinite(value):
-            return ""
-        if self._time_mode == "absolute" and self._timebase is not None:
-            try:
-                dt = self._timebase.to_datetime(float(value))
-            except Exception:
-                dt = None
-            if dt is not None:
-                with contextlib.suppress(Exception):
-                    return dt.strftime("%H:%M:%S")
-        seconds = float(value)
-        sign = "-" if seconds < 0 else ""
-        total = int(round(abs(seconds)))
-        hours, rem = divmod(total, 3600)
-        minutes, secs = divmod(rem, 60)
-        return f"{sign}{hours:02d}:{minutes:02d}:{secs:02d}"
-
-    def _install_axis_formatter(self) -> None:
-        if self._axis_formatter_installed or self._x_axis is None:
+    def _apply_axis_formatter(self) -> None:
+        if self._x_axis is None:
             return
         axis = getattr(self._x_axis, "axis", None)
         if axis is None:
             return
-        original = getattr(axis, "_get_tick_frac_labels", None)
-        if original is None:
-            return
-
-        def patched(self_axis):
-            major_frac, minor_frac, labels = original()
-            if major_frac is None or len(major_frac) == 0:
-                return major_frac, minor_frac, labels
-            domain = getattr(self_axis, "domain", None)
-            if not domain or len(domain) != 2:
-                return major_frac, minor_frac, labels
-            try:
-                start = float(domain[0])
-                end = float(domain[1])
-            except Exception:
-                return major_frac, minor_frac, labels
-            span = end - start
-            if abs(span) < 1e-12:
-                values = [start for _ in major_frac]
-            else:
-                values = [start + frac * span for frac in major_frac]
-            formatted = [self._format_tick_label(val) for val in values]
-            return major_frac, minor_frac, formatted
-
-        axis._get_tick_frac_labels = types.MethodType(patched, axis)
-        self._axis_formatter_installed = True
+        axis.tick_formatter = self._axis_formatter
 
     def _update_axis_theme(self) -> None:
         if self._x_axis is None:
