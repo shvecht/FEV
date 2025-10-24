@@ -17,73 +17,12 @@ LOG = logging.getLogger(__name__)
 try:  # pragma: no cover - import guarded for optional dependency
     from vispy import app as _vispy_app
     from vispy import scene
+    from vispy.scene import transforms
     from vispy.color import Color
 except Exception:  # pragma: no cover - handled by MainWindow fallback
     _vispy_app = None
     scene = None  # type: ignore
     Color = None  # type: ignore
-
-
-if scene is not None:
-    class _ChannelLabelWidget(scene.widgets.Widget):  # type: ignore[misc]
-        """Lightweight label widget that mirrors the CPU viewer styling."""
-
-        def __init__(
-            self,
-            *,
-            margin_px: float = 8.0,
-            font_size: float = 12.0,
-            active_color: str = "white",
-            hidden_color: str = "#6c788f",
-        ) -> None:
-            super().__init__(border_color=None, bgcolor=None, margin=0, padding=0)
-            self._margin_px = float(margin_px)
-            self._text = scene.visuals.Text(  # type: ignore[attr-defined]
-                text="",
-                color=active_color,
-                anchor_x="right",
-                anchor_y="top",
-                font_size=font_size,
-                method="cpu",
-            )
-            self._text.bold = True
-            self._text.italic = False
-            self.add_subvisual(self._text)
-            self._active_color = active_color
-            self._hidden_color = hidden_color
-            self._hidden = False
-            self._update_text_pos()
-
-        def on_resize(self, event) -> None:  # pragma: no cover - GUI only
-            del event
-            self._update_text_pos()
-
-        def set_palette(self, *, active: str, hidden: str) -> None:
-            self._active_color = active
-            self._hidden_color = hidden
-            self._apply_palette()
-
-        def set_hidden(self, hidden: bool) -> None:
-            self._hidden = bool(hidden)
-            self._apply_palette()
-
-        def set_text(self, text: str) -> None:
-            self._text.text = text
-
-        def _apply_palette(self) -> None:
-            color = self._hidden_color if self._hidden else self._active_color
-            self._text.color = color
-            self._text.bold = not self._hidden
-            self._text.italic = self._hidden
-
-        def _update_text_pos(self) -> None:
-            rect = self.inner_rect
-            x = rect.right - self._margin_px
-            y = rect.top - self._margin_px
-            self._text.pos = (x, y)
-
-else:  # pragma: no cover - VisPy unavailable, dummy for type checking
-    _ChannelLabelWidget = object  # type: ignore[assignment]
 
 
 @dataclass(slots=True)
@@ -117,9 +56,6 @@ class VispyChannelCanvas(QtWidgets.QWidget):
     hoverExited = QtCore.Signal()
 
     DEFAULT_VERTEX_BUDGET = 900_000
-    LABEL_WIDTH_MIN = 112
-    LABEL_WIDTH_MAX = 224
-    LABEL_MARGIN_PX = 8.0
 
     @classmethod
     def capability_probe(cls) -> VispyCapability:
@@ -217,15 +153,11 @@ class VispyChannelCanvas(QtWidgets.QWidget):
 
         self._views: list[scene.widgets.ViewBox] = []
         self._lines: list[scene.visuals.Line] = []
-        self._label_widgets: list[_ChannelLabelWidget] = []  # type: ignore[type-arg]
+        self._label_nodes: list[scene.visuals.Text] = []
         self._channel_states: list[_ChannelState] = []
         self._channel_visible: list[bool] = []
         self._channel_colors: list[Color] = []
         self._view_y_ranges: list[tuple[float, float]] = []
-        self._axis_placeholder: scene.widgets.Widget | None = None
-
-        self._label_active_color = "#dfe7ff"
-        self._label_hidden_color = "#6c788f"
 
         self._hover_line = scene.visuals.Line(
             pos=self._empty_vertices(),
@@ -263,24 +195,19 @@ class VispyChannelCanvas(QtWidgets.QWidget):
         *,
         background: str,
         curve_colors: Sequence[str],
-        label_active_color: str,
-        label_hidden_color: str,
+        label_color: str,
     ) -> None:
         """Update canvas palette."""
 
         self._canvas.bgcolor = Color(background)
         self._channel_colors = [Color(code) for code in curve_colors]
-        self._label_active_color = label_active_color
-        self._label_hidden_color = label_hidden_color
-        for idx, widget in enumerate(self._label_widgets):
-            widget.set_palette(active=label_active_color, hidden=label_hidden_color)
-            hidden = idx < len(self._channel_visible) and not self._channel_visible[idx]
-            widget.set_hidden(hidden)
+        for idx, text in enumerate(self._label_nodes):
+            text.color = Color(label_color)
             if idx < len(self._channel_colors):
                 line = self._lines[idx]
                 line.set_data(color=self._channel_colors[idx])
         if self._x_axis is not None:
-            axis_color = Color(label_active_color)
+            axis_color = Color(label_color)
             # Update available color properties without assigning new attributes.
             with contextlib.suppress(AttributeError):
                 self._x_axis.axis.tick_color = axis_color
@@ -297,44 +224,21 @@ class VispyChannelCanvas(QtWidgets.QWidget):
 
         count = len(infos)
         self._ensure_rows(count)
-        total_views = len(self._views)
+        self._channel_visible = [idx not in hidden_indices for idx in range(count)]
+        for idx, meta in enumerate(infos):
+            name = getattr(meta, "name", f"Ch {idx + 1}")
+            unit = getattr(meta, "unit", "")
+            label = f"{name}"
+            if unit:
+                label = f"{label} [{unit}]"
+            self._label_nodes[idx].text = label
+            self._views[idx].visible = self._channel_visible[idx]
+            self._lines[idx].visible = self._channel_visible[idx]
 
-        if len(self._channel_visible) < total_views:
-            self._channel_visible.extend([True] * (total_views - len(self._channel_visible)))
-
-        for idx in range(total_views):
-            in_range = idx < count
-            meta = infos[idx] if in_range else None
-            hidden = idx in hidden_indices if in_range else True
-            visible = in_range and not hidden
-            self._channel_visible[idx] = visible
-
-            if idx < len(self._label_widgets):
-                widget = self._label_widgets[idx]
-                if in_range and meta is not None:
-                    name = getattr(meta, "name", f"Ch {idx + 1}")
-                    unit = getattr(meta, "unit", "")
-                    label = f"{name}"
-                    if unit:
-                        label = f"{label} [{unit}]"
-                    widget.set_text(label)
-                    widget.set_hidden(hidden)
-                    widget.visible = True
-                else:
-                    widget.set_text("")
-                    widget.set_hidden(False)
-                    widget.visible = False
-
-            if idx < len(self._views):
-                view = self._views[idx]
-                line = self._lines[idx]
-                view.visible = visible
-                line.visible = visible
-                if not visible and idx < len(self._channel_states):
-                    # Keep cached data for hidden channels; drop it entirely if the row is unused.
-                    if not in_range:
-                        self._channel_states[idx] = _ChannelState(t=np.array([]), x=np.array([]))
-                    line.set_data(pos=self._empty_vertices())
+        for idx in range(count, len(self._views)):
+            self._views[idx].visible = False
+            self._lines[idx].visible = False
+            self._label_nodes[idx].text = ""
 
     def set_channel_visibility(self, idx: int, visible: bool) -> None:
         if idx >= len(self._views):
@@ -342,31 +246,12 @@ class VispyChannelCanvas(QtWidgets.QWidget):
         self._channel_visible[idx] = visible
         self._views[idx].visible = visible
         self._lines[idx].visible = visible
-        if idx < len(self._label_widgets):
-            self._label_widgets[idx].set_hidden(not visible)
-            self._label_widgets[idx].visible = True
         if not visible:
             self._lines[idx].set_data(pos=np.zeros((0, 2), dtype=np.float32))
-        else:
-            if idx < len(self._channel_states):
-                state = self._channel_states[idx]
-                if state.t.size and state.x.size:
-                    vertex = self._prepare_vertices(state.t, state.x)
-                    color = (
-                        self._channel_colors[idx]
-                        if idx < len(self._channel_colors)
-                        else Color("#66aaff")
-                    )
-                    self._lines[idx].set_data(pos=vertex, color=color, width=1.2)
-                    self._update_channel_range(idx, state)
 
     def set_channel_label(self, idx: int, text: str) -> None:
-        if idx < len(self._label_widgets):
-            widget = self._label_widgets[idx]
-            widget.set_text(text)
-            hidden = idx < len(self._channel_visible) and not self._channel_visible[idx]
-            widget.set_hidden(hidden)
-            widget.visible = True
+        if idx < len(self._label_nodes):
+            self._label_nodes[idx].text = text
 
     def set_curve_color(self, idx: int, color: str) -> None:
         if idx >= len(self._lines):
@@ -504,27 +389,25 @@ class VispyChannelCanvas(QtWidgets.QWidget):
         if self._x_axis is not None:
             self._grid.remove_widget(self._x_axis)
             self._x_axis = None
-        if self._axis_placeholder is not None:
-            self._grid.remove_widget(self._axis_placeholder)
-            self._axis_placeholder = None
 
         while len(self._views) < count:
             row = len(self._views)
-            label_widget = _ChannelLabelWidget(  # type: ignore[operator]
-                margin_px=self.LABEL_MARGIN_PX,
+            label = scene.visuals.Text(
+                text="",
+                anchor_x="left",
+                anchor_y="top",
+                color="white",
                 font_size=12,
-                active_color=self._label_active_color,
-                hidden_color=self._label_hidden_color,
             )
-            label_widget.width_min = self.LABEL_WIDTH_MIN
-            label_widget.width_max = self.LABEL_WIDTH_MAX
-            self._grid.add_widget(label_widget, row=row, col=0)
+            label_transform = transforms.STTransform(translate=(4, 4))
+            label.transform = label_transform
 
             view = self._grid.add_view(row=row, col=1, camera="panzoom")
             view.camera.interactive = False
             view.border_color = None
             view.padding = 0.0
 
+            view.add(label)
             line = scene.visuals.Line(method="gl")
             line.set_data(pos=self._empty_vertices())
             line.visible = False
@@ -534,18 +417,13 @@ class VispyChannelCanvas(QtWidgets.QWidget):
 
             self._views.append(view)
             self._lines.append(line)
-            self._label_widgets.append(label_widget)
+            self._label_nodes.append(label)
             self._channel_states.append(_ChannelState(t=np.array([]), x=np.array([])))
             self._channel_visible.append(True)
             self._channel_colors.append(Color("#66aaff"))
             self._view_y_ranges.append((-1.0, 1.0))
 
         # Re-append axis under the populated rows.
-        placeholder = scene.widgets.Widget(border_color=None, bgcolor=None, margin=0, padding=0)
-        placeholder.width_min = self.LABEL_WIDTH_MIN
-        placeholder.width_max = self.LABEL_WIDTH_MAX
-        self._grid.add_widget(placeholder, row=len(self._views), col=0)
-        self._axis_placeholder = placeholder
         self._x_axis = scene.AxisWidget(orientation="bottom")
         self._x_axis.axis.scale_type = "linear"
         self._x_axis.height_max = 32
