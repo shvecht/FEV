@@ -58,6 +58,7 @@ class VispyChannelCanvas(QtWidgets.QWidget):
     hoverExited = QtCore.Signal()
 
     DEFAULT_VERTEX_BUDGET = 900_000
+    supports_annotations = True
 
     @property
     def widget(self) -> QtWidgets.QWidget:  # pragma: no cover - trivial accessor
@@ -189,6 +190,20 @@ class VispyChannelCanvas(QtWidgets.QWidget):
         self._axis_formatter = TimeTickFormatter()
         self._timebase = None
         self._time_mode = "relative"
+
+        self._hypnogram_view: scene.widgets.ViewBox | None = None
+        self._hypnogram_label_view: scene.widgets.ViewBox | None = None
+        self._hypnogram_label_text: scene.visuals.Text | None = None
+        self._hypnogram_outline: scene.visuals.Line | None = None
+        self._hypnogram_fill_meshes: dict[str, scene.visuals.Mesh] = {}
+        self._hypnogram_region_mesh: scene.visuals.Mesh | None = None
+        self._hypnogram_region_border: scene.visuals.Line | None = None
+        self._hypnogram_visible = False
+        self._hypnogram_y_range: tuple[float, float] = (-0.6, 0.6)
+        self._annotation_rectangles: list[scene.visuals.Mesh] = []
+        self._annotation_marker_lines: list[scene.visuals.Line] = []
+        self._annotation_events_visible = False
+        self._annotation_faces = np.array([[0, 1, 2], [2, 1, 3]], dtype=np.uint32)
 
         self._hover_line = scene.visuals.Line(
             pos=self._empty_vertices(),
@@ -340,6 +355,10 @@ class VispyChannelCanvas(QtWidgets.QWidget):
             self._install_axis_formatter()
             self._request_axis_update()
         self._update_grid_palette()
+        if self._hypnogram_view is not None:
+            self._hypnogram_view.bgcolor = self._background_color
+        if self._hypnogram_label_text is not None:
+            self._hypnogram_label_text.color = self._label_active_color
 
     def configure_channels(
         self,
@@ -509,6 +528,186 @@ class VispyChannelCanvas(QtWidgets.QWidget):
             final=final,
         )
 
+    def update_hypnogram(
+        self,
+        payload: dict[str, object] | None,
+        *,
+        visible: bool,
+        view_start: float,
+        view_end: float,
+    ) -> None:
+        if not visible or payload is None:
+            self._hypnogram_visible = False
+            if self._hypnogram_outline is not None:
+                self._hypnogram_outline.visible = False
+            self._update_hypnogram_region_visual(view_start, view_end)
+            self._update_annotation_lane_visibility()
+            return
+
+        self._ensure_hypnogram_row()
+        self._hypnogram_visible = True
+
+        step_x = payload.get("step_x")
+        step_y = payload.get("step_y")
+        outline_points: list[tuple[float, float]] = []
+        outline_connect: list[tuple[int, int]] = []
+        if isinstance(step_x, np.ndarray) and isinstance(step_y, np.ndarray):
+            prev_idx = None
+            for x_val, y_val in zip(step_x, step_y):
+                if not (np.isfinite(x_val) and np.isfinite(y_val)):
+                    prev_idx = None
+                    continue
+                outline_points.append((float(x_val), float(y_val)))
+                curr_idx = len(outline_points) - 1
+                if prev_idx is not None:
+                    outline_connect.append((prev_idx, curr_idx))
+                prev_idx = curr_idx
+        if self._hypnogram_outline is not None:
+            if outline_points:
+                pos_arr = np.asarray(outline_points, dtype=np.float32)
+                connect_arr = (
+                    np.asarray(outline_connect, dtype=np.uint32)
+                    if outline_connect
+                    else None
+                )
+                self._hypnogram_outline.set_data(
+                    pos=pos_arr,
+                    connect=connect_arr,
+                    color=self._label_active_color,
+                    width=1.0,
+                )
+                self._hypnogram_outline.visible = True
+            else:
+                self._hypnogram_outline.visible = False
+
+        label_data = payload.get("label_data", {})
+        colors = payload.get("colors", {})
+        active_labels: set[str] = set()
+        if isinstance(label_data, dict):
+            for label, data in label_data.items():
+                x_vals = data.get("x")
+                top_vals = data.get("top")
+                fill_level = float(data.get("fill", 0.0))
+                if not isinstance(x_vals, np.ndarray) or not isinstance(top_vals, np.ndarray):
+                    continue
+                vertices, faces = self._stage_fill_mesh_data(x_vals, top_vals, fill_level)
+                mesh = self._hypnogram_fill_meshes.get(label)
+                if vertices is None or faces is None:
+                    if mesh is not None:
+                        mesh.visible = False
+                    continue
+                if mesh is None:
+                    mesh = scene.visuals.Mesh()
+                    mesh.set_gl_state(depth_test=False, blend=True)
+                    mesh.visible = False
+                    if self._hypnogram_view is not None:
+                        self._hypnogram_view.add(mesh)
+                    self._hypnogram_fill_meshes[label] = mesh
+                color = colors.get(label)
+                if isinstance(color, QtGui.QColor):
+                    rgba = (
+                        float(color.redF()),
+                        float(color.greenF()),
+                        float(color.blueF()),
+                        0.5,
+                    )
+                else:
+                    rgba = Color(color or "#6c788f").rgba
+                mesh.set_data(vertices=vertices, faces=faces, color=rgba)
+                mesh.visible = True
+                active_labels.add(label)
+        for label, mesh in list(self._hypnogram_fill_meshes.items()):
+            if label not in active_labels:
+                mesh.visible = False
+
+        try:
+            max_level = float(payload.get("max_level", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            max_level = 0.0
+        self._hypnogram_y_range = (-0.6, max(0.6, max_level + 0.6))
+        if self._hypnogram_view is not None:
+            self._hypnogram_view.camera.set_range(
+                x=(view_start, view_end),
+                y=self._hypnogram_y_range,
+            )
+
+        self._update_hypnogram_region_visual(view_start, view_end)
+        self._update_annotation_lane_visibility()
+
+    def update_annotations(
+        self,
+        events: Sequence[dict[str, object]] | None,
+        *,
+        view_start: float,
+        view_end: float,
+    ) -> None:
+        entries = list(events or [])
+        if not entries:
+            self._annotation_events_visible = False
+            for mesh in self._annotation_rectangles:
+                mesh.visible = False
+            for line in self._annotation_marker_lines:
+                line.visible = False
+            self._update_annotation_lane_visibility()
+            return
+
+        self._ensure_annotation_mesh_pool(len(entries))
+        self._ensure_annotation_marker_pool(len(entries))
+        self._annotation_events_visible = True
+
+        y0, y1 = self._hypnogram_y_range
+        if not (np.isfinite(y0) and np.isfinite(y1)) or y1 <= y0:
+            y0, y1 = -0.6, 0.6
+
+        faces = self._annotation_faces
+        for idx, entry in enumerate(entries):
+            start = float(entry.get("start", 0.0))
+            end = float(entry.get("end", start))
+            if not np.isfinite(start):
+                start = 0.0
+            if not np.isfinite(end) or end <= start:
+                end = start + 0.5
+            color = entry.get("color")
+            if color is None:
+                color = (0.9, 0.6, 0.3, 0.3)
+            line_color = entry.get("line_color", color)
+            mesh = self._annotation_rectangles[idx]
+            vertices = np.array(
+                [
+                    (start, y0, 0.0),
+                    (start, y1, 0.0),
+                    (end, y0, 0.0),
+                    (end, y1, 0.0),
+                ],
+                dtype=np.float32,
+            )
+            mesh.set_data(vertices=vertices, faces=faces, color=color)
+            mesh.visible = True
+
+            marker = self._annotation_marker_lines[idx]
+            marker_pos = np.array(
+                [
+                    (start, y0),
+                    (start, y1),
+                ],
+                dtype=np.float32,
+            )
+            marker.set_data(pos=marker_pos, color=line_color, width=1.2)
+            marker.visible = True
+
+        for mesh in self._annotation_rectangles[len(entries) :]:
+            mesh.visible = False
+        for line in self._annotation_marker_lines[len(entries) :]:
+            line.visible = False
+
+        if self._hypnogram_view is not None:
+            self._hypnogram_view.camera.set_range(
+                x=(view_start, view_end),
+                y=self._hypnogram_y_range,
+            )
+        self._update_hypnogram_region_visual(view_start, view_end)
+        self._update_annotation_lane_visibility()
+
     def clear_channel(self, idx: int) -> None:
         if idx >= len(self._lines):
             return
@@ -533,10 +732,14 @@ class VispyChannelCanvas(QtWidgets.QWidget):
             if idx < len(self._view_y_ranges):
                 y_range = self._view_y_ranges[idx]
             view.camera.set_range(x=x_range, y=y_range)
-        if self._x_axis is not None and self._views:
-            # AxisWidget follows the first linked view; ensure linkage stays intact.
-            with contextlib.suppress(Exception):
-                self._x_axis.link_view(self._views[0])
+        if self._hypnogram_view is not None:
+            self._hypnogram_view.camera.set_range(
+                x=x_range,
+                y=self._hypnogram_y_range,
+            )
+        self._update_hypnogram_region_visual(*x_range)
+        if self._x_axis is not None:
+            self._refresh_axis_link()
             self._request_axis_update()
 
     def estimate_pixels(self) -> int:
@@ -616,25 +819,270 @@ class VispyChannelCanvas(QtWidgets.QWidget):
             self._view_y_ranges.append((-1.0, 1.0))
             self._label_hidden.append(False)
 
-        # Re-append axis under the populated rows.
+        self._install_axis_widget()
+        self.set_view(self._view_start, self._view_duration)
+
+    def _install_axis_widget(self) -> None:
+        if self._x_axis is not None:
+            self._grid.remove_widget(self._x_axis)
+            self._x_axis = None
+        if self._gutter_axis_placeholder is not None:
+            self._grid.remove_widget(self._gutter_axis_placeholder)
+            self._gutter_axis_placeholder = None
+
+        total_rows = len(self._views)
+        if self._hypnogram_view is not None:
+            total_rows += 1
+
         self._x_axis = scene.AxisWidget(orientation="bottom")
         self._x_axis.axis.scale_type = "linear"
         self._x_axis.height_max = 32
         self._x_axis.height_min = 28
-        self._grid.add_widget(self._x_axis, row=len(self._views), col=1)
+        self._grid.add_widget(self._x_axis, row=total_rows, col=1)
         with contextlib.suppress(Exception):
             placeholder = scene.widgets.Widget()
             placeholder.height_max = self._x_axis.height_max
             placeholder.height_min = self._x_axis.height_min
             placeholder.border_color = None
             placeholder.bgcolor = None
-            self._grid.add_widget(placeholder, row=len(self._views), col=0)
+            self._grid.add_widget(placeholder, row=total_rows, col=0)
             self._gutter_axis_placeholder = placeholder
-        if self._views:
-            self._x_axis.link_view(self._views[0])
         self._apply_axis_formatter()
         self._update_axis_theme()
+        self._refresh_axis_link()
+
+    def _refresh_axis_link(self) -> None:
+        if self._x_axis is None:
+            return
+        target = None
+        if (self._hypnogram_view is not None) and (
+            self._hypnogram_visible or self._annotation_events_visible
+        ):
+            target = self._hypnogram_view
+        if target is None and self._views:
+            target = self._views[0]
+        if target is None:
+            return
+        with contextlib.suppress(Exception):
+            self._x_axis.link_view(target)
+
+    def _ensure_hypnogram_row(self) -> None:
+        if self._hypnogram_view is not None:
+            return
+
+        if self._x_axis is not None:
+            self._grid.remove_widget(self._x_axis)
+            self._x_axis = None
+        if self._gutter_axis_placeholder is not None:
+            self._grid.remove_widget(self._gutter_axis_placeholder)
+            self._gutter_axis_placeholder = None
+
+        row = len(self._views)
+        label_view = self._grid.add_view(row=row, col=0, camera="panzoom")
+        label_view.camera.interactive = False
+        label_view.border_color = None
+        label_view.padding = 0.0
+        label_view.bgcolor = None
+        with contextlib.suppress(Exception):
+            label_view.height_min = 48
+            label_view.height_max = 96
+
+        label_text = scene.visuals.Text(
+            text="Hypnogram",
+            anchor_x="left",
+            anchor_y="top",
+            color=self._label_active_color,
+            font_size=12,
+        )
+        label_text.transform = transforms.STTransform(translate=(8, 8))
+        label_view.add(label_text)
+
+        view = self._grid.add_view(row=row, col=1, camera="panzoom")
+        view.camera.interactive = False
+        view.border_color = None
+        view.padding = 0.0
+        with contextlib.suppress(Exception):
+            view.height_min = 64
+            view.height_max = 140
+        view.bgcolor = self._background_color
+
+        outline = scene.visuals.Line(method="gl")
+        outline.set_data(pos=self._empty_vertices())
+        outline.visible = False
+        outline.set_gl_state(depth_test=False, blend=True)
+        view.add(outline)
+
+        region_mesh = scene.visuals.Mesh(color=(0.4, 0.6, 0.9, 0.18))
+        region_mesh.visible = False
+        region_mesh.set_gl_state(depth_test=False, blend=True)
+        view.add(region_mesh)
+
+        region_border = scene.visuals.Line(method="gl")
+        region_border.visible = False
+        region_border.set_gl_state(depth_test=False, blend=True)
+        view.add(region_border)
+
+        self._hypnogram_label_view = label_view
+        self._hypnogram_label_text = label_text
+        self._hypnogram_view = view
+        self._hypnogram_outline = outline
+        self._hypnogram_region_mesh = region_mesh
+        self._hypnogram_region_border = region_border
+        self._hypnogram_fill_meshes = {}
+        self._annotation_rectangles = []
+        self._annotation_marker_lines = []
+        self._hypnogram_visible = False
+        self._annotation_events_visible = False
+        self._hypnogram_y_range = (-0.6, 0.6)
+
+        self._install_axis_widget()
         self.set_view(self._view_start, self._view_duration)
+
+    def _update_annotation_lane_visibility(self) -> None:
+        active = self._hypnogram_visible or self._annotation_events_visible
+        if self._hypnogram_view is not None:
+            self._hypnogram_view.visible = active
+        if self._hypnogram_label_view is not None:
+            self._hypnogram_label_view.visible = active
+        if not active:
+            if self._hypnogram_outline is not None:
+                self._hypnogram_outline.visible = False
+            if self._hypnogram_region_mesh is not None:
+                self._hypnogram_region_mesh.visible = False
+            if self._hypnogram_region_border is not None:
+                self._hypnogram_region_border.visible = False
+            for mesh in self._hypnogram_fill_meshes.values():
+                mesh.visible = False
+            for mesh in self._annotation_rectangles:
+                mesh.visible = False
+            for line in self._annotation_marker_lines:
+                line.visible = False
+        self._refresh_axis_link()
+
+    def _stage_fill_mesh_data(
+        self, x_vals: np.ndarray, top_vals: np.ndarray, fill_level: float
+    ) -> tuple[np.ndarray | None, np.ndarray | None]:
+        if x_vals.size == 0 or top_vals.size == 0:
+            return None, None
+        valid = np.isfinite(x_vals) & np.isfinite(top_vals)
+        if not np.any(valid):
+            return None, None
+
+        vertices: list[tuple[float, float, float]] = []
+        faces: list[tuple[int, int, int]] = []
+        start_idx: int | None = None
+        for idx, is_valid in enumerate(valid):
+            if is_valid and start_idx is None:
+                start_idx = idx
+            elif not is_valid and start_idx is not None:
+                if idx - start_idx >= 2:
+                    xs = x_vals[start_idx:idx]
+                    ys = top_vals[start_idx:idx]
+                    base = len(vertices)
+                    start_x = float(xs[0])
+                    end_x = float(xs[-1])
+                    top_val = float(ys[0])
+                    vertices.extend(
+                        [
+                            (start_x, fill_level, 0.0),
+                            (start_x, top_val, 0.0),
+                            (end_x, fill_level, 0.0),
+                            (end_x, top_val, 0.0),
+                        ]
+                    )
+                    faces.append((base, base + 1, base + 2))
+                    faces.append((base + 2, base + 1, base + 3))
+                start_idx = None
+        if start_idx is not None and x_vals.size - start_idx >= 2:
+            xs = x_vals[start_idx:]
+            ys = top_vals[start_idx:]
+            base = len(vertices)
+            start_x = float(xs[0])
+            end_x = float(xs[-1])
+            top_val = float(ys[0])
+            vertices.extend(
+                [
+                    (start_x, fill_level, 0.0),
+                    (start_x, top_val, 0.0),
+                    (end_x, fill_level, 0.0),
+                    (end_x, top_val, 0.0),
+                ]
+            )
+            faces.append((base, base + 1, base + 2))
+            faces.append((base + 2, base + 1, base + 3))
+
+        if not faces:
+            return None, None
+        return np.asarray(vertices, dtype=np.float32), np.asarray(faces, dtype=np.uint32)
+
+    def _update_hypnogram_region_visual(self, view_start: float, view_end: float) -> None:
+        if self._hypnogram_region_mesh is None or self._hypnogram_region_border is None:
+            return
+        if not (self._hypnogram_visible or self._annotation_events_visible):
+            self._hypnogram_region_mesh.visible = False
+            self._hypnogram_region_border.visible = False
+            return
+        width = max(0.0, float(view_end) - float(view_start))
+        height = max(0.0, self._hypnogram_y_range[1] - self._hypnogram_y_range[0])
+        if width <= 0.0 or height <= 0.0:
+            self._hypnogram_region_mesh.visible = False
+            self._hypnogram_region_border.visible = False
+            return
+        x0 = float(view_start)
+        x1 = x0 + width
+        y0, y1 = self._hypnogram_y_range
+        vertices = np.array(
+            [
+                (x0, y0, 0.0),
+                (x0, y1, 0.0),
+                (x1, y0, 0.0),
+                (x1, y1, 0.0),
+            ],
+            dtype=np.float32,
+        )
+        faces = self._annotation_faces
+        self._hypnogram_region_mesh.set_data(
+            vertices=vertices,
+            faces=faces,
+            color=(0.4, 0.6, 0.9, 0.18),
+        )
+        self._hypnogram_region_mesh.visible = True
+        border_pos = np.array(
+            [
+                (x0, y0),
+                (x0, y1),
+                (x1, y1),
+                (x1, y0),
+                (x0, y0),
+            ],
+            dtype=np.float32,
+        )
+        self._hypnogram_region_border.set_data(
+            pos=border_pos,
+            color=(0.6, 0.7, 0.9, 0.4),
+            width=1.0,
+        )
+        self._hypnogram_region_border.visible = True
+
+    def _ensure_annotation_mesh_pool(self, count: int) -> None:
+        self._ensure_hypnogram_row()
+        while len(self._annotation_rectangles) < count:
+            mesh = scene.visuals.Mesh()
+            mesh.visible = False
+            mesh.set_gl_state(depth_test=False, blend=True)
+            if self._hypnogram_view is not None:
+                self._hypnogram_view.add(mesh)
+            self._annotation_rectangles.append(mesh)
+
+    def _ensure_annotation_marker_pool(self, count: int) -> None:
+        self._ensure_hypnogram_row()
+        while len(self._annotation_marker_lines) < count:
+            line = scene.visuals.Line(method="gl")
+            line.visible = False
+            line.set_gl_state(depth_test=False, blend=True)
+            if self._hypnogram_view is not None:
+                self._hypnogram_view.add(line)
+            self._annotation_marker_lines.append(line)
 
     def _update_channel_range(self, idx: int, state: _ChannelState) -> None:
         if idx >= len(self._views):

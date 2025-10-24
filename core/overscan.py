@@ -118,6 +118,8 @@ class OverscanTile:
     )
     vertex_cache: dict[int, list[np.ndarray]] = field(default_factory=dict)
     is_final: bool = True
+    annotation_payload: dict[str, object] | None = None
+    hypnogram_payload: dict[str, object] | None = None
 
     def contains(self, window_start: float, window_end: float) -> bool:
         return window_start >= self.start and window_end <= self.end
@@ -1159,4 +1161,12 @@ class AsyncTileWorker:
             prepared_cache={k: list(v) for k, v in tile.prepared_cache.items()},
             vertex_cache={k: list(v) for k, v in tile.vertex_cache.items()},
             is_final=is_final,
+            annotation_payload=
+            None
+            if tile.annotation_payload is None
+            else dict(tile.annotation_payload),
+            hypnogram_payload=
+            None
+            if tile.hypnogram_payload is None
+            else dict(tile.hypnogram_payload),
         )
