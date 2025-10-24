@@ -157,6 +157,7 @@ class VispyChannelCanvas(QtWidgets.QWidget):
         self._channel_states: list[_ChannelState] = []
         self._channel_visible: list[bool] = []
         self._channel_colors: list[Color] = []
+        self._view_y_ranges: list[tuple[float, float]] = []
 
         self._hover_line = scene.visuals.Line(
             pos=np.zeros((0, 2), dtype=np.float32),
@@ -330,13 +331,20 @@ class VispyChannelCanvas(QtWidgets.QWidget):
         self._lines[idx].set_data(pos=self._empty_vertices())
         if idx < len(self._channel_states):
             self._channel_states[idx] = _ChannelState(t=np.array([]), x=np.array([]))
+        if idx < len(self._view_y_ranges):
+            self._view_y_ranges[idx] = (-1.0, 1.0)
+            if idx < len(self._views):
+                self._views[idx].camera.set_range(y=(-1.0, 1.0))
 
     def set_view(self, start: float, duration: float) -> None:
         self._view_start = start
         self._view_duration = max(0.001, duration)
         x_range = (self._view_start, self._view_start + self._view_duration)
-        for view in self._views:
-            view.camera.set_range(x=x_range)
+        for idx, view in enumerate(self._views):
+            y_range = (-1.0, 1.0)
+            if idx < len(self._view_y_ranges):
+                y_range = self._view_y_ranges[idx]
+            view.camera.set_range(x=x_range, y=y_range)
         if self._x_axis is not None:
             self._x_axis.domain = x_range
 
@@ -395,6 +403,7 @@ class VispyChannelCanvas(QtWidgets.QWidget):
             self._channel_states.append(_ChannelState(t=np.array([]), x=np.array([])))
             self._channel_visible.append(True)
             self._channel_colors.append(Color("#66aaff"))
+            self._view_y_ranges.append((-1.0, 1.0))
 
         # Re-append axis under the populated rows.
         self._x_axis = scene.AxisWidget(orientation="bottom")
@@ -410,6 +419,8 @@ class VispyChannelCanvas(QtWidgets.QWidget):
         if idx >= len(self._views):
             return
         if state.x.size == 0:
+            if idx < len(self._view_y_ranges):
+                self._view_y_ranges[idx] = (-1.0, 1.0)
             self._views[idx].camera.set_range(y=(-1.0, 1.0))
             return
         min_val = float(np.nanmin(state.x))
@@ -420,6 +431,8 @@ class VispyChannelCanvas(QtWidgets.QWidget):
             pad = max(1e-3, abs(max_val) * 0.1 + 1e-3)
             min_val -= pad
             max_val += pad
+        if idx < len(self._view_y_ranges):
+            self._view_y_ranges[idx] = (min_val, max_val)
         self._views[idx].camera.set_range(y=(min_val, max_val))
 
     # ------------------------------------------------------------------
