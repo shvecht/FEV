@@ -17,7 +17,7 @@ VisPy ships a `SceneCanvas` that embeds cleanly into Qt and routes draw calls to
 
 ### Integration notes
 
-* **Widget swap:** Replace `pg.GraphicsLayoutWidget` with a lightweight proxy that chooses between the existing pyqtgraph plot grid and a VisPy canvas at runtime. The proxy exposes `ensure_row(i)`, `set_data(i, t, x)`, and `set_theme(theme)` to map onto either backend.【F:ui/main_window.py†L528-L560】
+* **Widget swap:** Replace `pg.GraphicsLayoutWidget` with a lightweight proxy that chooses between the existing pyqtgraph plot grid and a VisPy canvas at runtime. The proxy exposes `ensure_row(i)`, `set_data(i, t, x)`, and `set_theme(background, colors, label_active, label_hidden, axis_color)` to map onto either backend.【F:ui/main_window.py†L528-L560】
 * **Glyph reuse:** Pre-bake per-channel `LineVisual` objects (one per VisPy sub-viewport) and call `.set_data()` with numpy views supplied by the overscan cache. This mirrors how we mutate `PlotDataItem` today, minimizing churn.
 * **Event bridge:** Connect VisPy's `mouse_move`, `mouse_press`, and `mouse_wheel` events back into the existing `_update_hover_indicator`, pan buttons, and zoom controls so shared shortcuts continue to operate.【F:ui/main_window.py†L537-L560】
 * **Theming:** Translate our theme palette to VisPy `Color` instances and update stroke widths to match current aesthetics.
