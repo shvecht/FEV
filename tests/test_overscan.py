@@ -1,4 +1,7 @@
 from collections import OrderedDict
+import asyncio
+import time
+from concurrent.futures import Future, CancelledError as FutureCancelledError
 from types import SimpleNamespace
 from typing import Sequence
 
@@ -7,11 +10,17 @@ import pytest
 
 try:
     from ui import main_window as main_window_module
-    from ui.main_window import _OverscanRequest, _OverscanTile, _OverscanWorker
-except ImportError as exc:  # pragma: no cover - optional dependency guard
-    pytest.skip(f"Qt dependencies unavailable: {exc}", allow_module_level=True)
+    from ui.main_window import _OverscanWorker
+    HAS_QT = True
+except ImportError:  # pragma: no cover - optional dependency guard
+    main_window_module = None
+    _OverscanWorker = None
+    HAS_QT = False
 
 from core.overscan import (
+    AsyncTileWorker,
+    OverscanRequest,
+    OverscanTile,
     SignalChunk,
     OverscanRenderer,
     choose_lod_duration,
@@ -125,6 +134,7 @@ def test_chunk_from_envelope_emits_loops():
     np.testing.assert_allclose(x_loops, expected_values)
 
 
+@pytest.mark.skipif(not HAS_QT, reason="Qt dependencies unavailable")
 def test_overscan_worker_prefers_lod(monkeypatch):
     class FakeLoader:
         def __init__(self):
@@ -148,14 +158,14 @@ def test_overscan_worker_prefers_lod(monkeypatch):
 
     loader = FakeLoader()
     worker = _OverscanWorker(loader, lod_enabled=True, lod_min_bin_multiple=2.0)
-    captured: dict[str, _OverscanTile] = {}
+    captured: dict[str, OverscanTile] = {}
 
     def capture(req_id, tile):
         captured["tile"] = tile
 
     worker.finished.emit = capture  # type: ignore[assignment]
     worker.failed.emit = lambda *_args: None  # type: ignore[assignment]
-    request = _OverscanRequest(
+    request = OverscanRequest(
         request_id=1,
         start=0.0,
         end=120.0,
@@ -176,6 +186,7 @@ def test_overscan_worker_prefers_lod(monkeypatch):
     assert tile.is_final is True
 
 
+@pytest.mark.skipif(not HAS_QT, reason="Qt dependencies unavailable")
 def test_overscan_worker_respects_min_view_duration(monkeypatch):
     class FakeLoader:
         def __init__(self):
@@ -204,14 +215,14 @@ def test_overscan_worker_respects_min_view_duration(monkeypatch):
         lod_min_bin_multiple=2.0,
         lod_min_view_duration=200.0,
     )
-    captured: dict[str, _OverscanTile] = {}
+    captured: dict[str, OverscanTile] = {}
 
     def capture(req_id, tile):
         captured["tile"] = tile
 
     worker.finished.emit = capture  # type: ignore[assignment]
     worker.failed.emit = lambda *_args: None  # type: ignore[assignment]
-    request = _OverscanRequest(
+    request = OverscanRequest(
         request_id=2,
         start=0.0,
         end=120.0,
@@ -230,6 +241,7 @@ def test_overscan_worker_respects_min_view_duration(monkeypatch):
     assert tile.is_final is True
 
 
+@pytest.mark.skipif(not HAS_QT, reason="Qt dependencies unavailable")
 def test_overscan_worker_ratio_respects_min_view(monkeypatch):
     class FakeLoader:
         def __init__(self):
@@ -259,14 +271,14 @@ def test_overscan_worker_ratio_respects_min_view(monkeypatch):
         lod_min_view_duration=200.0,
         lod_ratio=2.0,
     )
-    captured: dict[str, _OverscanTile] = {}
+    captured: dict[str, OverscanTile] = {}
 
     def capture(req_id, tile):
         captured["tile"] = tile
 
     worker.finished.emit = capture  # type: ignore[assignment]
     worker.failed.emit = lambda *_args: None  # type: ignore[assignment]
-    request = _OverscanRequest(
+    request = OverscanRequest(
         request_id=3,
         start=0.0,
         end=60.0,
@@ -362,6 +374,7 @@ def test_choose_envelope_duration_prefers_stride_threshold():
     assert duration_zoomed == pytest.approx(4.0)
 
 
+@pytest.mark.skipif(not HAS_QT, reason="Qt dependencies unavailable")
 def test_prepare_tile_uses_cached_series(monkeypatch):
     window = main_window_module.MainWindow
 
@@ -379,7 +392,7 @@ def test_prepare_tile_uses_cached_series(monkeypatch):
     x = np.sin(t).astype(np.float32)
     chunk = SignalChunk(t, x)
 
-    tile = _OverscanTile(
+    tile = OverscanTile(
         request_id=1,
         start=0.0,
         end=10.0,
@@ -414,6 +427,7 @@ def test_prepare_tile_uses_cached_series(monkeypatch):
     assert call_counter["count"] == 1
 
 
+@pytest.mark.skipif(not HAS_QT, reason="Qt dependencies unavailable")
 def test_request_tile_uses_lru_cache():
     window_cls = main_window_module.MainWindow
 
@@ -425,23 +439,34 @@ def test_request_tile_uses_lru_cache():
     class DummyWindow:
         def __init__(self):
             self.loader = DummyLoader()
-            self._overscan_worker = object()
+            self._submit_calls: list[tuple[OverscanRequest, object]] = []
+
+            class StubWorker:
+                def __init__(self, calls):
+                    self._calls = calls
+
+                def submit(self, request, *, on_preview=None):
+                    self._calls.append((request, on_preview))
+                    fut: Future = Future()
+                    return fut
+
+                def close(self):
+                    return None
+
+            self._overscan_worker = StubWorker(self._submit_calls)
             self._overscan_factor = 2.0
             self._overscan_tile = None
             self._overscan_inflight = None
             self._overscan_request_id = 0
             self._current_tile_id = None
             self._overscan_tile_cache: OrderedDict[
-                tuple[tuple[int, ...], int, int], _OverscanTile
+                tuple[tuple[int, ...], int, int], OverscanTile
             ] = OrderedDict()
             self._overscan_tile_cache_limit = 6
             self._scheduled_refresh = False
-            self._applied_tiles: list[_OverscanTile] = []
+            self._applied_tiles: list[OverscanTile] = []
             self._view_start = 10.0
             self._view_duration = 10.0
-            self.overscanRequested = SimpleNamespace(
-                calls=[], emit=lambda request: self.overscanRequested.calls.append(request)
-            )
 
         def _estimate_pixels(self):
             return 0
@@ -478,7 +503,7 @@ def test_request_tile_uses_lru_cache():
         SignalChunk(np.zeros(0, dtype=np.float64), np.zeros(0, dtype=np.float32))
         for _ in channels
     ]
-    tile = _OverscanTile(
+    tile = OverscanTile(
         request_id=42,
         start=start,
         end=end,
@@ -496,7 +521,7 @@ def test_request_tile_uses_lru_cache():
 
     window_cls._request_overscan_tile(dummy, dummy._view_start, dummy._view_duration)
 
-    assert dummy.overscanRequested.calls == []
+    assert dummy._submit_calls == []
     assert dummy._overscan_tile is tile
     assert dummy._overscan_inflight is None
     assert dummy._overscan_request_id == 1
@@ -506,3 +531,61 @@ def test_request_tile_uses_lru_cache():
     assert tile.view_start == pytest.approx(dummy._view_start)
     assert tile.view_duration == pytest.approx(dummy._view_duration)
     assert list(dummy._overscan_tile_cache.values())[-1] is tile
+
+
+def test_async_tile_worker_latest_request_wins():
+    class SlowLoader:
+        def __init__(self):
+            self.duration_s = 120.0
+            self.n_channels = 1
+            self.max_window_s = 120.0
+
+        def read(self, channel: int, start: float, end: float, **_kwargs):
+            time.sleep(0.05)
+            t = np.linspace(start, end, 32, dtype=np.float64)
+            return t, np.full_like(t, fill_value=start, dtype=np.float32)
+
+        def channel_fs(self, channel: int) -> float:
+            return 100.0
+
+    loader = SlowLoader()
+    worker = AsyncTileWorker(
+        loader,
+        lod_enabled=False,
+        lod_min_bin_multiple=2.0,
+        lod_min_view_duration=None,
+    )
+
+    try:
+        req1 = OverscanRequest(
+            request_id=1,
+            start=0.0,
+            end=30.0,
+            view_start=0.0,
+            view_duration=30.0,
+            channel_indices=(0,),
+            max_samples=None,
+        )
+        req2 = OverscanRequest(
+            request_id=2,
+            start=30.0,
+            end=60.0,
+            view_start=30.0,
+            view_duration=30.0,
+            channel_indices=(0,),
+            max_samples=None,
+        )
+
+        fut1 = worker.submit(req1)
+        fut2 = worker.submit(req2)
+
+        tile2 = fut2.result(timeout=2.0)
+        assert isinstance(tile2, OverscanTile)
+        assert tile2.request_id == 2
+        assert tile2.is_final is True
+        assert tile2.start == pytest.approx(30.0)
+
+        with pytest.raises((asyncio.CancelledError, FutureCancelledError)):
+            fut1.result(timeout=0.5)
+    finally:
+        worker.close()
