@@ -303,7 +303,12 @@ def test_zarr_loader_exposes_lod_levels(tmp_path):
         t_series, x_series = chunk
         assert t_series.size == x_series.size
         assert t_series.size > 0
-        pairs = x_series.reshape(-1, 2)
+        loops = x_series.reshape(-1, 4)
+        # Each LOD bin is emitted as a closed loop of four points: low→high→high→low.
+        np.testing.assert_allclose(loops[:, 0], loops[:, 3], atol=1e-5)
+        np.testing.assert_allclose(loops[:, 1], loops[:, 2], atol=1e-5)
+
+        pairs = np.stack((loops[:, 0], loops[:, 1]), axis=1)
         expected_pairs = _expected_minmax(data, 100)
         np.testing.assert_allclose(pairs[:, 0], expected_pairs[: pairs.shape[0], 0], atol=1e-5)
         np.testing.assert_allclose(pairs[:, 1], expected_pairs[: pairs.shape[0], 1], atol=1e-5)
