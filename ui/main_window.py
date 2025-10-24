@@ -203,6 +203,10 @@ class MainWindow(QtWidgets.QMainWindow):
             max_tiles=self._config.prefetch_max_tiles,
             max_mb=self._config.prefetch_max_mb,
         )
+        prefetch_service.update_hints(
+            channels=self._config.prefetch_hint_channels,
+            window_s=self._config.prefetch_hint_window_s,
+        )
         self._prefetch = prefetch_service.create_cache(
             self._fetch_tile, preview_fetch=self._fetch_tile_preview
         )
@@ -1834,16 +1838,48 @@ class MainWindow(QtWidgets.QMainWindow):
         self._config.save()
 
     def _schedule_prefetch(self):
-        total = self.loader.duration_s
-        for ch in range(self.loader.n_channels):
-            if ch in self._hidden_channels:
-                continue
-            start = max(0.0, self._view_start - self._view_duration)
-            start = min(start, total)
-            duration = min(self._view_duration * 3, max(0.0, total - start))
-            if duration <= 0:
-                continue
+        if getattr(self, "_prefetch", None) is None:
+            return
+        loader = self._prefetch_loader or self.loader
+        total = float(getattr(loader, "duration_s", self.loader.duration_s))
+        visible_channels = [
+            ch for ch in range(getattr(loader, "n_channels", self.loader.n_channels)) if ch not in self._hidden_channels
+        ]
+        if not visible_channels:
+            return
+        fs_fn = getattr(loader, "fs", None)
+        sample_rates: list[float] = []
+        if callable(fs_fn):
+            for ch in visible_channels:
+                try:
+                    rate = float(fs_fn(ch))
+                except Exception:
+                    rate = 0.0
+                if rate > 0:
+                    sample_rates.append(rate)
+        estimated_bytes = None
+        prefetch_cache = getattr(self, "_prefetch", None)
+        if prefetch_cache is not None:
+            estimated_bytes = prefetch_cache.estimated_tile_bytes
+            if estimated_bytes <= 0:
+                estimated_bytes = None
+        radius = prefetch_service.prefetch_radius(
+            self._view_duration,
+            channel_indices=visible_channels,
+            sample_rates=sample_rates if sample_rates else None,
+            estimated_tile_bytes=estimated_bytes,
+        )
+        start = max(0.0, self._view_start - radius)
+        span = self._view_duration + radius * 2.0
+        end = min(total, start + span)
+        duration = max(0.0, end - start)
+        if duration <= 0:
+            return
+        for ch in visible_channels:
             self._prefetch.prefetch_window(ch, start, duration)
+        prefetch_service.update_hints(channels=visible_channels, window_s=self._view_duration)
+        self._config.prefetch_hint_channels = tuple(visible_channels)
+        self._config.prefetch_hint_window_s = float(self._view_duration)
     def _zoom_factor(self, factor: float):
         anchor = self._view_start + self._view_duration * 0.5
         start, duration = zoom_window(
@@ -1865,14 +1901,6 @@ class MainWindow(QtWidgets.QMainWindow):
             limits=self._limits,
         )
         self._set_view(start, duration, sender="buttons")
-
-    def _schedule_prefetch(self):
-        for ch in range(self.loader.n_channels):
-            if ch in self._hidden_channels:
-                continue
-            start = max(0.0, self._view_start - self._view_duration)
-            duration = self._view_duration * 3
-            self._prefetch.prefetch_window(ch, start, duration)
 
     def _full_view(self):
         self._set_view(0.0, self.loader.duration_s, sender="buttons")
@@ -3065,6 +3093,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._prefetch.stop()
         self._release_prefetch_loader()
         self._shutdown_overscan_worker()
+        self._config.save()
         super().closeEvent(event)
 
     def _update_data_source_label(self):

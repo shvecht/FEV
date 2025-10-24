@@ -11,6 +11,8 @@ class ViewerConfig:
     prefetch_tile_s: float = 5.0
     prefetch_max_tiles: int | None = 64
     prefetch_max_mb: float | None = 16.0
+    prefetch_hint_channels: tuple[int, ...] = ()
+    prefetch_hint_window_s: float = 60.0
     prefetch_collapsed: bool = False
     controls_collapsed: bool = False
     int16_cache_enabled: bool = False
@@ -41,6 +43,27 @@ class ViewerConfig:
                 cfg.prefetch_tile_s = section.getfloat("tile_s", fallback=cfg.prefetch_tile_s)
                 cfg.prefetch_max_tiles = section.getint("max_tiles", fallback=cfg.prefetch_max_tiles)
                 cfg.prefetch_max_mb = section.getfloat("max_mb", fallback=cfg.prefetch_max_mb)
+                hint_raw = section.get("hint_channels", fallback="")
+                if hint_raw:
+                    indices: list[int] = []
+                    seen: set[int] = set()
+                    for part in hint_raw.split(","):
+                        part = part.strip()
+                        if not part:
+                            continue
+                        try:
+                            value = int(part)
+                        except ValueError:
+                            continue
+                        if value < 0 or value in seen:
+                            continue
+                        seen.add(value)
+                        indices.append(value)
+                    if indices:
+                        cfg.prefetch_hint_channels = tuple(indices)
+                cfg.prefetch_hint_window_s = section.getfloat(
+                    "hint_window_s", fallback=cfg.prefetch_hint_window_s
+                )
 
             ui_section = parser["ui"] if "ui" in parser else None
             if ui_section:
@@ -138,6 +161,8 @@ class ViewerConfig:
             "tile_s": f"{self.prefetch_tile_s:.3f}",
             "max_tiles": str(self.prefetch_max_tiles or 0),
             "max_mb": f"{self.prefetch_max_mb or 0}",
+            "hint_channels": ",".join(str(idx) for idx in self.prefetch_hint_channels),
+            "hint_window_s": f"{self.prefetch_hint_window_s:.3f}",
         }
         hidden_serialized = ",".join(str(idx) for idx in sorted(set(self.hidden_channels)))
         hidden_ann_serialized = ",".join(

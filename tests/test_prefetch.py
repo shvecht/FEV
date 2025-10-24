@@ -1,6 +1,7 @@
 import time
 
 import numpy as np
+import pytest
 
 from core.prefetch import PrefetchCache, PrefetchConfig, PrefetchService
 
@@ -84,3 +85,29 @@ def test_prefetch_get_respects_max_bytes_budget():
         cache.get_tile(0, float(idx), 1.0)
         with cache._lock:
             assert len(cache._cache) == 1
+
+
+def test_prefetch_cache_tracks_hits_and_misses():
+    cache = PrefetchCache(fake_fetch, PrefetchConfig(tile_duration=1.0, max_tiles=4))
+    cache.get_tile(0, 0.0, 1.0)
+    cache.get_tile(0, 0.0, 1.0)
+    hits, misses = cache.stats
+    assert hits == 1
+    assert misses == 1
+
+
+def test_prefetch_service_radius_limits_span():
+    service = PrefetchService(PrefetchConfig(tile_duration=5.0, max_tiles=6))
+    radius = service.prefetch_radius(10.0, channel_indices=[0, 1])
+    assert radius == pytest.approx(2.5)
+
+
+def test_prefetch_service_radius_respects_byte_budget():
+    config = PrefetchConfig(tile_duration=1.0, max_tiles=100, max_bytes=10_000.0)
+    service = PrefetchService(config)
+    radius = service.prefetch_radius(
+        2.0,
+        channel_indices=[0, 1],
+        sample_rates=[200.0, 200.0],
+    )
+    assert radius == pytest.approx(0.041666, rel=1e-4)
