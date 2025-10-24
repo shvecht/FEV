@@ -894,7 +894,13 @@ class MainWindow(QtWidgets.QMainWindow):
             getattr(self, "annotationPositionToggle", None),
         ]
         widgets = [w for w in widgets if w is not None]
+        supports_annotations = True
         if self._use_gpu_canvas:
+            supports_annotations = bool(
+                self._gpu_canvas
+                and getattr(self._gpu_canvas, "supports_annotations", False)
+            )
+        if not supports_annotations:
             note = "Annotation overlays are unavailable in GPU mode"
             for widget in widgets:
                 self._annotation_control_states[widget] = widget.isEnabled()
@@ -2945,6 +2951,21 @@ class MainWindow(QtWidgets.QMainWindow):
             self.stageSummaryLabel.setText(
                 self._compose_status_text(stage_label, position_label, summary)
             )
+            tile = self._overscan_tile
+            if tile is not None:
+                self._update_gpu_overlays_from_tile(tile)
+            elif self._gpu_canvas is not None:
+                self._gpu_canvas.update_annotations(
+                    None,
+                    view_start=self._view_start,
+                    view_end=self._view_start + self._view_duration,
+                )
+                self._gpu_canvas.update_hypnogram(
+                    None,
+                    visible=False,
+                    view_start=self._view_start,
+                    view_end=self._view_start + self._view_duration,
+                )
             return
         if not self._primary_plot:
             return
@@ -3172,7 +3193,190 @@ class MainWindow(QtWidgets.QMainWindow):
             prepared_series,
             vertex_series if want_vertices else None,
         )
+        if self._use_gpu_canvas:
+            if (
+                self._annotations_index is not None
+                and not self._annotations_index.is_empty()
+            ):
+                if tile.annotation_payload is None:
+                    tile.annotation_payload = self._build_annotation_payload_for_tile(tile)
+                if tile.hypnogram_payload is None:
+                    tile.hypnogram_payload = self._stage_curve_data()
+            else:
+                tile.annotation_payload = None
+                tile.hypnogram_payload = None
         return changed
+
+    def _build_annotation_payload_for_tile(
+        self, tile: OverscanTile
+    ) -> dict[str, object] | None:
+        if self._annotations_index is None or self._annotations_index.is_empty():
+            return None
+
+        start = float(tile.start)
+        end = float(tile.end)
+        events, ids = self._annotations_index.between(start, end, return_indices=True)
+        events = np.array(events, copy=False)
+        ids = np.asarray(ids, dtype=int)
+
+        stage = self._annotations_index.between(
+            start, end, channels=[annotation_core.STAGE_CHANNEL]
+        )
+        if isinstance(stage, tuple):
+            stage = stage[0]
+        stage_arr = np.array(stage, copy=False)
+
+        position = self._annotations_index.between(
+            start, end, channels=[annotation_core.POSITION_CHANNEL]
+        )
+        if isinstance(position, tuple):
+            position = position[0]
+        position_arr = np.array(position, copy=False)
+
+        return {
+            "events": events,
+            "ids": ids,
+            "stage": stage_arr,
+            "position": position_arr,
+        }
+
+    @staticmethod
+    def _qt_color_to_rgba(
+        color: QtGui.QColor | str, alpha: float | None = None
+    ) -> tuple[float, float, float, float]:
+        qt_color = QtGui.QColor(color)
+        r = float(qt_color.redF())
+        g = float(qt_color.greenF())
+        b = float(qt_color.blueF())
+        if alpha is None:
+            a = float(qt_color.alphaF())
+        else:
+            a = max(0.0, min(1.0, float(alpha)))
+        return (r, g, b, a)
+
+    def _prepare_gpu_event_payload(
+        self,
+        payload: dict[str, object],
+        view_start: float,
+        view_end: float,
+        hidden_channels: set[str],
+        focus_only: bool,
+        selected_id: int | None,
+    ) -> list[dict[str, object]]:
+        events_obj = payload.get("events")
+        ids_obj = payload.get("ids")
+        if events_obj is None or ids_obj is None:
+            return []
+        events = np.array(events_obj, copy=False)
+        ids = np.asarray(ids_obj, dtype=int)
+        if events.size == 0 or ids.size == 0:
+            return []
+
+        mask = (events["start_s"] < view_end) & (events["end_s"] > view_start)
+        if hidden_channels:
+            chan_mask = np.array(
+                [str(chan) not in hidden_channels for chan in events["chan"]],
+                dtype=bool,
+            )
+            mask &= chan_mask
+        events = events[mask]
+        ids = ids[mask]
+        if events.size == 0:
+            return []
+
+        target_id = int(selected_id) if selected_id is not None else None
+        if focus_only:
+            if target_id is None:
+                return []
+            focus_mask = ids == target_id
+            events = events[focus_mask]
+            ids = ids[focus_mask]
+            if events.size == 0:
+                return []
+
+        alpha_selected = 140.0 / 255.0
+        alpha_dim = 70.0 / 255.0
+        results: list[dict[str, object]] = []
+        for ev, ev_id in zip(events, ids):
+            start = float(ev["start_s"])
+            end = float(ev["end_s"])
+            if not math.isfinite(start):
+                continue
+            if not math.isfinite(end) or end <= start:
+                end = start + 0.5
+            label = str(ev["label"])
+            base_color = self._color_for_event(label)
+            is_selected = target_id is not None and ev_id == target_id
+            alpha = alpha_selected if is_selected else alpha_dim
+            fill_color = self._qt_color_to_rgba(base_color, alpha)
+            line_color = self._qt_color_to_rgba(base_color, 0.9)
+            results.append(
+                {
+                    "start": start,
+                    "end": end,
+                    "color": fill_color,
+                    "line_color": line_color,
+                    "label": label,
+                    "selected": is_selected,
+                }
+            )
+        return results
+
+    def _update_gpu_overlays_from_tile(self, tile: OverscanTile) -> None:
+        if not self._use_gpu_canvas or self._gpu_canvas is None:
+            return
+
+        view_start = self._view_start
+        view_end = view_start + self._view_duration
+        annotations_ready = (
+            self._annotations_enabled
+            and self._annotations_index is not None
+            and not self._annotations_index.is_empty()
+        )
+
+        hidden_channels = {str(ch) for ch in self._hidden_annotation_channels}
+        stage_visible = (
+            annotations_ready
+            and annotation_core.STAGE_CHANNEL not in hidden_channels
+        )
+        hypnogram_payload = None
+        if stage_visible:
+            hypnogram_payload = tile.hypnogram_payload
+            if hypnogram_payload is None:
+                hypnogram_payload = self._stage_curve_data()
+                tile.hypnogram_payload = hypnogram_payload
+
+        self._gpu_canvas.update_hypnogram(
+            hypnogram_payload,
+            visible=stage_visible,
+            view_start=view_start,
+            view_end=view_end,
+        )
+
+        focus_only_checkbox = getattr(self, "annotationFocusOnly", None)
+        focus_only = bool(focus_only_checkbox and focus_only_checkbox.isChecked())
+        selected_id = self._current_event_id
+        base_payload = tile.annotation_payload if annotations_ready else None
+        if base_payload is None and annotations_ready:
+            base_payload = self._build_annotation_payload_for_tile(tile)
+            tile.annotation_payload = base_payload
+
+        events_payload: list[dict[str, object]] | None = None
+        if base_payload is not None:
+            events_payload = self._prepare_gpu_event_payload(
+                base_payload,
+                view_start,
+                view_end,
+                hidden_channels,
+                focus_only,
+                int(selected_id) if selected_id is not None else None,
+            )
+
+        self._gpu_canvas.update_annotations(
+            events_payload,
+            view_start=view_start,
+            view_end=view_end,
+        )
 
     def _apply_tile_to_curves(self, tile: OverscanTile) -> None:
         self._prepare_tile(tile)
@@ -3209,6 +3413,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 final=is_final,
                 vertices=vertices,
             )
+            if self._use_gpu_canvas and backend is self._gpu_canvas:
+                self._update_gpu_overlays_from_tile(tile)
             self._current_tile_id = tile.request_id
             self._update_renderer_indicator()
             return
@@ -3576,6 +3782,18 @@ class MainWindow(QtWidgets.QMainWindow):
         return cache
 
     def _update_hypnogram(self, t0: float, t1: float) -> None:
+        if self._use_gpu_canvas:
+            tile = self._overscan_tile
+            if tile is not None:
+                self._update_gpu_overlays_from_tile(tile)
+            elif self._gpu_canvas is not None:
+                self._gpu_canvas.update_hypnogram(
+                    None,
+                    visible=False,
+                    view_start=self._view_start,
+                    view_end=self._view_start + self._view_duration,
+                )
+            return
         plot = self.hypnogramPlot
         if plot is None:
             return
