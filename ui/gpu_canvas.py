@@ -58,6 +58,10 @@ class VispyChannelCanvas(QtWidgets.QWidget):
 
     DEFAULT_VERTEX_BUDGET = 900_000
 
+    @property
+    def widget(self) -> QtWidgets.QWidget:  # pragma: no cover - trivial accessor
+        return self
+
     @classmethod
     def capability_probe(cls) -> VispyCapability:
         """Attempt to create a minimal canvas to gauge readiness."""
@@ -472,6 +476,26 @@ class VispyChannelCanvas(QtWidgets.QWidget):
 
         for idx in range(limit, len(self._lines)):
             self.clear_channel(idx)
+
+    def apply_series(
+        self,
+        request_id: int,
+        series: Sequence[tuple[np.ndarray, np.ndarray]],
+        hidden_indices: Sequence[int],
+        *,
+        final: bool,
+        vertices: Sequence[np.ndarray] | None = None,
+    ) -> None:
+        hidden_set = set(hidden_indices)
+        if vertices is None:
+            vertices = [self._prepare_vertices(t, x) for (t, x) in series]
+        self.apply_tile_data(
+            request_id,
+            series,
+            list(vertices),
+            hidden_set,
+            final=final,
+        )
 
     def clear_channel(self, idx: int) -> None:
         if idx >= len(self._lines):
