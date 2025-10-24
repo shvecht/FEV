@@ -180,7 +180,11 @@ class VispyChannelCanvas(QtWidgets.QWidget):
 
         # Connect canvas mouse events to drive hover feedback.
         self._canvas.events.mouse_move.connect(self._on_mouse_move)
-        self._canvas.events.mouse_leave.connect(self._on_mouse_leave)
+        mouse_leave_emitter = getattr(self._canvas.events, "mouse_leave", None)
+        if mouse_leave_emitter is not None:
+            mouse_leave_emitter.connect(self._on_mouse_leave)
+        else:  # pragma: no cover - depends on VisPy backend
+            LOG.debug("VisPy canvas has no mouse_leave event; hover will persist until next move")
 
     # ------------------------------------------------------------------
     # Public control surface
@@ -525,4 +529,3 @@ class VispyChannelCanvas(QtWidgets.QWidget):
     @staticmethod
     def _empty_vertices() -> np.ndarray:
         return np.zeros((0, 2), dtype=np.float32)
-
