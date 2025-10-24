@@ -21,6 +21,7 @@ from ui.time_axis import TimeAxis
 from ui.widgets import CollapsibleSection
 from ui.themes import DEFAULT_THEME, THEMES, ThemeDefinition
 from ui.hover_utils import _sample_at_time
+from ui.channel_backend import ChannelCanvasBackend, PyqtgraphChannelBackend
 from ui.gpu_canvas import VispyChannelCanvas
 from config import ViewerConfig
 from core.decimate import min_max_bins
@@ -167,6 +168,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.plots: list[pg.PlotItem] = []
         self.curves: list[pg.PlotDataItem] = []
         self.channel_labels: list[pg.LabelItem] = []
+        self._channel_backend: ChannelCanvasBackend | None = None
+        self._pg_backend: PyqtgraphChannelBackend | None = None
         self._cpu_plot_widget: pg.GraphicsLayoutWidget | None = None
         self._plot_scroll: QtWidgets.QScrollArea | None = None
         self._plot_container: QtWidgets.QWidget | None = None
@@ -674,6 +677,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._hover_line = None
             self._hover_label = None
             self._hover_plot = None
+            self._channel_backend = self._gpu_canvas
             self._configure_gpu_canvas()
         else:
             self._use_gpu_canvas = False
@@ -856,12 +860,18 @@ class MainWindow(QtWidgets.QMainWindow):
                 mouse_exited.connect(self._on_plot_scene_mouse_exited)
 
             self._cpu_plot_widget = widget
-            self.plots = []
-            self.curves = []
-            self.channel_labels = []
+            self._pg_backend = PyqtgraphChannelBackend(widget)
+            self.plots = self._pg_backend.plots
+            self.curves = self._pg_backend.curves
+            self.channel_labels = self._pg_backend.channel_labels
             self._plot_viewport_filter_installed = False
         else:
             widget = self._cpu_plot_widget
+            if self._pg_backend is None:
+                self._pg_backend = PyqtgraphChannelBackend(widget)
+                self.plots = self._pg_backend.plots
+                self.curves = self._pg_backend.curves
+                self.channel_labels = self._pg_backend.channel_labels
 
         self._plot_viewport = widget.viewport()
         if self._plot_viewport is not None and not self._plot_viewport_filter_installed:
@@ -869,7 +879,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self._plot_viewport_filter_installed = True
 
         self.plotLayout = widget
-        self._ensure_plot_rows(self.loader.n_channels)
+        if self._pg_backend is not None:
+            self.plots = self._pg_backend.plots
+            self.curves = self._pg_backend.curves
+            self.channel_labels = self._pg_backend.channel_labels
+            self._channel_backend = self._pg_backend
         self._configure_plots()
         return widget
 
@@ -1013,6 +1027,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 return False
             self.plotLayout = self._gpu_canvas
             self._plot_viewport = self._gpu_canvas
+            self._channel_backend = self._gpu_canvas
             self._use_gpu_canvas = True
             self._config.canvas_backend = "vispy"
             self._gpu_failure_reason = None
@@ -1036,6 +1051,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 return False
             self.plotLayout = widget
             self._plot_viewport = widget.viewport()
+            if self._pg_backend is not None:
+                self._channel_backend = self._pg_backend
             self._use_gpu_canvas = False
             if not self._gpu_forced:
                 self._config.canvas_backend = "pyqtgraph"
@@ -1229,11 +1246,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.setStyleSheet(theme.stylesheet)
 
-        if self._use_gpu_canvas and self._gpu_canvas is not None:
+        backend = self._channel_backend
+        if backend is not None:
             colors = theme.curve_colors or ("#5f8bff",)
             label_active = theme.channel_label_active or theme.pg_foreground
             label_hidden = theme.channel_label_hidden or theme.pg_foreground
-            self._gpu_canvas.set_theme(
+            backend.set_theme(
                 background=theme.pg_background,
                 curve_colors=colors,
                 label_active=label_active,
@@ -1689,7 +1707,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.startSpin.blockSignals(False)
             self.windowSpin.blockSignals(False)
 
-        self._ensure_plot_rows(self.loader.n_channels)
         self._configure_plots()
         self._refresh_limits()
         self._update_controls_from_state()
@@ -1843,7 +1860,6 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 self._gpu_canvas.set_time_mode("relative")
 
-        self._ensure_plot_rows(self.loader.n_channels)
         self._configure_plots()
         self._refresh_limits()
         self._invalidate_overscan_tile_cache()
@@ -3177,20 +3193,21 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._maybe_autoswitch_renderer(visible_vertex_count)
 
-        if self._use_gpu_canvas and self._gpu_canvas is not None:
-            vertices = tile.vertex_data
+        backend = self._channel_backend
+        if backend is not None:
+            vertices = tile.vertex_data if tile.vertex_data else None
             if not vertices or len(vertices) < len(tile.channel_data):
                 vertices = [
                     self._make_vertex_payload(t_arr, x_arr)
                     for (t_arr, x_arr) in tile.channel_data
                 ]
                 tile.vertex_data = vertices
-            self._gpu_canvas.apply_tile_data(
+            backend.apply_series(
                 tile.request_id,
                 tile.channel_data,
-                vertices,
                 self._hidden_channels,
                 final=is_final,
+                vertices=vertices,
             )
             self._current_tile_id = tile.request_id
             self._update_renderer_indicator()
@@ -3296,8 +3313,9 @@ class MainWindow(QtWidgets.QMainWindow):
         return int(total_samples * np.dtype(np.int16).itemsize)
 
     def _estimate_pixels(self) -> int:
-        if self._use_gpu_canvas and self._gpu_canvas is not None:
-            return max(0, self._gpu_canvas.estimate_pixels())
+        backend = self._channel_backend
+        if backend is not None:
+            return max(0, backend.estimate_pixels())
         if not self._primary_plot:
             return 0
         vb = self._primary_plot.getViewBox()
@@ -3307,30 +3325,6 @@ class MainWindow(QtWidgets.QMainWindow):
         return max(0, width)
 
     # ----- Plot helpers ------------------------------------------------------
-
-    def _ensure_plot_rows(self, count: int):
-        if self._use_gpu_canvas:
-            return
-        while len(self.plots) < count:
-            idx = len(self.plots)
-            label = self.plotLayout.addLabel(row=idx, col=0, text="", justify="right")
-            self.channel_labels.append(label)
-
-            plot = self.plotLayout.addPlot(row=idx, col=1)
-            plot.showAxis("bottom", show=False)
-            plot.showAxis("left", show=False)
-            plot.showAxis("right", show=False)
-            plot.showAxis("top", show=False)
-            plot.setMenuEnabled(False)
-            plot.setMouseEnabled(x=True, y=False)
-            plot.showGrid(x=False, y=True, alpha=0.15)
-            curve_color = self._curve_color(idx)
-            curve = plot.plot([], [], pen=pg.mkPen(curve_color, width=1.2))
-            curve.setClipToView(True)
-            curve.setDownsampling(auto=True, method="peak")
-
-            self.plots.append(plot)
-            self.curves.append(curve)
 
     def _ensure_hypnogram_plot(self) -> None:
         if self._use_gpu_canvas:
@@ -3646,8 +3640,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self._primary_plot = None
             return
 
+        if self._pg_backend is not None:
+            infos = getattr(self.loader, "info", [])
+            hidden = {idx for idx in self._hidden_channels if 0 <= idx < len(infos)}
+            self._pg_backend.configure_channels(infos=infos, hidden_indices=hidden)
+
         old_primary = self._primary_plot
-        self._ensure_plot_rows(n)
 
         # Reset previous primary axis if needed
         if self._primary_plot and self._primary_plot not in self.plots[:n]:
@@ -3719,17 +3717,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self._sync_hover_overlay_target()
 
     def _configure_gpu_canvas(self) -> None:
-        if not (self._use_gpu_canvas and self._gpu_canvas is not None):
+        backend = self._channel_backend if self._use_gpu_canvas else None
+        if backend is None:
             return
         infos = getattr(self.loader, "info", [])
         hidden = {idx for idx in self._hidden_channels if 0 <= idx < len(infos)}
-        self._gpu_canvas.configure_channels(infos=infos, hidden_indices=hidden)
-        self._gpu_canvas.set_view(self._view_start, self._view_duration)
+        backend.configure_channels(infos=infos, hidden_indices=hidden)
+        backend.set_view(self._view_start, self._view_duration)
         theme = self._theme
         colors = theme.curve_colors or ("#5f8bff",)
         label_active = theme.channel_label_active or theme.pg_foreground
         label_hidden = theme.channel_label_hidden or theme.pg_foreground
-        self._gpu_canvas.set_theme(
+        backend.set_theme(
             background=theme.pg_background,
             curve_colors=colors,
             label_active=label_active,
@@ -3737,19 +3736,19 @@ class MainWindow(QtWidgets.QMainWindow):
             axis_color=theme.pg_foreground,
         )
         timebase = getattr(self.loader, "timebase", None)
-        self._gpu_canvas.set_timebase(timebase)
+        backend.set_timebase(timebase)
         if getattr(timebase, "start_dt", None) is not None:
-            self._gpu_canvas.set_time_mode("absolute")
+            backend.set_time_mode("absolute")
         else:
-            self._gpu_canvas.set_time_mode("relative")
+            backend.set_time_mode("relative")
         for idx, meta in enumerate(infos):
             hidden_flag = idx in hidden
-            self._gpu_canvas.set_channel_label(
+            backend.set_channel_label(
                 idx,
                 self._format_label(meta, hidden=hidden_flag),
                 hidden=hidden_flag,
             )
-        self._gpu_canvas.set_hover_enabled(False)
+        backend.set_hover_enabled(False)
 
     def _sync_channel_controls(self) -> None:
         if not hasattr(self, "channelSection"):
