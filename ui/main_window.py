@@ -1133,8 +1133,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._gpu_canvas.set_theme(
                 background=theme.pg_background,
                 curve_colors=colors,
-                label_active_color=theme.channel_label_active,
-                label_hidden_color=theme.channel_label_hidden,
+                label_color=theme.pg_foreground,
             )
         else:
             self.plotLayout.setBackground(theme.pg_background)
