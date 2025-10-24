@@ -160,7 +160,7 @@ class VispyChannelCanvas(QtWidgets.QWidget):
         self._view_y_ranges: list[tuple[float, float]] = []
 
         self._hover_line = scene.visuals.Line(
-            pos=np.zeros((0, 2), dtype=np.float32),
+            pos=self._empty_vertices(),
             color=Color("#d0d4ff"),
             width=1.0,
             method="gl",
@@ -208,8 +208,11 @@ class VispyChannelCanvas(QtWidgets.QWidget):
                 line.set_data(color=self._channel_colors[idx])
         if self._x_axis is not None:
             axis_color = Color(label_color)
-            self._x_axis.axis.color = axis_color
-            self._x_axis.axis.tick_color = axis_color
+            # Update available color properties without assigning new attributes.
+            with contextlib.suppress(AttributeError):
+                self._x_axis.axis.tick_color = axis_color
+            with contextlib.suppress(AttributeError):
+                self._x_axis.axis.text_color = axis_color
 
     def configure_channels(
         self,
@@ -309,15 +312,20 @@ class VispyChannelCanvas(QtWidgets.QWidget):
                 continue
 
             t_arr, x_arr = series[idx]
+            if t_arr.size == 0 or x_arr.size == 0:
+                self.clear_channel(idx)
+                continue
             vertex = vertices[idx] if idx < len(vertices) else None
             if vertex is None:
                 vertex = self._prepare_vertices(t_arr, x_arr)
-
-            if not final and vertex.size == 0:
+            if vertex is None or vertex.shape[0] < 2:
+                self.clear_channel(idx)
                 continue
 
             color = self._channel_colors[idx] if idx < len(self._channel_colors) else Color("#66aaff")
-            self._lines[idx].set_data(pos=vertex, color=color, width=1.2)
+            line_item = self._lines[idx]
+            line_item.visible = True
+            line_item.set_data(pos=vertex, color=color, width=1.2)
 
             state = _ChannelState(t=t_arr.copy(), x=x_arr.copy())
             if idx < len(self._channel_states):
@@ -332,7 +340,9 @@ class VispyChannelCanvas(QtWidgets.QWidget):
     def clear_channel(self, idx: int) -> None:
         if idx >= len(self._lines):
             return
-        self._lines[idx].set_data(pos=self._empty_vertices())
+        line = self._lines[idx]
+        line.visible = False
+        line.set_data(pos=self._empty_vertices())
         if idx < len(self._channel_states):
             self._channel_states[idx] = _ChannelState(t=np.array([]), x=np.array([]))
         if idx < len(self._view_y_ranges):
@@ -349,8 +359,10 @@ class VispyChannelCanvas(QtWidgets.QWidget):
             if idx < len(self._view_y_ranges):
                 y_range = self._view_y_ranges[idx]
             view.camera.set_range(x=x_range, y=y_range)
-        if self._x_axis is not None:
-            self._x_axis.domain = x_range
+        if self._x_axis is not None and self._views:
+            # AxisWidget follows the first linked view; ensure linkage stays intact.
+            with contextlib.suppress(Exception):
+                self._x_axis.link_view(self._views[0])
 
     def estimate_pixels(self) -> int:
         native = self._canvas.native
@@ -397,6 +409,8 @@ class VispyChannelCanvas(QtWidgets.QWidget):
 
             view.add(label)
             line = scene.visuals.Line(method="gl")
+            line.set_data(pos=self._empty_vertices())
+            line.visible = False
             view.add(line)
             view.add(self._hover_line)
             view.add(self._hover_marker)
@@ -541,4 +555,5 @@ class VispyChannelCanvas(QtWidgets.QWidget):
 
     @staticmethod
     def _empty_vertices() -> np.ndarray:
-        return np.zeros((0, 2), dtype=np.float32)
+        # Two nearly coincident vertices keep VisPy bounds finite without rendering a visible segment.
+        return np.array([[0.0, 0.0], [1e-6, 0.0]], dtype=np.float32)
