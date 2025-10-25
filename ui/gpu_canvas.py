@@ -783,6 +783,11 @@ class VispyChannelCanvas(QtWidgets.QWidget):
             self._hover_marker.visible = False
             self._hover_channel = None
 
+    def annotation_lane_active(self) -> bool:
+        """Return True if hypnogram or annotation events are visible."""
+
+        return bool(self._hypnogram_visible or self._annotation_events_visible)
+
     # ------------------------------------------------------------------
     # Internal helpers
 

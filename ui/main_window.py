@@ -875,17 +875,10 @@ class MainWindow(QtWidgets.QMainWindow):
             container.setMaximumWidth(260)
             layout = QtWidgets.QVBoxLayout(container)
             layout.setContentsMargins(12, 8, 8, 8)
-            layout.setSpacing(6)
-            spacer = QtWidgets.QSpacerItem(
-                0,
-                0,
-                QtWidgets.QSizePolicy.Minimum,
-                QtWidgets.QSizePolicy.Expanding,
-            )
-            layout.addItem(spacer)
+            layout.setSpacing(2)
             self._gpu_label_container = container
             self._gpu_label_layout = layout
-            self._gpu_label_spacer = spacer
+            self._gpu_label_spacer = None
             self._sync_gpu_label_background()
         return self._gpu_label_container
 
@@ -913,6 +906,7 @@ class MainWindow(QtWidgets.QMainWindow):
         container.show()
         self._gpu_canvas.show()
         self.channel_labels = self._gpu_label_widgets
+        self._update_gpu_plot_height_hint()
         return self._gpu_plot_wrapper
 
     def _style_gpu_label(self, label: QtWidgets.QLabel, hidden: bool) -> None:
@@ -951,13 +945,13 @@ class MainWindow(QtWidgets.QMainWindow):
             label.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
             label.setSizePolicy(
                 QtWidgets.QSizePolicy.Preferred,
-                QtWidgets.QSizePolicy.Fixed,
+                QtWidgets.QSizePolicy.Expanding,
             )
-            label.setMinimumHeight(48)
-            insert_pos = layout.count()
-            if self._gpu_label_spacer is not None:
-                insert_pos = max(0, layout.count() - 1)
-            layout.insertWidget(insert_pos, label)
+            label.setMinimumHeight(0)
+            layout.addWidget(label, 1)
+            label_index = layout.indexOf(label)
+            if label_index >= 0:
+                layout.setStretch(label_index, 1)
             self._gpu_label_widgets.append(label)
         for idx, label in enumerate(self._gpu_label_widgets):
             if idx >= len(infos):
@@ -975,6 +969,40 @@ class MainWindow(QtWidgets.QMainWindow):
                 label.setVisible(True)
                 self._style_gpu_label(label, hidden_flag)
         self.channel_labels = self._gpu_label_widgets
+        visible_count = sum(1 for idx in range(len(infos)) if idx not in hidden)
+        self._update_gpu_plot_height_hint(visible_count)
+
+    def _gpu_visible_channel_count(self) -> int:
+        if not self._use_gpu_canvas:
+            return 0
+        loader = getattr(self, "loader", None)
+        infos = getattr(loader, "info", None)
+        if not infos:
+            return 0
+        hidden = self._hidden_channels
+        return sum(1 for idx in range(len(infos)) if idx not in hidden)
+
+    def _update_gpu_plot_height_hint(self, visible_count: int | None = None) -> None:
+        if not self._use_gpu_canvas:
+            return
+        canvas = self._gpu_canvas
+        wrapper = self._gpu_plot_wrapper
+        if canvas is None or wrapper is None:
+            return
+        if visible_count is None:
+            visible_count = self._gpu_visible_channel_count()
+        lanes = max(visible_count, 1)
+        per_lane = 56
+        axis_allowance = 48
+        annotations_active = bool(
+            getattr(canvas, "annotation_lane_active", lambda: False)()
+        )
+        annotation_allowance = 80 if annotations_active else 32
+        min_height = max(320, int(lanes * per_lane + axis_allowance + annotation_allowance))
+        wrapper.setMinimumHeight(min_height)
+        canvas.setMinimumHeight(min_height)
+        if self._gpu_label_container is not None:
+            self._gpu_label_container.setMinimumHeight(min_height)
 
     def _update_gpu_label_widget(self, idx: int, text: str, hidden: bool) -> None:
         if idx >= len(self._gpu_label_widgets):
@@ -3181,6 +3209,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     view_start=self._view_start,
                     view_end=self._view_start + self._view_duration,
                 )
+            self._update_gpu_plot_height_hint()
             return
         if not self._primary_plot:
             return
@@ -3592,6 +3621,7 @@ class MainWindow(QtWidgets.QMainWindow):
             view_start=view_start,
             view_end=view_end,
         )
+        self._update_gpu_plot_height_hint()
 
     def _apply_tile_to_curves(self, tile: OverscanTile) -> None:
         self._prepare_tile(tile)
@@ -4008,6 +4038,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     view_start=self._view_start,
                     view_end=self._view_start + self._view_duration,
                 )
+                self._update_gpu_plot_height_hint()
             return
         plot = self.hypnogramPlot
         if plot is None:
@@ -4238,6 +4269,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if not visible and self._hover_sample is not None and self._hover_sample.channel == idx:
                 self._clear_hover_sample()
             self._sync_backend_hover_state()
+            self._update_gpu_plot_height_hint()
             return
         if idx >= len(self.plots):
             return
