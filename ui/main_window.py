@@ -886,6 +886,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._gpu_label_container = container
             self._gpu_label_layout = layout
             self._gpu_label_spacer = spacer
+            self._sync_gpu_label_background()
         return self._gpu_label_container
 
     def _ensure_gpu_plot_widget(self) -> QtWidgets.QWidget | None:
@@ -924,6 +925,17 @@ class MainWindow(QtWidgets.QMainWindow):
             css = f"color: {active}; font-weight: 600;"
         label.setStyleSheet(css + " padding-right: 12px;")
 
+    def _sync_gpu_label_background(self) -> None:
+        container = self._gpu_label_container
+        if container is None:
+            return
+        container.setAttribute(QtCore.Qt.WA_StyledBackground, True)
+        theme = getattr(self, "_theme", THEMES[DEFAULT_THEME])
+        background = theme.pg_background or "#10141a"
+        container.setStyleSheet(
+            f"background-color: {background}; border: none; padding: 0px;"
+        )
+
     def _sync_gpu_label_widgets(
         self,
         infos: Sequence[object],
@@ -955,18 +967,26 @@ class MainWindow(QtWidgets.QMainWindow):
             meta = infos[idx]
             hidden_flag = idx in hidden
             text = self._channel_label_text(meta, hidden=hidden_flag)
-            label.setText(text)
-            label.setVisible(True)
-            self._style_gpu_label(label, hidden_flag)
+            if hidden_flag:
+                label.hide()
+                label.setText("")
+            else:
+                label.setText(text)
+                label.setVisible(True)
+                self._style_gpu_label(label, hidden_flag)
         self.channel_labels = self._gpu_label_widgets
 
     def _update_gpu_label_widget(self, idx: int, text: str, hidden: bool) -> None:
         if idx >= len(self._gpu_label_widgets):
             return
         label = self._gpu_label_widgets[idx]
-        label.setText(text)
-        label.setVisible(True)
-        self._style_gpu_label(label, hidden)
+        if hidden:
+            label.hide()
+            label.setText("")
+        else:
+            label.setText(text)
+            label.setVisible(True)
+            self._style_gpu_label(label, hidden)
 
     def _ensure_cpu_canvas(self) -> pg.GraphicsLayoutWidget:
         if self._cpu_plot_widget is None:
@@ -1413,6 +1433,7 @@ class MainWindow(QtWidgets.QMainWindow):
         pg.setConfigOption("foreground", theme.pg_foreground)
 
         self.setStyleSheet(theme.stylesheet)
+        self._sync_gpu_label_background()
 
         backend = self._channel_backend
         if backend is not None:
