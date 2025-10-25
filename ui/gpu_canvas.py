@@ -225,10 +225,14 @@ class VispyChannelCanvas(QtWidgets.QWidget):
         self._channel_states: list[_ChannelState] = []
         self._channel_visible: list[bool] = []
         self._channel_colors: list[Color] = []
+        self._channel_labels: list[scene.visuals.Text] = []
+        self._channel_label_texts: list[str] = []
+        self._channel_label_hidden: list[bool] = []
         self._view_y_ranges: list[tuple[float, float]] = []
 
         self._background_color = Color("#10141a")
         self._label_active_color = Color("#dfe7ff")
+        self._label_hidden_color = Color("#6c788f")
         self._grid_line_color = Color((0.45, 0.52, 0.68, 0.2))
         self._axis_formatter = TimeTickFormatter()
         self._axis_ticker: _TimeAxisTicker | None = None
@@ -368,6 +372,7 @@ class VispyChannelCanvas(QtWidgets.QWidget):
             Color(palette[idx % len(palette)]) for idx in range(channel_count)
         ]
         self._label_active_color = Color(label_active)
+        self._label_hidden_color = Color(label_hidden or label_active)
         self._grid_line_color = self._compute_grid_color()
         for idx, line in enumerate(self._lines):
             if idx < len(self._channel_colors):
@@ -397,6 +402,8 @@ class VispyChannelCanvas(QtWidgets.QWidget):
             self._hypnogram_view.bgcolor = self._background_color
         if self._hypnogram_label_text is not None:
             self._hypnogram_label_text.color = self._label_active_color
+        for idx in range(len(self._channel_labels)):
+            self._update_label_color(idx)
 
     def configure_channels(
         self,
@@ -422,6 +429,11 @@ class VispyChannelCanvas(QtWidgets.QWidget):
                     self._lines[idx].set_data(pos=self._empty_vertices())
             if idx < len(self._grid_lines):
                 self._grid_lines[idx].visible = visible
+            if idx < len(self._channel_label_hidden):
+                self._channel_label_hidden[idx] = idx in hidden_indices
+            self._update_label_color(idx)
+            self._update_label_visibility(idx)
+            self._update_label_position(idx)
 
         for idx in range(count, len(self._views)):
             self._views[idx].visible = False
@@ -430,6 +442,10 @@ class VispyChannelCanvas(QtWidgets.QWidget):
                 self._lines[idx].set_data(pos=self._empty_vertices())
             if idx < len(self._grid_lines):
                 self._grid_lines[idx].visible = False
+            if idx < len(self._channel_labels):
+                self._channel_label_texts[idx] = ""
+                self._channel_labels[idx].text = ""
+                self._channel_labels[idx].visible = False
 
     def set_channel_visibility(self, idx: int, visible: bool) -> None:
         if idx >= len(self._views):
@@ -443,11 +459,24 @@ class VispyChannelCanvas(QtWidgets.QWidget):
             self._lines[idx].set_data(pos=self._empty_vertices())
             if self._hover_channel == idx:
                 self._hide_hover()
+        self._update_label_visibility(idx)
+        if visible:
+            self._update_label_position(idx)
 
-    def set_channel_label(self, idx: int, text: str, *, hidden: bool) -> None:  # noqa: ARG002
-        if idx >= len(self._channel_visible):
+    def set_channel_label(self, idx: int, text: str, *, hidden: bool) -> None:
+        if idx >= len(self._channel_labels):
             return
-        self._channel_visible[idx] = not hidden
+        if idx >= len(self._channel_label_texts):
+            self._channel_label_texts.extend([""] * (idx + 1 - len(self._channel_label_texts)))
+        if idx >= len(self._channel_label_hidden):
+            self._channel_label_hidden.extend([False] * (idx + 1 - len(self._channel_label_hidden)))
+        self._channel_label_texts[idx] = text or ""
+        self._channel_label_hidden[idx] = bool(hidden)
+        label = self._channel_labels[idx]
+        label.text = text or ""
+        self._update_label_color(idx)
+        self._update_label_visibility(idx)
+        self._update_label_position(idx)
 
     def set_curve_color(self, idx: int, color: str) -> None:
         if idx >= len(self._lines):
@@ -749,6 +778,7 @@ class VispyChannelCanvas(QtWidgets.QWidget):
             self._grid_lines[idx].visible = False
         if self._hover_channel == idx:
             self._hide_hover()
+        self._update_label_visibility(idx)
 
     def set_view(self, start: float, duration: float) -> None:
         self._view_start = start
@@ -765,6 +795,7 @@ class VispyChannelCanvas(QtWidgets.QWidget):
                 y=self._hypnogram_y_range,
             )
         self._update_hypnogram_region_visual(*x_range)
+        self._update_all_label_positions()
         if self._x_axis is not None:
             self._refresh_axis_link()
             self._request_axis_update()
@@ -812,12 +843,26 @@ class VispyChannelCanvas(QtWidgets.QWidget):
             view.add(self._hover_line)
             view.add(self._hover_marker)
 
+            label = scene.visuals.Text(
+                text="",
+                anchor_x="left",
+                anchor_y="top",
+                color=self._label_active_color,
+                font_size=12,
+            )
+            label.visible = False
+            label.transform = transforms.STTransform()
+            view.add(label)
+
             self._views.append(view)
             self._lines.append(line)
             self._grid_lines.append(grid)
             self._channel_states.append(_ChannelState(t=np.array([]), x=np.array([])))
             self._channel_visible.append(True)
             self._channel_colors.append(Color("#66aaff"))
+            self._channel_labels.append(label)
+            self._channel_label_texts.append("")
+            self._channel_label_hidden.append(False)
             self._view_y_ranges.append((-1.0, 1.0))
 
         self._install_axis_widget()
@@ -855,6 +900,53 @@ class VispyChannelCanvas(QtWidgets.QWidget):
             return
         with contextlib.suppress(Exception):
             self._x_axis.link_view(target)
+
+    def _update_all_label_positions(self) -> None:
+        for idx in range(len(self._channel_labels)):
+            self._update_label_position(idx)
+
+    def _update_label_position(self, idx: int) -> None:
+        if idx >= len(self._channel_labels):
+            return
+        duration = max(self._view_duration, 1e-6)
+        x_pos = self._view_start + duration * 0.01
+        if idx < len(self._view_y_ranges):
+            y0, y1 = self._view_y_ranges[idx]
+        else:
+            y0, y1 = (-1.0, 1.0)
+        if not (np.isfinite(y0) and np.isfinite(y1)) or y1 <= y0:
+            y0, y1 = -1.0, 1.0
+        margin = max((y1 - y0) * 0.08, 1e-6)
+        y_pos = y1 - margin
+        try:
+            self._channel_labels[idx].pos = (float(x_pos), float(y_pos))
+        except Exception:
+            pass
+
+    def _update_label_visibility(self, idx: int) -> None:
+        if idx >= len(self._channel_labels):
+            return
+        text = self._channel_label_texts[idx] if idx < len(self._channel_label_texts) else ""
+        hidden = self._channel_label_hidden[idx] if idx < len(self._channel_label_hidden) else False
+        visible = bool(text)
+        if idx < len(self._channel_visible):
+            visible = visible and bool(self._channel_visible[idx])
+        if hidden:
+            visible = False
+        self._channel_labels[idx].visible = visible
+
+    def _update_label_color(self, idx: int) -> None:
+        if idx >= len(self._channel_labels):
+            return
+        hidden = self._channel_label_hidden[idx] if idx < len(self._channel_label_hidden) else False
+        color = self._label_hidden_color if hidden else self._label_active_color
+        try:
+            self._channel_labels[idx].color = color
+        except Exception:
+            try:
+                self._channel_labels[idx].color = color.rgba
+            except Exception:
+                pass
 
     def _ensure_hypnogram_row(self) -> None:
         if self._hypnogram_view is not None:
@@ -1080,6 +1172,7 @@ class VispyChannelCanvas(QtWidgets.QWidget):
             max_val += pad
         self._view_y_ranges[idx] = (min_val, max_val)
         self._views[idx].camera.set_range(y=(min_val, max_val))
+        self._update_label_position(idx)
 
     # ------------------------------------------------------------------
     # Hover feedback
