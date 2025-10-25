@@ -349,6 +349,7 @@ class VispyChannelCanvas(QtWidgets.QWidget):
                 context.set_viewport(0, 0, physical_width, physical_height)
         with contextlib.suppress(Exception):
             self._canvas.update()
+        self._update_all_label_positions()
 
     # ------------------------------------------------------------------
     # Public control surface
@@ -848,7 +849,9 @@ class VispyChannelCanvas(QtWidgets.QWidget):
                 anchor_x="left",
                 anchor_y="top",
                 color=self._label_active_color,
-                font_size=12,
+                font_size=14,
+                bold=True,
+                method="gpu",
             )
             label.visible = False
             label.transform = transforms.STTransform()
@@ -909,15 +912,32 @@ class VispyChannelCanvas(QtWidgets.QWidget):
         if idx >= len(self._channel_labels):
             return
         duration = max(self._view_duration, 1e-6)
-        x_pos = self._view_start + duration * 0.01
+        view = self._views[idx] if idx < len(self._views) else None
+        width_px = height_px = 0.0
+        if view is not None:
+            try:
+                width_px, height_px = view.size
+            except Exception:
+                width_px = height_px = 0.0
+
+        px_margin_x = 14.0
+        if width_px > 1.0:
+            x_offset = duration * (px_margin_x / float(width_px))
+        else:
+            x_offset = duration * 0.01
+        x_pos = self._view_start + x_offset
         if idx < len(self._view_y_ranges):
             y0, y1 = self._view_y_ranges[idx]
         else:
             y0, y1 = (-1.0, 1.0)
         if not (np.isfinite(y0) and np.isfinite(y1)) or y1 <= y0:
             y0, y1 = -1.0, 1.0
-        margin = max((y1 - y0) * 0.08, 1e-6)
-        y_pos = y1 - margin
+        px_margin_y = 12.0
+        if height_px > 1.0:
+            y_offset = (y1 - y0) * (px_margin_y / float(height_px))
+        else:
+            y_offset = max((y1 - y0) * 0.08, 1e-6)
+        y_pos = y1 - max(y_offset, 1e-6)
         try:
             self._channel_labels[idx].pos = (float(x_pos), float(y_pos))
         except Exception:
