@@ -219,15 +219,17 @@ class VispyChannelCanvas(QtWidgets.QWidget):
         # We'll insert an AxisWidget at the bottom row when channels exist.
         self._x_axis: scene.AxisWidget | None = None
 
+        self._gutter_views: list[scene.widgets.ViewBox] = []
         self._views: list[scene.widgets.ViewBox] = []
         self._lines: list[scene.visuals.Line] = []
+        self._label_nodes: list[scene.visuals.Text] = []
         self._grid_lines: list[scene.visuals.GridLines] = []
         self._channel_states: list[_ChannelState] = []
         self._channel_visible: list[bool] = []
         self._channel_colors: list[Color] = []
         self._view_y_ranges: list[tuple[float, float]] = []
-        self._channel_label_text: list[str] = []
-        self._channel_label_hidden: list[bool] = []
+        self._label_hidden: list[bool] = []
+        self._gutter_axis_placeholder: scene.widgets.Widget | None = None
 
         self._background_color = Color("#10141a")
         self._label_active_color = Color("#dfe7ff")
@@ -239,6 +241,8 @@ class VispyChannelCanvas(QtWidgets.QWidget):
         self._time_mode = "relative"
 
         self._hypnogram_view: scene.widgets.ViewBox | None = None
+        self._hypnogram_label_view: scene.widgets.ViewBox | None = None
+        self._hypnogram_label_text: scene.visuals.Text | None = None
         self._hypnogram_outline: scene.visuals.Line | None = None
         self._hypnogram_fill_meshes: dict[str, scene.visuals.Mesh] = {}
         self._hypnogram_region_mesh: scene.visuals.Mesh | None = None
@@ -365,7 +369,7 @@ class VispyChannelCanvas(QtWidgets.QWidget):
         self._background_color = Color(background)
         self._canvas.bgcolor = self._background_color
         palette = list(curve_colors) if curve_colors else ["#5f8bff"]
-        channel_count = max(len(self._lines), 1)
+        channel_count = max(len(self._lines), len(self._label_nodes), 1)
         self._channel_colors = [
             Color(palette[idx % len(palette)]) for idx in range(channel_count)
         ]
@@ -377,10 +381,14 @@ class VispyChannelCanvas(QtWidgets.QWidget):
             rgba[3] = max(0.25, float(rgba[3]) * 0.6)
             self._label_hidden_color = Color(rgba)
         self._grid_line_color = self._compute_grid_color()
-        for idx in range(len(self._lines)):
+        for gutter in self._gutter_views:
+            with contextlib.suppress(Exception):
+                gutter.bgcolor = self._background_color
+        for idx in range(len(self._label_nodes)):
             if idx < len(self._channel_colors):
                 with contextlib.suppress(Exception):
                     self._lines[idx].set_data(color=self._channel_colors[idx])
+            self._apply_label_style(idx)
         if self._x_axis is not None:
             axis_color_obj = Color(axis_color or label_active)
             # Update available color properties without assigning new attributes.
@@ -403,6 +411,8 @@ class VispyChannelCanvas(QtWidgets.QWidget):
         self._update_grid_palette()
         if self._hypnogram_view is not None:
             self._hypnogram_view.bgcolor = self._background_color
+        if self._hypnogram_label_text is not None:
+            self._hypnogram_label_text.color = self._label_active_color
 
     def configure_channels(
         self,
@@ -415,50 +425,62 @@ class VispyChannelCanvas(QtWidgets.QWidget):
         count = len(infos)
         self._ensure_rows(count)
         self._channel_visible = [idx not in hidden_indices for idx in range(count)]
-        for idx in range(count):
+        for idx, meta in enumerate(infos):
+            name = getattr(meta, "name", f"Ch {idx + 1}")
+            unit = getattr(meta, "unit", "")
+            label = f"{name}"
+            if unit:
+                label = f"{label} [{unit}]"
+            self._label_nodes[idx].text = label
+            self._label_nodes[idx].visible = True
             visible = self._channel_visible[idx]
-            if idx < len(self._views):
-                self._views[idx].visible = visible
-            if idx < len(self._lines):
-                self._lines[idx].visible = visible
-                if not visible:
-                    self._lines[idx].set_data(pos=self._empty_vertices())
+            if idx < len(self._gutter_views):
+                self._gutter_views[idx].visible = visible
+            self._views[idx].visible = visible
+            self._lines[idx].visible = visible
             if idx < len(self._grid_lines):
                 self._grid_lines[idx].visible = visible
+            if idx < len(self._label_hidden):
+                self._label_hidden[idx] = not visible
+            self._apply_label_style(idx)
 
         for idx in range(count, len(self._views)):
+            if idx < len(self._gutter_views):
+                self._gutter_views[idx].visible = False
             self._views[idx].visible = False
-        for idx in range(count, len(self._lines)):
             self._lines[idx].visible = False
-            self._lines[idx].set_data(pos=self._empty_vertices())
-        for idx in range(count, len(self._grid_lines)):
-            self._grid_lines[idx].visible = False
-        for idx in range(count, len(self._channel_label_text)):
-            self._channel_label_text[idx] = ""
-        for idx in range(count, len(self._channel_label_hidden)):
-            self._channel_label_hidden[idx] = False
+            self._label_nodes[idx].text = ""
+            if idx < len(self._grid_lines):
+                self._grid_lines[idx].visible = False
+            if idx < len(self._label_hidden):
+                self._label_hidden[idx] = False
+                self._apply_label_style(idx)
 
     def set_channel_visibility(self, idx: int, visible: bool) -> None:
         if idx >= len(self._views):
             return
         self._channel_visible[idx] = visible
+        if idx < len(self._gutter_views):
+            self._gutter_views[idx].visible = visible
         self._views[idx].visible = visible
         self._lines[idx].visible = visible
         if idx < len(self._grid_lines):
             self._grid_lines[idx].visible = visible
+        if idx < len(self._label_hidden):
+            self._label_hidden[idx] = not visible
+            self._apply_label_style(idx)
         if not visible:
             self._lines[idx].set_data(pos=np.zeros((0, 2), dtype=np.float32))
             if self._hover_channel == idx:
                 self._hide_hover()
 
     def set_channel_label(self, idx: int, text: str, *, hidden: bool | None = None) -> None:
-        while idx >= len(self._channel_label_text):
-            self._channel_label_text.append("")
-        while idx >= len(self._channel_label_hidden):
-            self._channel_label_hidden.append(False)
-        self._channel_label_text[idx] = text
-        if hidden is not None:
-            self._channel_label_hidden[idx] = bool(hidden)
+        if idx < len(self._label_nodes):
+            self._label_nodes[idx].text = text
+            self._label_nodes[idx].visible = True
+            if hidden is not None and idx < len(self._label_hidden):
+                self._label_hidden[idx] = bool(hidden)
+            self._apply_label_style(idx)
 
     def set_curve_color(self, idx: int, color: str) -> None:
         if idx >= len(self._lines):
@@ -806,10 +828,35 @@ class VispyChannelCanvas(QtWidgets.QWidget):
             self._grid.remove_widget(self._x_axis)
             self._x_axis = None
             self._axis_ticker = None
+        if self._gutter_axis_placeholder is not None:
+            self._grid.remove_widget(self._gutter_axis_placeholder)
+            self._gutter_axis_placeholder = None
 
         while len(self._views) < count:
             row = len(self._views)
-            view = self._grid.add_view(row=row, col=0, camera="panzoom")
+            gutter = self._grid.add_view(row=row, col=0, camera="panzoom")
+            gutter.camera.interactive = False
+            with contextlib.suppress(Exception):
+                gutter.camera.set_range(x=(0.0, 1.0), y=(0.0, 1.0))
+            gutter.border_color = None
+            gutter.padding = 0.0
+            gutter.bgcolor = None
+            with contextlib.suppress(Exception):
+                gutter.width_min = 72
+            with contextlib.suppress(Exception):
+                gutter.width_max = 220
+
+            label = scene.visuals.Text(
+                text="",
+                anchor_x="left",
+                anchor_y="top",
+                color="white",
+                font_size=12,
+            )
+            label.pos = (0.02, 0.95)
+            gutter.add(label)
+
+            view = self._grid.add_view(row=row, col=1, camera="panzoom")
             view.camera.interactive = False
             view.border_color = None
             view.padding = 0.0
@@ -824,15 +871,16 @@ class VispyChannelCanvas(QtWidgets.QWidget):
             view.add(self._hover_line)
             view.add(self._hover_marker)
 
+            self._gutter_views.append(gutter)
             self._views.append(view)
             self._lines.append(line)
+            self._label_nodes.append(label)
             self._grid_lines.append(grid)
             self._channel_states.append(_ChannelState(t=np.array([]), x=np.array([])))
             self._channel_visible.append(True)
             self._channel_colors.append(Color("#66aaff"))
             self._view_y_ranges.append((-1.0, 1.0))
-            self._channel_label_text.append("")
-            self._channel_label_hidden.append(False)
+            self._label_hidden.append(False)
 
         self._install_axis_widget()
         self.set_view(self._view_start, self._view_duration)
@@ -842,6 +890,9 @@ class VispyChannelCanvas(QtWidgets.QWidget):
             self._grid.remove_widget(self._x_axis)
             self._x_axis = None
             self._axis_ticker = None
+        if self._gutter_axis_placeholder is not None:
+            self._grid.remove_widget(self._gutter_axis_placeholder)
+            self._gutter_axis_placeholder = None
 
         total_rows = len(self._views)
         if self._hypnogram_view is not None:
@@ -851,7 +902,15 @@ class VispyChannelCanvas(QtWidgets.QWidget):
         self._x_axis.axis.scale_type = "linear"
         self._x_axis.height_max = 32
         self._x_axis.height_min = 28
-        self._grid.add_widget(self._x_axis, row=total_rows, col=0)
+        self._grid.add_widget(self._x_axis, row=total_rows, col=1)
+        with contextlib.suppress(Exception):
+            placeholder = scene.widgets.Widget()
+            placeholder.height_max = self._x_axis.height_max
+            placeholder.height_min = self._x_axis.height_min
+            placeholder.border_color = None
+            placeholder.bgcolor = None
+            self._grid.add_widget(placeholder, row=total_rows, col=0)
+            self._gutter_axis_placeholder = placeholder
         self._apply_axis_formatter()
         self._update_axis_theme()
         self._refresh_axis_link()
@@ -879,9 +938,31 @@ class VispyChannelCanvas(QtWidgets.QWidget):
             self._grid.remove_widget(self._x_axis)
             self._x_axis = None
             self._axis_ticker = None
+        if self._gutter_axis_placeholder is not None:
+            self._grid.remove_widget(self._gutter_axis_placeholder)
+            self._gutter_axis_placeholder = None
 
         row = len(self._views)
-        view = self._grid.add_view(row=row, col=0, camera="panzoom")
+        label_view = self._grid.add_view(row=row, col=0, camera="panzoom")
+        label_view.camera.interactive = False
+        label_view.border_color = None
+        label_view.padding = 0.0
+        label_view.bgcolor = None
+        with contextlib.suppress(Exception):
+            label_view.height_min = 48
+            label_view.height_max = 96
+
+        label_text = scene.visuals.Text(
+            text="Hypnogram",
+            anchor_x="left",
+            anchor_y="top",
+            color=self._label_active_color,
+            font_size=12,
+        )
+        label_text.transform = transforms.STTransform(translate=(8, 8))
+        label_view.add(label_text)
+
+        view = self._grid.add_view(row=row, col=1, camera="panzoom")
         view.camera.interactive = False
         view.border_color = None
         view.padding = 0.0
@@ -906,6 +987,8 @@ class VispyChannelCanvas(QtWidgets.QWidget):
         region_border.set_gl_state(depth_test=False, blend=True)
         view.add(region_border)
 
+        self._hypnogram_label_view = label_view
+        self._hypnogram_label_text = label_text
         self._hypnogram_view = view
         self._hypnogram_outline = outline
         self._hypnogram_region_mesh = region_mesh
@@ -924,6 +1007,8 @@ class VispyChannelCanvas(QtWidgets.QWidget):
         active = self._hypnogram_visible or self._annotation_events_visible
         if self._hypnogram_view is not None:
             self._hypnogram_view.visible = active
+        if self._hypnogram_label_view is not None:
+            self._hypnogram_label_view.visible = active
         if not active:
             if self._hypnogram_outline is not None:
                 self._hypnogram_outline.visible = False
@@ -1220,6 +1305,16 @@ class VispyChannelCanvas(QtWidgets.QWidget):
 
     # ------------------------------------------------------------------
     # Palette helpers
+
+    def _apply_label_style(self, idx: int) -> None:
+        if idx >= len(self._label_nodes):
+            return
+        label = self._label_nodes[idx]
+        hidden = self._label_hidden[idx] if idx < len(self._label_hidden) else False
+        color = self._label_hidden_color if hidden else self._label_active_color
+        label.color = color
+        label.bold = not hidden
+        label.italic = hidden
 
     def _compute_grid_color(self) -> Color:
         fg = np.array(self._label_active_color.rgba)

@@ -194,14 +194,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._control_wrapper: QtWidgets.QWidget | None = None
         self._control_scroll: QtWidgets.QScrollArea | None = None
         self._control_rail: QtWidgets.QWidget | None = None
-        self._gpu_label_widget: QtWidgets.QWidget | None = None
-        self._gpu_label_layout: QtWidgets.QVBoxLayout | None = None
-        self._gpu_channel_label_layout: QtWidgets.QVBoxLayout | None = None
-        self._gpu_label_widgets: list[QtWidgets.QLabel] = []
-        self._gpu_label_spacer: QtWidgets.QSpacerItem | None = None
-        self._gpu_hypnogram_label: QtWidgets.QLabel | None = None
-        self._gpu_hover_label_index: int | None = None
-        self._gpu_hypnogram_visible: bool = False
         self._limits = WindowLimits(
             duration_min=0.25,
             duration_max=float(getattr(loader, "max_window_s", 120.0)),
@@ -689,8 +681,7 @@ class MainWindow(QtWidgets.QMainWindow):
         controlLayout.addStretch(1)
 
         if self._use_gpu_canvas and self._ensure_gpu_canvas_created():
-            gpu_container = self._build_gpu_canvas_container()
-            self.plotLayout = gpu_container
+            self.plotLayout = self._gpu_canvas
             self.plotLayout.setMinimumSize(0, 0)
             self.plotLayout.setSizePolicy(
                 QtWidgets.QSizePolicy.Expanding,
@@ -860,205 +851,6 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 self._gpu_hover_connected = True
         return True
-
-    def _build_gpu_canvas_container(self) -> QtWidgets.QWidget:
-        canvas = self._gpu_canvas
-        if canvas is None:
-            raise RuntimeError("GPU canvas is unavailable")
-        label_column = self._ensure_gpu_label_column()
-        container = QtWidgets.QWidget()
-        layout = QtWidgets.QHBoxLayout(container)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
-        if label_column is not None:
-            layout.addWidget(label_column)
-        layout.addWidget(canvas, 1)
-        return container
-
-    def _ensure_gpu_label_column(self) -> QtWidgets.QWidget | None:
-        if self._gpu_label_widget is None:
-            widget = QtWidgets.QWidget()
-            widget.setObjectName("gpuLabelColumn")
-            widget.setSizePolicy(
-                QtWidgets.QSizePolicy.Fixed,
-                QtWidgets.QSizePolicy.Expanding,
-            )
-            widget.setMinimumWidth(184)
-            widget.setMaximumWidth(320)
-            layout = QtWidgets.QVBoxLayout(widget)
-            layout.setContentsMargins(12, 12, 12, 12)
-            layout.setSpacing(10)
-
-            channel_container = QtWidgets.QWidget()
-            channel_container.setSizePolicy(
-                QtWidgets.QSizePolicy.Expanding,
-                QtWidgets.QSizePolicy.Minimum,
-            )
-            channel_layout = QtWidgets.QVBoxLayout(channel_container)
-            channel_layout.setContentsMargins(0, 0, 0, 0)
-            channel_layout.setSpacing(6)
-            layout.addWidget(channel_container)
-
-            hyp_label = QtWidgets.QLabel("Hypnogram")
-            hyp_label.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
-            hyp_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
-            hyp_label.setSizePolicy(
-                QtWidgets.QSizePolicy.Expanding,
-                QtWidgets.QSizePolicy.Fixed,
-            )
-            hyp_label.setMinimumHeight(52)
-            hyp_label.hide()
-            layout.addWidget(hyp_label)
-
-            if self._gpu_label_spacer is None:
-                spacer = QtWidgets.QSpacerItem(
-                    0,
-                    0,
-                    QtWidgets.QSizePolicy.Minimum,
-                    QtWidgets.QSizePolicy.Expanding,
-                )
-                layout.addItem(spacer)
-                self._gpu_label_spacer = spacer
-
-            self._gpu_label_widgets = []
-            self._gpu_label_layout = layout
-            self._gpu_channel_label_layout = channel_layout
-            self._gpu_hypnogram_label = hyp_label
-            self._gpu_label_widget = widget
-        return self._gpu_label_widget
-
-    def _ensure_gpu_label_widgets(self, count: int) -> None:
-        layout = self._gpu_channel_label_layout
-        if layout is None:
-            return
-        while len(self._gpu_label_widgets) < count:
-            label = QtWidgets.QLabel("")
-            label.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
-            label.setWordWrap(True)
-            label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
-            label.setSizePolicy(
-                QtWidgets.QSizePolicy.Expanding,
-                QtWidgets.QSizePolicy.Minimum,
-            )
-            label.setMinimumHeight(52)
-            label.hide()
-            layout.addWidget(label)
-            self._gpu_label_widgets.append(label)
-        for idx in range(count, len(self._gpu_label_widgets)):
-            self._gpu_label_widgets[idx].hide()
-
-    def _style_gpu_label_widget(
-        self, label: QtWidgets.QLabel, *, hidden: bool, hovered: bool
-    ) -> None:
-        theme = self._theme
-        active_color = theme.channel_label_active or theme.pg_foreground or "#dfe7ff"
-        hidden_color = theme.channel_label_hidden or active_color
-        base_color = hidden_color if hidden else active_color
-        weight = "600" if not hidden else "500"
-        font_style = "italic" if hidden else "normal"
-        hover_bg = QtGui.QColor(active_color)
-        hover_bg.setAlpha(48)
-        hover_border = QtGui.QColor(active_color)
-        hover_border.setAlpha(110)
-
-        def _rgba(color: QtGui.QColor) -> str:
-            return (
-                f"rgba({color.red()}, {color.green()}, {color.blue()}, {color.alpha() / 255:.3f})"
-            )
-
-        background = _rgba(hover_bg) if hovered else "transparent"
-        border = (
-            f"1px solid {_rgba(hover_border)}" if hovered else "1px solid transparent"
-        )
-        label.setStyleSheet(
-            "padding: 6px 10px;"
-            "border-radius: 6px;"
-            f"color: {base_color};"
-            f"font-weight: {weight};"
-            f"font-style: {font_style};"
-            f"background-color: {background};"
-            f"border: {border};"
-        )
-
-    def _apply_gpu_label_style(self, idx: int, *, hidden: bool, hovered: bool) -> None:
-        if idx >= len(self._gpu_label_widgets):
-            return
-        label = self._gpu_label_widgets[idx]
-        self._style_gpu_label_widget(label, hidden=hidden, hovered=hovered)
-
-    def _set_gpu_label(self, idx: int, text: str, hidden: bool) -> None:
-        self._ensure_gpu_label_widgets(idx + 1)
-        if idx >= len(self._gpu_label_widgets):
-            return
-        label = self._gpu_label_widgets[idx]
-        label.setText(text)
-        label.setToolTip(text)
-        label.setVisible(True)
-        self._apply_gpu_label_style(
-            idx,
-            hidden=hidden,
-            hovered=(self._gpu_hover_label_index == idx),
-        )
-
-    def _sync_gpu_label_column(
-        self, infos: Sequence[object], hidden: set[int]
-    ) -> None:
-        if self._ensure_gpu_label_column() is None:
-            return
-        if self._gpu_label_layout is None:
-            return
-        count = len(infos)
-        self._ensure_gpu_label_widgets(count)
-        for idx, meta in enumerate(infos):
-            hidden_flag = idx in hidden
-            text = self._channel_label_text(meta, hidden=hidden_flag)
-            self._set_gpu_label(idx, text, hidden_flag)
-        for idx in range(count, len(self._gpu_label_widgets)):
-            self._gpu_label_widgets[idx].hide()
-        if self._gpu_hypnogram_label is not None:
-            if self._gpu_hypnogram_visible:
-                self._gpu_hypnogram_label.setText("Hypnogram")
-                self._gpu_hypnogram_label.setToolTip("Hypnogram")
-                self._gpu_hypnogram_label.setVisible(True)
-                self._style_gpu_label_widget(
-                    self._gpu_hypnogram_label,
-                    hidden=False,
-                    hovered=False,
-                )
-            else:
-                self._gpu_hypnogram_label.hide()
-        if self._gpu_label_widget is not None:
-            self._gpu_label_widget.setVisible(count > 0 or self._gpu_hypnogram_visible)
-
-    def _update_gpu_label_hover(self, idx: int | None) -> None:
-        if not self._use_gpu_canvas:
-            return
-        if self._gpu_hover_label_index == idx:
-            return
-        previous = self._gpu_hover_label_index
-        self._gpu_hover_label_index = idx
-        if previous is not None:
-            hidden_prev = previous in self._hidden_channels
-            self._apply_gpu_label_style(previous, hidden=hidden_prev, hovered=False)
-        if idx is not None:
-            hidden_now = idx in self._hidden_channels
-            self._apply_gpu_label_style(idx, hidden=hidden_now, hovered=True)
-
-    def _update_gpu_hypnogram_label(self, visible: bool) -> None:
-        self._gpu_hypnogram_visible = bool(visible)
-        if self._gpu_hypnogram_label is None:
-            self._ensure_gpu_label_column()
-        if self._gpu_hypnogram_label is None:
-            return
-        if not self._gpu_hypnogram_visible:
-            self._gpu_hypnogram_label.hide()
-            return
-        self._gpu_hypnogram_label.setText("Hypnogram")
-        self._gpu_hypnogram_label.setToolTip("Hypnogram")
-        self._gpu_hypnogram_label.setVisible(True)
-        self._style_gpu_label_widget(
-            self._gpu_hypnogram_label, hidden=False, hovered=False
-        )
 
     def _ensure_cpu_canvas(self) -> pg.GraphicsLayoutWidget:
         if self._cpu_plot_widget is None:
@@ -1574,15 +1366,13 @@ class MainWindow(QtWidgets.QMainWindow):
     def _refresh_channel_label_styles(self) -> None:
         if self._use_gpu_canvas and self._gpu_canvas is not None:
             infos = getattr(self.loader, "info", [])
-            hidden = {idx for idx in self._hidden_channels if 0 <= idx < len(infos)}
             for idx, meta in enumerate(infos):
-                hidden_flag = idx in hidden
+                hidden = idx in self._hidden_channels
                 self._gpu_canvas.set_channel_label(
                     idx,
-                    self._channel_label_text(meta, hidden=hidden_flag),
-                    hidden=hidden_flag,
+                    self._channel_label_text(meta, hidden=hidden),
+                    hidden=hidden,
                 )
-            self._sync_gpu_label_column(infos, hidden)
             return
 
         if not self.channel_labels:
@@ -3629,16 +3419,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 hypnogram_payload = self._stage_curve_data()
                 tile.hypnogram_payload = hypnogram_payload
 
-        self._update_gpu_hypnogram_label(stage_visible)
         self._gpu_canvas.update_hypnogram(
             hypnogram_payload,
             visible=stage_visible,
             view_start=view_start,
             view_end=view_end,
         )
-        infos = getattr(self.loader, "info", [])
-        hidden_indices = {idx for idx in self._hidden_channels if 0 <= idx < len(infos)}
-        self._sync_gpu_label_column(infos, hidden_indices)
 
         focus_only_checkbox = getattr(self, "annotationFocusOnly", None)
         focus_only = bool(focus_only_checkbox and focus_only_checkbox.isChecked())
@@ -4233,8 +4019,6 @@ class MainWindow(QtWidgets.QMainWindow):
         hidden = {idx for idx in self._hidden_channels if 0 <= idx < len(infos)}
         backend.configure_channels(infos=infos, hidden_indices=hidden)
         self._apply_backend_common_state(backend, infos, hidden)
-        self._ensure_gpu_label_column()
-        self._sync_gpu_label_column(infos, hidden)
         self._sync_backend_hover_state()
 
     def _sync_channel_controls(self) -> None:
@@ -4285,7 +4069,6 @@ class MainWindow(QtWidgets.QMainWindow):
             if idx >= n:
                 self._hidden_channels.discard(idx)
                 return
-            self._ensure_gpu_label_column()
             meta = self.loader.info[idx]
             if visible:
                 self._hidden_channels.discard(idx)
@@ -4295,11 +4078,6 @@ class MainWindow(QtWidgets.QMainWindow):
             state_changed = (idx in self._hidden_channels) != prev_hidden
             self._gpu_canvas.set_channel_visibility(idx, visible)
             self._gpu_canvas.set_channel_label(
-                idx,
-                self._channel_label_text(meta, hidden=not visible),
-                hidden=not visible,
-            )
-            self._set_gpu_label(
                 idx,
                 self._channel_label_text(meta, hidden=not visible),
                 hidden=not visible,
@@ -4461,16 +4239,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self._clear_hover_sample()
             return False
         self._hover_sample = _HoverSample(channel_idx, float(sample_time), float(sample_value))
-        if self._use_gpu_canvas:
-            self._update_gpu_label_hover(channel_idx)
         return True
 
     def _clear_hover_sample(self) -> None:
         if self._hover_sample is None:
             return
         self._hover_sample = None
-        if self._use_gpu_canvas:
-            self._update_gpu_label_hover(None)
 
     @QtCore.Slot(float, float, int)
     def _on_gpu_hover_moved(
