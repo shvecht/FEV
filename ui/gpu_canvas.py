@@ -21,10 +21,58 @@ try:  # pragma: no cover - import guarded for optional dependency
     from vispy import scene
     from vispy.scene import transforms
     from vispy.color import Color
+    from vispy.visuals.axis import Ticker as _AxisTicker
 except Exception:  # pragma: no cover - handled by MainWindow fallback
     _vispy_app = None
     scene = None  # type: ignore
     Color = None  # type: ignore
+    _AxisTicker = None  # type: ignore
+
+
+if _AxisTicker is not None:  # pragma: no cover - exercised via VisPy path
+
+    class _TimeAxisTicker(_AxisTicker):
+        """Bridge VisPy tick generation to the shared TimeTickFormatter."""
+
+        def __init__(self, axis, formatter: TimeTickFormatter, *, anchors=None) -> None:
+            super().__init__(axis, anchors=anchors)
+            self._formatter = formatter
+
+        def set_formatter(self, formatter: TimeTickFormatter) -> None:
+            self._formatter = formatter
+
+        def get_update(self):
+            tick_pos, labels, tick_label_pos, anchors, axis_label_pos = super().get_update()
+            formatter = getattr(self, "_formatter", None)
+            if formatter is None:
+                return tick_pos, labels, tick_label_pos, anchors, axis_label_pos
+
+            numeric_labels: list[float] = []
+            try:
+                for label in labels:
+                    if label is None:
+                        raise ValueError("tick label is None")
+                    numeric_labels.append(float(str(label).replace("\u2212", "-")))
+            except Exception:
+                return tick_pos, labels, tick_label_pos, anchors, axis_label_pos
+
+            try:
+                formatted = formatter(numeric_labels)
+            except Exception:
+                return tick_pos, labels, tick_label_pos, anchors, axis_label_pos
+
+            if len(formatted) == len(labels):
+                labels = list(formatted)
+            return tick_pos, labels, tick_label_pos, anchors, axis_label_pos
+
+else:  # pragma: no cover - VisPy unavailable
+
+    class _TimeAxisTicker:  # type: ignore[override]
+        def __init__(self, *args, **kwargs) -> None:
+            raise RuntimeError("VisPy Axis Ticker is unavailable")
+
+        def set_formatter(self, formatter: TimeTickFormatter) -> None:
+            raise RuntimeError("VisPy Axis Ticker is unavailable")
 
 
 @dataclass(slots=True)
@@ -188,6 +236,7 @@ class VispyChannelCanvas(QtWidgets.QWidget):
         self._label_hidden_color = Color("#6c788f")
         self._grid_line_color = Color((0.45, 0.52, 0.68, 0.2))
         self._axis_formatter = TimeTickFormatter()
+        self._axis_ticker: _TimeAxisTicker | None = None
         self._timebase = None
         self._time_mode = "relative"
 
@@ -319,7 +368,11 @@ class VispyChannelCanvas(QtWidgets.QWidget):
 
         self._background_color = Color(background)
         self._canvas.bgcolor = self._background_color
-        self._channel_colors = [Color(code) for code in curve_colors]
+        palette = list(curve_colors) if curve_colors else ["#5f8bff"]
+        channel_count = max(len(self._lines), len(self._label_nodes), 1)
+        self._channel_colors = [
+            Color(palette[idx % len(palette)]) for idx in range(channel_count)
+        ]
         self._label_active_color = Color(label_active)
         if label_hidden:
             self._label_hidden_color = Color(label_hidden)
@@ -333,7 +386,8 @@ class VispyChannelCanvas(QtWidgets.QWidget):
                 gutter.bgcolor = self._background_color
         for idx in range(len(self._label_nodes)):
             if idx < len(self._channel_colors):
-                self._lines[idx].set_data(color=self._channel_colors[idx])
+                with contextlib.suppress(Exception):
+                    self._lines[idx].set_data(color=self._channel_colors[idx])
             self._apply_label_style(idx)
         if self._x_axis is not None:
             axis_color_obj = Color(axis_color or label_active)
@@ -378,6 +432,7 @@ class VispyChannelCanvas(QtWidgets.QWidget):
             if unit:
                 label = f"{label} [{unit}]"
             self._label_nodes[idx].text = label
+            self._label_nodes[idx].visible = True
             visible = self._channel_visible[idx]
             if idx < len(self._gutter_views):
                 self._gutter_views[idx].visible = visible
@@ -422,6 +477,7 @@ class VispyChannelCanvas(QtWidgets.QWidget):
     def set_channel_label(self, idx: int, text: str, *, hidden: bool | None = None) -> None:
         if idx < len(self._label_nodes):
             self._label_nodes[idx].text = text
+            self._label_nodes[idx].visible = True
             if hidden is not None and idx < len(self._label_hidden):
                 self._label_hidden[idx] = bool(hidden)
             self._apply_label_style(idx)
@@ -771,6 +827,7 @@ class VispyChannelCanvas(QtWidgets.QWidget):
         if self._x_axis is not None:
             self._grid.remove_widget(self._x_axis)
             self._x_axis = None
+            self._axis_ticker = None
         if self._gutter_axis_placeholder is not None:
             self._grid.remove_widget(self._gutter_axis_placeholder)
             self._gutter_axis_placeholder = None
@@ -779,6 +836,8 @@ class VispyChannelCanvas(QtWidgets.QWidget):
             row = len(self._views)
             gutter = self._grid.add_view(row=row, col=0, camera="panzoom")
             gutter.camera.interactive = False
+            with contextlib.suppress(Exception):
+                gutter.camera.set_range(x=(0.0, 1.0), y=(0.0, 1.0))
             gutter.border_color = None
             gutter.padding = 0.0
             gutter.bgcolor = None
@@ -794,7 +853,7 @@ class VispyChannelCanvas(QtWidgets.QWidget):
                 color="white",
                 font_size=12,
             )
-            label.transform = transforms.STTransform(translate=(8, 8))
+            label.pos = (0.02, 0.95)
             gutter.add(label)
 
             view = self._grid.add_view(row=row, col=1, camera="panzoom")
@@ -830,6 +889,7 @@ class VispyChannelCanvas(QtWidgets.QWidget):
         if self._x_axis is not None:
             self._grid.remove_widget(self._x_axis)
             self._x_axis = None
+            self._axis_ticker = None
         if self._gutter_axis_placeholder is not None:
             self._grid.remove_widget(self._gutter_axis_placeholder)
             self._gutter_axis_placeholder = None
@@ -877,6 +937,7 @@ class VispyChannelCanvas(QtWidgets.QWidget):
         if self._x_axis is not None:
             self._grid.remove_widget(self._x_axis)
             self._x_axis = None
+            self._axis_ticker = None
         if self._gutter_axis_placeholder is not None:
             self._grid.remove_widget(self._gutter_axis_placeholder)
             self._gutter_axis_placeholder = None
@@ -1091,9 +1152,10 @@ class VispyChannelCanvas(QtWidgets.QWidget):
     def _update_channel_range(self, idx: int, state: _ChannelState) -> None:
         if idx >= len(self._views):
             return
+        if idx >= len(self._view_y_ranges):
+            self._view_y_ranges.extend([(-1.0, 1.0)] * (idx + 1 - len(self._view_y_ranges)))
         if state.x.size == 0:
-            if idx < len(self._view_y_ranges):
-                self._view_y_ranges[idx] = (-1.0, 1.0)
+            self._view_y_ranges[idx] = (-1.0, 1.0)
             self._views[idx].camera.set_range(y=(-1.0, 1.0))
             return
         min_val = float(np.nanmin(state.x))
@@ -1104,8 +1166,7 @@ class VispyChannelCanvas(QtWidgets.QWidget):
             pad = max(1e-3, abs(max_val) * 0.1 + 1e-3)
             min_val -= pad
             max_val += pad
-        if idx < len(self._view_y_ranges):
-            self._view_y_ranges[idx] = (min_val, max_val)
+        self._view_y_ranges[idx] = (min_val, max_val)
         self._views[idx].camera.set_range(y=(min_val, max_val))
 
     # ------------------------------------------------------------------
@@ -1114,9 +1175,26 @@ class VispyChannelCanvas(QtWidgets.QWidget):
     def _on_mouse_move(self, event) -> None:  # pragma: no cover - GUI only
         if not self._hover_enabled:
             return
-        if event.pos is None:
+        pos = getattr(event, "pos", None)
+        if pos is None:
             self._hide_hover()
             return
+        pos_tuple: tuple[float, float] | None = None
+        try:
+            x_val = float(pos[0])
+            y_val = float(pos[1])
+            pos_tuple = (x_val, y_val)
+        except Exception:
+            try:
+                x_val = float(pos.x)
+                y_val = float(pos.y)
+                pos_tuple = (x_val, y_val)
+            except Exception:
+                pos_tuple = None
+
+        qt_point = None
+        if pos_tuple is not None:
+            qt_point = QtCore.QPoint(int(round(pos_tuple[0])), int(round(pos_tuple[1])))
 
         # Map cursor to data coordinates across views.
         for idx, view in enumerate(self._views):
@@ -1127,9 +1205,6 @@ class VispyChannelCanvas(QtWidgets.QWidget):
             tr = view.scene.transform
             if tr is None:
                 continue
-            bounds = view.scene.node_transform(view.scene).map(view.node.bounds(axis=0))
-            if bounds is None:
-                continue
             try:
                 rect = view.camera.rect
             except AttributeError:
@@ -1139,12 +1214,18 @@ class VispyChannelCanvas(QtWidgets.QWidget):
                 rect = view.camera.get_state()["rect"]
 
             # Rough containment test in framebuffer coordinates.
-            if not view.canvas.native.rect().contains(event.pos):
-                continue
+            native = getattr(view.canvas, "native", None)
+            if qt_point is not None and native is not None:
+                try:
+                    native_rect = native.rect()
+                except Exception:
+                    native_rect = None
+                if native_rect is not None and not native_rect.contains(qt_point):
+                    continue
 
             # Convert to data coordinates.
             try:
-                data_pos = view.camera.transform.imap(event.pos)
+                data_pos = view.camera.transform.imap(pos_tuple if pos_tuple is not None else pos)
             except Exception:
                 continue
             if data_pos is None:
@@ -1157,7 +1238,16 @@ class VispyChannelCanvas(QtWidgets.QWidget):
 
             sample_t, sample_x = sample
             self._hover_channel = idx
-            self._hover_line.set_data(pos=np.array([[sample_t, rect.y0], [sample_t, rect.y1]], dtype=np.float32))
+            y_low = getattr(rect, "bottom", None)
+            y_high = getattr(rect, "top", None)
+            if y_low is None or y_high is None:
+                try:
+                    y_low, y_high = rect[1], rect[3]
+                except Exception:
+                    y_low, y_high = -1.0, 1.0
+            self._hover_line.set_data(
+                pos=np.array([[sample_t, float(y_low)], [sample_t, float(y_high)]], dtype=np.float32)
+            )
             self._hover_line.visible = True
             self._hover_marker.text = f"{sample_x:.3f}"
             self._hover_marker.pos = sample_t, sample_x
@@ -1251,13 +1341,17 @@ class VispyChannelCanvas(QtWidgets.QWidget):
     def set_timebase(self, timebase) -> None:
         self._timebase = timebase
         self._axis_formatter.set_timebase(timebase)
-        self._request_axis_update()
+        self._apply_axis_formatter()
 
     def set_time_mode(self, mode: str) -> None:
         mode_lower = str(mode).lower()
         self._time_mode = "absolute" if mode_lower == "absolute" else "relative"
         self._axis_formatter.set_mode(self._time_mode)
-        self._request_axis_update()
+        self._apply_axis_formatter()
+
+    def _install_axis_formatter(self) -> None:
+        """Compatibility shim for legacy call sites; forwards to _apply_axis_formatter."""
+        self._apply_axis_formatter()
 
     def _apply_axis_formatter(self) -> None:
         if self._x_axis is None:
@@ -1265,7 +1359,17 @@ class VispyChannelCanvas(QtWidgets.QWidget):
         axis = getattr(self._x_axis, "axis", None)
         if axis is None:
             return
-        axis.tick_formatter = self._axis_formatter
+        if _AxisTicker is None:
+            return
+        existing = getattr(axis, "ticker", None)
+        anchors = getattr(existing, "_anchors", None)
+        if isinstance(existing, _TimeAxisTicker):
+            existing.set_formatter(self._axis_formatter)
+            self._axis_ticker = existing
+        else:
+            self._axis_ticker = _TimeAxisTicker(axis, self._axis_formatter, anchors=anchors)
+            axis.ticker = self._axis_ticker
+        self._request_axis_update()
 
     def _update_axis_theme(self) -> None:
         if self._x_axis is None:

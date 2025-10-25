@@ -1085,6 +1085,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._use_gpu_canvas = False
             if not self._gpu_forced:
                 self._config.canvas_backend = "pyqtgraph"
+            self._configure_plots()
             self._sync_hover_overlay_target()
             self._update_annotation_controls_for_renderer()
             self._update_renderer_indicator()
@@ -1959,6 +1960,35 @@ class MainWindow(QtWidgets.QMainWindow):
         self._schedule_prefetch()
         self._ensure_overscan_for_view()
         self._sync_backend_hover_state()
+
+    def _apply_backend_common_state(
+        self,
+        backend: ChannelCanvasBackend,
+        infos: Sequence[object],
+        hidden: set[int],
+    ) -> None:
+        theme = self._theme
+        colors = theme.curve_colors or ("#5f8bff",)
+        label_active = theme.channel_label_active or theme.pg_foreground
+        label_hidden = theme.channel_label_hidden or theme.pg_foreground
+        backend.set_theme(
+            background=theme.pg_background,
+            curve_colors=colors,
+            label_active=label_active,
+            label_hidden=label_hidden,
+            axis_color=theme.pg_foreground,
+        )
+        backend.set_view(self._view_start, self._view_duration)
+        timebase = getattr(self.loader, "timebase", None)
+        backend.set_timebase(timebase)
+        backend.set_time_mode("absolute" if getattr(timebase, "start_dt", None) is not None else "relative")
+        for idx, meta in enumerate(infos):
+            hidden_flag = idx in hidden
+            backend.set_channel_label(
+                idx,
+                self._channel_label_text(meta, hidden=hidden_flag),
+                hidden=hidden_flag,
+            )
 
     def _pan_fraction(self, fraction: float):
         delta = fraction * self._view_duration
@@ -3905,6 +3935,8 @@ class MainWindow(QtWidgets.QMainWindow):
             infos = getattr(self.loader, "info", [])
             hidden = {idx for idx in self._hidden_channels if 0 <= idx < len(infos)}
             self._pg_backend.configure_channels(infos=infos, hidden_indices=hidden)
+            backend = self._pg_backend
+            self._apply_backend_common_state(backend, infos, hidden)
 
         old_primary = self._primary_plot
 
@@ -3986,31 +4018,7 @@ class MainWindow(QtWidgets.QMainWindow):
         infos = getattr(self.loader, "info", [])
         hidden = {idx for idx in self._hidden_channels if 0 <= idx < len(infos)}
         backend.configure_channels(infos=infos, hidden_indices=hidden)
-        backend.set_view(self._view_start, self._view_duration)
-        theme = self._theme
-        colors = theme.curve_colors or ("#5f8bff",)
-        label_active = theme.channel_label_active or theme.pg_foreground
-        label_hidden = theme.channel_label_hidden or theme.pg_foreground
-        backend.set_theme(
-            background=theme.pg_background,
-            curve_colors=colors,
-            label_active=label_active,
-            label_hidden=label_hidden,
-            axis_color=theme.pg_foreground,
-        )
-        timebase = getattr(self.loader, "timebase", None)
-        backend.set_timebase(timebase)
-        if getattr(timebase, "start_dt", None) is not None:
-            backend.set_time_mode("absolute")
-        else:
-            backend.set_time_mode("relative")
-        for idx, meta in enumerate(infos):
-            hidden_flag = idx in hidden
-            backend.set_channel_label(
-                idx,
-                self._channel_label_text(meta, hidden=hidden_flag),
-                hidden=hidden_flag,
-            )
+        self._apply_backend_common_state(backend, infos, hidden)
         self._sync_backend_hover_state()
 
     def _sync_channel_controls(self) -> None:
