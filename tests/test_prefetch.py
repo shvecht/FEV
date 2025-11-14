@@ -3,7 +3,7 @@ import time
 import numpy as np
 import pytest
 
-from core.prefetch import PrefetchCache, PrefetchConfig, PrefetchService
+from core.prefetch import PrefetchCache, PrefetchConfig, PrefetchService, _tile_key
 
 
 def fake_fetch(channel: int, start: float, end: float):
@@ -59,6 +59,33 @@ def test_prefetch_preview_runs_before_final():
     assert calls, "prefetch should invoke preview and final stages"
     assert calls[0][0] == "preview"
     assert any(stage == "final" for stage, *_ in calls)
+
+
+def test_prefetch_window_adds_neighbour_and_lod_tiles():
+    cache = PrefetchCache(
+        fake_fetch,
+        PrefetchConfig(tile_duration=1.0, max_tiles=8),
+        preview_fetch=fake_fetch,
+    )
+    cache.prefetch_window(0, 5.0, 1.0, neighbours=(-1, 0, 1), lod_duration=2.0)
+    with cache._lock:
+        keys = [task.key for task in cache._pending]
+    assert _tile_key(0, 5.0, 1.0) in keys
+    assert _tile_key(0, 4.0, 1.0) in keys
+    assert _tile_key(0, 5.0, 2.0) in keys
+
+
+def test_prefetch_window_respects_max_per_frame():
+    cache = PrefetchCache(
+        fake_fetch,
+        PrefetchConfig(tile_duration=1.0, max_tiles=8),
+        preview_fetch=fake_fetch,
+    )
+    cache.prefetch_window(0, 0.0, 5.0, neighbours=(-1, 0, 1), max_per_frame=2)
+    with cache._lock:
+        assert len(cache._pending) == 2
+        stages = [task.stage for task in cache._pending]
+    assert stages == ["preview", "final"]
 
 
 def test_prefetch_service_configures_caches():
