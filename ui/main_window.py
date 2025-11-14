@@ -299,6 +299,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._lod_min_bin_multiple = max(
             1.0, float(getattr(self._config, "lod_min_bin_multiple", 2.0) or 2.0)
         )
+        self._lod_envelope_ratio = float(getattr(self._config, "lod_envelope_ratio", 0.0) or 0.0)
         raw_min_view = getattr(self._config, "lod_min_view_duration_s", 240.0)
         try:
             min_view = float(raw_min_view)
@@ -1643,13 +1644,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self._overscan_inflight = None
             self._current_tile_id = None
             return
-        lod_ratio = float(getattr(self._config, "lod_envelope_ratio", 0.0) or 0.0)
         worker = AsyncTileWorker(
             worker_loader,
             lod_enabled=self._lod_enabled,
             lod_min_bin_multiple=self._lod_min_bin_multiple,
             lod_min_view_duration=self._lod_min_view_duration,
-            lod_ratio=lod_ratio,
+            lod_ratio=self._lod_envelope_ratio,
         )
         self._overscan_worker = worker
         self._overscan_worker_loader = worker_loader
@@ -1723,6 +1723,30 @@ class MainWindow(QtWidgets.QMainWindow):
             self._lod_min_bin_multiple,
             min_view_duration=self._lod_min_view_duration,
         )
+
+    def _next_lod_duration_for_channel(
+        self, channel: int, view_duration: float, loader=None
+    ) -> Optional[float]:
+        if not self._lod_enabled:
+            return None
+        durations = self._available_lod_durations(channel, loader)
+        if not durations:
+            return None
+        selected = select_lod_duration(
+            view_duration,
+            durations,
+            self._lod_min_bin_multiple,
+            min_view_duration=self._lod_min_view_duration,
+        )
+        # If no selection is made, fall back to the smallest available duration.
+        if selected is None:
+            return durations[0] if durations else None
+        for duration in durations:
+            if math.isclose(duration, selected, rel_tol=1e-6, abs_tol=1e-6):
+                continue
+            if duration > selected:
+                return duration
+        return None
 
     # ----- Behaviors -------------------------------------------------------
 
@@ -2244,8 +2268,37 @@ class MainWindow(QtWidgets.QMainWindow):
         duration = max(0.0, end - start)
         if duration <= 0:
             return
+        neighbour_offsets = (-1, 0, 1)
+        preview_multiplier = 2 if getattr(self._prefetch, "preview_fetch", None) is not None else 1
+        tile_duration = getattr(getattr(self._prefetch, "config", None), "tile_duration", None)
+        try:
+            base_tile = float(tile_duration) if tile_duration is not None else float(self._config.prefetch_tile_s)
+        except (TypeError, ValueError):
+            base_tile = float(self._config.prefetch_tile_s)
+        if base_tile <= 0:
+            base_tile = max(1.0, self._view_duration)
+        base_tile_count = max(1, int(math.ceil(duration / base_tile)))
         for ch in visible_channels:
-            self._prefetch.prefetch_window(ch, start, duration)
+            lod_duration = self._next_lod_duration_for_channel(ch, self._view_duration, loader)
+            if lod_duration is not None and math.isclose(
+                float(lod_duration), base_tile, rel_tol=1e-6, abs_tol=1e-6
+            ):
+                lod_duration = None
+            lod_tile_count = 0
+            if lod_duration is not None and lod_duration > 0:
+                lod_tile_count = int(math.ceil(duration / float(lod_duration)))
+            total_tiles = base_tile_count * len(neighbour_offsets)
+            if lod_tile_count:
+                total_tiles += lod_tile_count * len(neighbour_offsets)
+            max_tasks = max(1, total_tiles * preview_multiplier)
+            self._prefetch.prefetch_window(
+                ch,
+                start,
+                duration,
+                neighbours=neighbour_offsets,
+                lod_duration=lod_duration,
+                max_per_frame=max_tasks,
+            )
         prefetch_service.update_hints(channels=visible_channels, window_s=self._view_duration)
         self._config.prefetch_hint_channels = tuple(visible_channels)
         self._config.prefetch_hint_window_s = float(self._view_duration)

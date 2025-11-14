@@ -96,25 +96,121 @@ class PrefetchCache:
             self._evict_if_needed()
         return data
 
-    def prefetch_window(self, channel: int, start: float, duration: float):
-        tiles = self._tiles_for_window(channel, start, duration)
+    def prefetch_window(
+        self,
+        channel: int,
+        start: float,
+        duration: float,
+        *,
+        neighbours: Sequence[int] | None = None,
+        lod_duration: float | None = None,
+        lod_neighbours: Sequence[int] | None = None,
+        max_per_frame: int | None = None,
+    ) -> None:
+        base_duration = float(self.config.tile_duration)
+        neighbour_offsets = self._normalize_offsets(neighbours)
+        pending_limit = None
+        if max_per_frame is not None:
+            try:
+                pending_limit = max(0, int(max_per_frame))
+            except (TypeError, ValueError):
+                pending_limit = None
         with self._lock:
+            tiles = list(
+                self._tiles_for_window(
+                    channel,
+                    start,
+                    duration,
+                    tile_duration=base_duration,
+                    offsets=neighbour_offsets,
+                )
+            )
+            lod_offsets = neighbour_offsets if lod_neighbours is None else self._normalize_offsets(lod_neighbours)
+            if lod_duration is not None:
+                try:
+                    lod_tile = float(lod_duration)
+                except (TypeError, ValueError):
+                    lod_tile = 0.0
+                if lod_tile > 0:
+                    tiles.extend(
+                        self._tiles_for_window(
+                            channel,
+                            start,
+                            duration,
+                            tile_duration=lod_tile,
+                            offsets=lod_offsets,
+                        )
+                    )
+
+            queue_count = len(self._pending)
             for tile in tiles:
                 entry = self._cache.get(tile)
                 needs_final = entry is None or not entry.is_final
+                if not needs_final and self.preview_fetch is None:
+                    continue
+                if pending_limit is not None and queue_count >= pending_limit:
+                    break
                 if self.preview_fetch is not None and needs_final:
-                    self._enqueue_task(_PrefetchTask(tile, "preview"))
+                    if self._enqueue_task(_PrefetchTask(tile, "preview"), pending_limit):
+                        queue_count += 1
+                        if pending_limit is not None and queue_count >= pending_limit:
+                            continue
                 if needs_final:
-                    self._enqueue_task(_PrefetchTask(tile, "final"))
+                    if self._enqueue_task(_PrefetchTask(tile, "final"), pending_limit):
+                        queue_count += 1
+                elif self.preview_fetch is not None:
+                    # Preview may still be useful even if final is cached.
+                    if self._enqueue_task(_PrefetchTask(tile, "preview"), pending_limit):
+                        queue_count += 1
 
-    def _tiles_for_window(self, channel: int, start: float, duration: float):
-        tiles = []
+            if pending_limit is not None and pending_limit > 0:
+                self._truncate_pending(pending_limit)
+
+    def _tiles_for_window(
+        self,
+        channel: int,
+        start: float,
+        duration: float,
+        *,
+        tile_duration: float,
+        offsets: Sequence[int],
+    ) -> list[tuple[int, float, float]]:
+        if tile_duration <= 0:
+            return []
+        end = start + duration
         t = start
-        tile_duration = self.config.tile_duration
-        while t < start + duration:
-            tiles.append(_tile_key(channel, t, tile_duration))
+        tiles: list[tuple[int, float, float]] = []
+        seen: set[tuple[int, float, float]] = set()
+        offsets_tuple = tuple(offsets) if offsets else (0,)
+        while t < end:
+            for offset in offsets_tuple:
+                tile_start = t + offset * tile_duration
+                if tile_start < 0:
+                    continue
+                key = _tile_key(channel, tile_start, tile_duration)
+                if key not in seen:
+                    seen.add(key)
+                    tiles.append(key)
             t += tile_duration
         return tiles
+
+    @staticmethod
+    def _normalize_offsets(offsets: Sequence[int] | None) -> tuple[int, ...]:
+        if not offsets:
+            return (0,)
+        unique: list[int] = []
+        seen: set[int] = set()
+        for value in offsets:
+            try:
+                offset = int(value)
+            except (TypeError, ValueError):
+                continue
+            if offset not in seen:
+                seen.add(offset)
+                unique.append(offset)
+        if 0 not in seen:
+            unique.append(0)
+        return tuple(unique)
 
     def _evict_if_needed(self):
         while len(self._cache) > self._max_tiles_allowed():
@@ -176,15 +272,28 @@ class PrefetchCache:
         with self._lock:
             return self._hits, self._misses
 
-    def _enqueue_task(self, task: _PrefetchTask) -> None:
+    def _enqueue_task(
+        self, task: _PrefetchTask, max_pending: int | None = None
+    ) -> bool:
         if task in self._pending:
-            return
+            return False
+        if max_pending is not None and max_pending > 0 and len(self._pending) >= max_pending:
+            return False
         self._pending.append(task)
+        return True
 
     def _ensure_final_enqueued(self, key: tuple[int, float, float]) -> None:
         final_task = _PrefetchTask(key, "final")
         if final_task not in self._pending:
             self._pending.append(final_task)
+
+    def _truncate_pending(self, max_pending: int) -> None:
+        if max_pending <= 0:
+            self._pending.clear()
+            return
+        if len(self._pending) <= max_pending:
+            return
+        del self._pending[max_pending:]
 
     def _update_estimated_tile_bytes(self, data: Tuple[np.ndarray, np.ndarray]) -> None:
         tile_bytes = sum(arr.nbytes for arr in data)

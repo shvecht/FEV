@@ -43,7 +43,7 @@ def qt_app():
 class _DummyPrefetchCache:
     fetch: Callable[[int, float, float], tuple[np.ndarray, np.ndarray]]
     preview_fetch: Callable[[int, float, float], tuple[np.ndarray, np.ndarray]] | None
-    requests: list[tuple[str, int, float, float]]
+    requests: list[tuple[str, int, float, float, dict[str, object]]]
 
     def __init__(
         self,
@@ -63,10 +63,28 @@ class _DummyPrefetchCache:
     def clear(self) -> None:
         self.requests.clear()
 
-    def prefetch_window(self, channel: int, start: float, duration: float) -> None:
+    def prefetch_window(
+        self,
+        channel: int,
+        start: float,
+        duration: float,
+        *,
+        neighbours: Sequence[int] | None = None,
+        lod_duration: float | None = None,
+        lod_neighbours: Sequence[int] | None = None,
+        max_per_frame: int | None = None,
+    ) -> None:
+        meta = {
+            "neighbours": tuple(neighbours) if neighbours is not None else (),
+            "lod_duration": lod_duration,
+            "lod_neighbours": tuple(lod_neighbours)
+            if lod_neighbours is not None
+            else (),
+            "max_per_frame": max_per_frame,
+        }
         if self.preview_fetch is not None:
-            self.requests.append(("preview", channel, start, duration))
-        self.requests.append(("final", channel, start, duration))
+            self.requests.append(("preview", channel, start, duration, meta))
+        self.requests.append(("final", channel, start, duration, meta))
 
 
 class _DummyPrefetchService:
