@@ -285,7 +285,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._hover_sample: _HoverSample | None = None
         self._hover_backend_enabled: bool = False
         self._plot_viewport: QtWidgets.QWidget | None = None
-        self._overscan_factor = 2.0  # windows per side
+        self._overscan_factor = 2.0  # baseline window multiple per side
         self._overscan_zoom_reuse_ratio = 0.7
         self._overscan_tile: OverscanTile | None = None
         self._overscan_request_id = 0
@@ -2477,9 +2477,39 @@ class MainWindow(QtWidgets.QMainWindow):
         future.add_done_callback(_handle_completion)
 
     def _compute_overscan_bounds(self, view_start: float, view_duration: float) -> tuple[float, float]:
-        total = self.loader.duration_s
-        left_desired = self._overscan_factor * view_duration
-        right_desired = self._overscan_factor * view_duration
+        total = float(self.loader.duration_s)
+        try:
+            view_start = float(view_start)
+        except (TypeError, ValueError):
+            view_start = 0.0
+        try:
+            view_duration = float(view_duration)
+        except (TypeError, ValueError):
+            view_duration = 0.0
+        if view_duration <= 0.0:
+            clamped_start = max(0.0, min(view_start, total))
+            return clamped_start, clamped_start
+
+        pixel_width = self._estimate_pixels() or 0
+        if pixel_width > 0:
+            reference_window = getattr(self, "_default_view_duration", None)
+            try:
+                reference_window = float(reference_window)
+            except (TypeError, ValueError):
+                reference_window = None
+            if reference_window is None or not math.isfinite(reference_window) or reference_window <= 0.0:
+                reference_window = view_duration
+            zoom_factor = reference_window / max(view_duration, 1e-6)
+            if not math.isfinite(zoom_factor) or zoom_factor <= 0.0:
+                zoom_factor = 1.0
+            sec_per_px = view_duration / float(pixel_width)
+            base_pixels = float(pixel_width) * float(self._overscan_factor)
+            overscan_seconds = base_pixels * math.sqrt(zoom_factor) * sec_per_px
+        else:
+            overscan_seconds = self._overscan_factor * view_duration
+
+        left_desired = max(0.0, overscan_seconds)
+        right_desired = left_desired
         left = min(left_desired, view_start)
         right = min(right_desired, max(0.0, total - (view_start + view_duration)))
         span = left + view_duration + right

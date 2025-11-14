@@ -456,6 +456,59 @@ def test_prepare_tile_uses_cached_series(monkeypatch):
     assert call_counter["count"] == 1
 
 
+def test_compute_overscan_bounds_scales_with_zoom():
+    if not HAS_QT or main_window_module is None:
+        pytest.skip("Qt dependencies unavailable")
+
+    window_cls = main_window_module.MainWindow
+
+    class DummyLoader:
+        duration_s = 200.0
+        n_channels = 1
+        max_window_s = 120.0
+
+    class DummyWindow:
+        def __init__(self):
+            self.loader = DummyLoader()
+            self._overscan_factor = 2.0
+            self._default_view_duration = 10.0
+            self._view_start = 60.0
+            self._view_duration = 10.0
+            self._pixel_width = 1000
+
+        def _estimate_pixels(self):
+            return self._pixel_width
+
+    dummy = DummyWindow()
+
+    base_duration = dummy._view_duration
+    base_start, base_end = window_cls._compute_overscan_bounds(
+        dummy, dummy._view_start, dummy._view_duration
+    )
+    base_span = base_end - base_start
+    base_ratio = (base_span - base_duration) / (2 * base_duration)
+
+    dummy._view_duration = 5.0
+    zoom_start, zoom_end = window_cls._compute_overscan_bounds(
+        dummy, dummy._view_start, dummy._view_duration
+    )
+    zoom_span = zoom_end - zoom_start
+    zoom_ratio = (zoom_span - dummy._view_duration) / (2 * dummy._view_duration)
+
+    dummy._view_duration = 40.0
+    dummy._view_start = 80.0
+    wide_start, wide_end = window_cls._compute_overscan_bounds(
+        dummy, dummy._view_start, dummy._view_duration
+    )
+    wide_span = wide_end - wide_start
+    wide_ratio = (wide_span - dummy._view_duration) / (2 * dummy._view_duration)
+
+    assert zoom_ratio > base_ratio
+    assert wide_ratio < base_ratio
+    # Ensure the span still respects loader limits
+    assert wide_span <= dummy.loader.max_window_s + 1e-6
+
+
 @pytest.mark.skipif(not HAS_QT, reason="Qt dependencies unavailable")
 def test_request_tile_uses_lru_cache():
     window_cls = main_window_module.MainWindow
