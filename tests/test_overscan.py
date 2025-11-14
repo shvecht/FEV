@@ -366,12 +366,32 @@ def test_overscan_renderer_falls_back_to_raw_for_zoom():
 def test_choose_envelope_duration_prefers_stride_threshold():
     loader = _SyntheticLoader(fs=200.0, lod_durations=(0.25, 1.0, 2.0, 4.0))
     renderer = OverscanRenderer(loader)
-    duration = renderer.choose_envelope_duration(0, window_duration=120.0, plot_width_px=400)
+    duration = renderer.choose_envelope_duration(
+        0,
+        window_duration=120.0,
+        plot_width_px=400,
+        zoom_factor=1.0,
+        display_dpi=96.0,
+    )
     # samples per px = 120 * 200 / 400 = 60 -> best bin <= 60 is 0.25 s (50 samples)
     assert duration == pytest.approx(0.25)
-    duration_zoomed = renderer.choose_envelope_duration(0, window_duration=120.0, plot_width_px=20)
-    # samples per px = 120 * 200 / 20 = 1200 -> allows up to 4.0 s bins (800 samples)
-    assert duration_zoomed == pytest.approx(4.0)
+    duration_zoomed_out = renderer.choose_envelope_duration(
+        0,
+        window_duration=120.0,
+        plot_width_px=400,
+        zoom_factor=1 / 256,
+        display_dpi=96.0,
+    )
+    # Effective pixels ~= 25 -> ~960 samples per effective px, allowing 4 s bins (800 samples)
+    assert duration_zoomed_out == pytest.approx(4.0)
+    duration_zoomed_in = renderer.choose_envelope_duration(
+        0,
+        window_duration=120.0,
+        plot_width_px=400,
+        zoom_factor=16.0,
+        display_dpi=192.0,
+    )
+    assert duration_zoomed_in is None
 
 
 @pytest.mark.skipif(not HAS_QT, reason="Qt dependencies unavailable")
@@ -385,6 +405,15 @@ def test_prepare_tile_uses_cached_series(monkeypatch):
 
         def _estimate_pixels(self):
             return 100
+
+        def _current_zoom_factor(self):
+            return 1.0
+
+        def _current_display_dpi(self):
+            return 96.0
+
+        def _effective_pixel_span(self, base_px):
+            return float(base_px)
 
     dummy = DummyWindow()
 
@@ -467,9 +496,17 @@ def test_request_tile_uses_lru_cache():
             self._applied_tiles: list[OverscanTile] = []
             self._view_start = 10.0
             self._view_duration = 10.0
+            self._use_gpu_canvas = False
+            self._gpu_autoswitch_enabled = False
 
         def _estimate_pixels(self):
             return 0
+
+        def _current_zoom_factor(self):
+            return 1.0
+
+        def _current_display_dpi(self):
+            return 96.0
 
         def _update_tile_view_metadata(self, tile, view_start, view_duration):
             if tile is None:

@@ -205,6 +205,7 @@ class MainWindow(QtWidgets.QMainWindow):
             total=loader.duration_s,
             limits=self._limits,
         )
+        self._default_view_duration = self._view_duration
         self._updating_viewbox = False
         self._maybe_build_int16_cache()
         self._prefetch_loader: object | None = None
@@ -2439,6 +2440,8 @@ class MainWindow(QtWidgets.QMainWindow):
         req_id = self._overscan_request_id + 1
         self._overscan_request_id = req_id
         self._overscan_inflight = req_id
+        pixel_width = self._estimate_pixels() or 0
+        pixel_hint = int(pixel_width) if pixel_width > 0 else None
         request = OverscanRequest(
             request_id=req_id,
             start=start,
@@ -2447,6 +2450,9 @@ class MainWindow(QtWidgets.QMainWindow):
             view_duration=window_duration,
             channel_indices=channels,
             max_samples=None,
+            pixel_width=pixel_hint,
+            zoom_factor=self._current_zoom_factor(),
+            display_dpi=self._current_display_dpi(),
         )
         if self._overscan_future is not None:
             self._overscan_future.cancel()
@@ -3315,8 +3321,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _prepare_tile(self, tile: OverscanTile) -> bool:
         pixels = self._estimate_pixels() or 0
+        effective_pixels = int(round(self._effective_pixel_span(pixels))) if pixels else 0
+        pixel_basis = effective_pixels if effective_pixels > 0 else pixels
         overscan_span = 2 * self._overscan_factor + 1
-        budget = int(max(200, pixels * overscan_span * 2)) if pixels else 2000
+        budget = (
+            int(max(200, pixel_basis * overscan_span * 2))
+            if pixel_basis
+            else 2000
+        )
         want_vertices = self._use_gpu_canvas or self._gpu_autoswitch_enabled
         changed = False
 
@@ -3756,6 +3768,67 @@ class MainWindow(QtWidgets.QMainWindow):
             return 0
         width = int(vb.width())
         return max(0, width)
+
+    def _current_zoom_factor(self) -> float:
+        baseline = getattr(self, "_lod_min_view_duration", None)
+        if baseline is None or not math.isfinite(baseline) or baseline <= 0:
+            baseline = getattr(self, "_default_view_duration", None)
+            if baseline is None or not math.isfinite(baseline) or baseline <= 0:
+                baseline = float(self._view_duration) if self._view_duration > 0 else 1.0
+        current = float(self._view_duration) if self._view_duration > 0 else 1.0
+        zoom = float(baseline) / max(current, 1e-6)
+        if not math.isfinite(zoom) or zoom <= 0:
+            return 1.0
+        return zoom
+
+    def _current_display_dpi(self) -> float:
+        widget: QtWidgets.QWidget | None
+        if self._use_gpu_canvas and self._gpu_canvas is not None:
+            widget = self._gpu_canvas
+        elif self._channel_backend is not None:
+            widget = self._channel_backend.widget
+        else:
+            widget = self
+
+        screen: QtGui.QScreen | None = None
+        window_handle = getattr(widget, "windowHandle", None)
+        if callable(window_handle):
+            handle = window_handle()
+            if handle is not None:
+                screen = handle.screen()
+        if screen is None:
+            app = QtWidgets.QApplication.instance()
+            if app is not None:
+                screen = app.primaryScreen()
+
+        dpi: float | None = None
+        if screen is not None:
+            try:
+                dpi = float(screen.logicalDotsPerInchX())
+            except Exception:
+                dpi = None
+            if dpi is None or not math.isfinite(dpi) or dpi <= 0:
+                try:
+                    dpi = float(screen.logicalDotsPerInch())
+                except Exception:
+                    dpi = None
+        if dpi is None or not math.isfinite(dpi) or dpi <= 0:
+            dpi = 96.0
+        return dpi
+
+    def _effective_pixel_span(self, base_px: int | float) -> float:
+        try:
+            base = float(base_px)
+        except (TypeError, ValueError):
+            return 0.0
+        if not math.isfinite(base) or base <= 0:
+            return 0.0
+        zoom = self._current_zoom_factor()
+        dpi = self._current_display_dpi()
+        effective = base * math.sqrt(max(zoom, 1e-6)) * (dpi / 96.0)
+        if not math.isfinite(effective) or effective <= 0:
+            return 0.0
+        return effective
 
     # ----- Plot helpers ------------------------------------------------------
 

@@ -94,6 +94,9 @@ class OverscanRequest:
     view_duration: float
     channel_indices: tuple[int, ...]
     max_samples: Optional[int] = None
+    pixel_width: Optional[int] = None
+    zoom_factor: float | None = None
+    display_dpi: float | None = None
 
 
 @dataclass
@@ -802,6 +805,9 @@ class OverscanRenderer:
         channel: int,
         window_duration: float,
         plot_width_px: int,
+        *,
+        zoom_factor: float | None = None,
+        display_dpi: float | None = None,
     ) -> float | None:
         """Return the most suitable envelope duration for the current viewport."""
 
@@ -814,7 +820,20 @@ class OverscanRenderer:
         if not math.isfinite(fs) or fs <= 0:
             return None
 
-        samples_per_pixel = window_duration * fs / float(plot_width_px)
+        base_pixels = float(plot_width_px)
+        if base_pixels <= 0 or not math.isfinite(base_pixels):
+            return None
+        zoom = float(zoom_factor) if zoom_factor is not None else 1.0
+        if not math.isfinite(zoom) or zoom <= 0:
+            zoom = 1.0
+        dpi = float(display_dpi) if display_dpi is not None else 96.0
+        if not math.isfinite(dpi) or dpi <= 0:
+            dpi = 96.0
+        effective_pixels = base_pixels * math.sqrt(zoom) * (dpi / 96.0)
+        if effective_pixels <= 0 or not math.isfinite(effective_pixels):
+            return None
+
+        samples_per_pixel = window_duration * fs / effective_pixels
         if not math.isfinite(samples_per_pixel) or samples_per_pixel <= 0:
             return None
 
@@ -836,13 +855,22 @@ class OverscanRenderer:
         start: float,
         end: float,
         plot_width_px: int,
+        *,
+        zoom_factor: float | None = None,
+        display_dpi: float | None = None,
     ) -> SignalChunk:
         """Return data for the requested window using the best available LOD."""
 
         window_duration = max(0.0, float(end) - float(start))
         duration = None
         try:
-            duration = self.choose_envelope_duration(channel, window_duration, plot_width_px)
+            duration = self.choose_envelope_duration(
+                channel,
+                window_duration,
+                plot_width_px,
+                zoom_factor=zoom_factor,
+                display_dpi=display_dpi,
+            )
         except AttributeError:
             duration = None
 
