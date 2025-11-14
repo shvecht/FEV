@@ -522,3 +522,54 @@ def test_gpu_hover_signal_updates_state(qt_app, monkeypatch):
     window._shutdown_overscan_worker()
     window.close()
     _process_events(qt_app)
+
+
+@pytest.mark.skipif(not HAS_QT, reason="Qt dependencies unavailable")
+def test_view_duration_quantisation_reuses_band(qt_app, monkeypatch):
+    from ui import main_window as mw
+
+    dummy_service = _DummyPrefetchService()
+    monkeypatch.setattr(mw, "prefetch_service", dummy_service)
+
+    loader = FakeHeadlessLoader(duration_s=200.0, base_fs=60.0, n_channels=2)
+    config = ViewerConfig(
+        canvas_backend="pyqtgraph",
+        lod_enabled=False,
+        view_duration_bands=(20.0, 40.0, 80.0),
+        view_duration_band_ratio=1.3,
+    )
+
+    window = mw.MainWindow(loader, config=config)
+    window.show()
+    _process_events(qt_app)
+
+    invalidations: list[bool] = []
+    original_invalidate = window._invalidate_overscan_tile_cache
+
+    def _tracker():
+        invalidations.append(True)
+        original_invalidate()
+
+    monkeypatch.setattr(window, "_invalidate_overscan_tile_cache", _tracker)
+
+    window._set_view(window._view_start, 18.0, sender="tests")
+    _process_events(qt_app)
+    assert window._view_duration == pytest.approx(20.0)
+    assert window._view_duration_band is not None
+    assert invalidations
+
+    invalidations.clear()
+    window._set_view(window._view_start, 19.5, sender="tests")
+    _process_events(qt_app)
+    assert window._view_duration == pytest.approx(20.0)
+    assert not invalidations
+
+    invalidations.clear()
+    window._set_view(window._view_start, 55.0, sender="tests")
+    _process_events(qt_app)
+    assert window._view_duration == pytest.approx(40.0)
+    assert invalidations
+
+    window._shutdown_overscan_worker()
+    window.close()
+    _process_events(qt_app)
