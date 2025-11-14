@@ -6,7 +6,7 @@ import logging
 import math
 import os
 import re
-from collections import Counter, OrderedDict
+from collections import Counter, OrderedDict, deque
 from concurrent.futures import Future
 from dataclasses import dataclass
 from functools import partial
@@ -327,6 +327,11 @@ class MainWindow(QtWidgets.QMainWindow):
             tuple[tuple[int, ...], int, int], OverscanTile
         ] = OrderedDict()
         self._overscan_tile_cache_limit = 6
+        self._tile_upload_budget_per_frame = max(
+            1, int(getattr(self._config, "tile_uploads_per_frame", 2) or 2)
+        )
+        self._tile_upload_budget_remaining = self._tile_upload_budget_per_frame
+        self._tile_upload_queue: deque[OverscanTile] = deque()
         self._lod_enabled = bool(getattr(self._config, "lod_enabled", True))
         self._lod_min_bin_multiple = max(
             1.0, float(getattr(self._config, "lod_min_bin_multiple", 2.0) or 2.0)
@@ -1746,6 +1751,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 except Exception:
                     pass
         self._last_lod_durations.clear()
+        self._tile_upload_queue.clear()
 
     def _available_lod_durations(self, channel: int, loader=None) -> tuple[float, ...]:
         durations: list[float] = []
@@ -2035,6 +2041,41 @@ class MainWindow(QtWidgets.QMainWindow):
     def _schedule_refresh(self):
         self._debounce_timer.start()
 
+    def _reset_tile_upload_budget(self) -> None:
+        self._tile_upload_budget_remaining = self._tile_upload_budget_per_frame
+
+    def _drop_pending_tile_request(self, request_id: int) -> None:
+        if request_id < 0 or not self._tile_upload_queue:
+            return
+        existing = [
+            tile
+            for tile in self._tile_upload_queue
+            if int(getattr(tile, "request_id", -1)) != request_id
+        ]
+        self._tile_upload_queue = deque(existing)
+
+    def _schedule_tile_upload(self, tile: OverscanTile, *, priority: bool = False) -> None:
+        request_id = int(getattr(tile, "request_id", -1))
+        self._drop_pending_tile_request(request_id)
+        if self._tile_upload_budget_remaining > 0 and not self._tile_upload_queue:
+            self._tile_upload_budget_remaining -= 1
+            self._apply_tile_to_curves(tile)
+            return
+        if priority:
+            self._tile_upload_queue.appendleft(tile)
+        else:
+            self._tile_upload_queue.append(tile)
+
+    def _drain_tile_upload_queue(self) -> None:
+        if not self._tile_upload_queue:
+            return
+        while self._tile_upload_queue and self._tile_upload_budget_remaining > 0:
+            tile = self._tile_upload_queue.popleft()
+            self._tile_upload_budget_remaining -= 1
+            self._apply_tile_to_curves(tile)
+        if self._tile_upload_queue and self._tile_upload_budget_remaining <= 0:
+            self._schedule_refresh()
+
     def _on_start_spin_changed(self, value: float):
         self._set_view(float(value), self._view_duration, sender="controls")
 
@@ -2045,6 +2086,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def refresh(self):
         if hasattr(self, "_debounce_timer"):
             self._debounce_timer.stop()
+        self._reset_tile_upload_budget()
+        self._drain_tile_upload_queue()
         t0 = self._view_start
         duration = self._view_duration
         t1 = min(self.loader.duration_s, t0 + duration)
@@ -2720,6 +2763,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._current_tile_id = None
         self._overscan_request_id += 1
         self._last_lod_durations.clear()
+        self._tile_upload_queue.clear()
 
     def _request_overscan_tile(self, window_start: float, window_duration: float):
         if self._overscan_worker is None or self.loader.n_channels == 0:
@@ -2868,7 +2912,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._overscan_tile = tile_obj
         self._update_tile_view_metadata(self._overscan_tile, self._view_start, self._view_duration)
         self._current_tile_id = None
-        self._apply_tile_to_curves(tile_obj)
+        self._schedule_tile_upload(tile_obj, priority=is_final)
         if is_final:
             self._record_lod_durations(tile_obj)
             self._cache_tile(tile_obj)
