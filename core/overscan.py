@@ -9,7 +9,7 @@ from collections import OrderedDict
 from concurrent.futures import Future
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Callable, Iterable, Optional, Sequence, Tuple
+from typing import Callable, Iterable, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import zarr
@@ -24,6 +24,7 @@ __all__ = [
     "select_lod_duration",
     "envelope_to_series",
     "choose_lod_duration",
+    "normalise_lod_ratio",
     "build_envelopes",
     "OverscanRenderer",
     "OverscanRequest",
@@ -94,6 +95,9 @@ class OverscanRequest:
     view_duration: float
     channel_indices: tuple[int, ...]
     max_samples: Optional[int] = None
+    pixel_width: Optional[int] = None
+    zoom_factor: float | None = None
+    display_dpi: float | None = None
 
 
 @dataclass
@@ -376,29 +380,109 @@ def envelope_to_series(
     return t_out, x_out
 
 
+def normalise_lod_ratio(
+    ratio: float | str | Sequence[float] | None,
+) -> tuple[float, float]:
+    """Return ``(promote, demote)`` ratios for LOD selection.
+
+    Accepts single floats (identical promote/demote), string expressions such as
+    ``"3/2"`` or ``"3,2"``, and generic sequences. Invalid inputs collapse to
+    ``(0.0, 0.0)`` which disables ratio-based selection.
+    """
+
+    if ratio is None:
+        return 0.0, 0.0
+
+    promote: float | None = None
+    demote: float | None = None
+
+    if isinstance(ratio, str):
+        parts = [part for part in re.split(r"[\s,:/]+", ratio) if part]
+    elif isinstance(ratio, Sequence):
+        parts = list(ratio)
+    else:
+        parts = [ratio]
+
+    if parts:
+        try:
+            promote = float(parts[0])
+        except (TypeError, ValueError):
+            promote = None
+    if len(parts) > 1:
+        try:
+            demote = float(parts[1])
+        except (TypeError, ValueError):
+            demote = None
+
+    if promote is None or not math.isfinite(promote) or promote <= 0.0:
+        return 0.0, 0.0
+
+    if demote is None or not math.isfinite(demote) or demote <= 0.0:
+        demote = promote
+
+    promote_val = float(promote)
+    demote_val = float(demote)
+    if demote_val > promote_val:
+        demote_val = promote_val
+
+    return promote_val, demote_val
+
+
 def choose_lod_duration(
     view_duration: float,
     available: Iterable[float],
     *,
-    ratio: float,
+    ratio: float | str | Sequence[float],
+    previous_duration: float | None = None,
 ) -> float | None:
-    """Pick the coarsest LOD duration allowed by ``ratio`` and ``view_duration``.
+    """Pick the coarsest LOD duration allowed by hysteresis-aware ``ratio``.
 
-    ``ratio`` represents the minimum number of bins the visible window should
-    cover before we drop to an envelope. A ratio <= 0 disables LOD selection.
+    ``ratio`` can be a single float or ``(promote, demote)`` pair where
+    ``promote`` defines the number of bins required before moving to a coarser
+    envelope and ``demote`` the number of bins below which we fall back to a
+    finer LOD. When ``previous_duration`` is provided, hysteresis prevents
+    rapid oscillation between neighbouring levels.
     """
 
-    if ratio <= 0 or not np.isfinite(ratio):
+    promote_ratio, demote_ratio = normalise_lod_ratio(ratio)
+    if promote_ratio <= 0.0 or not np.isfinite(promote_ratio):
         return None
 
-    best: float | None = None
-    for duration in sorted({float(d) for d in available}):
-        if duration <= 0:
-            continue
-        if view_duration >= ratio * duration:
-            if best is None or duration > best:
-                best = duration
-    return best
+    durations = sorted({float(d) for d in available if float(d) > 0.0})
+    if not durations:
+        return None
+
+    prev_idx: int | None = None
+    if previous_duration is not None and durations:
+        prev_val = float(previous_duration)
+        if math.isfinite(prev_val) and prev_val > 0.0:
+            for idx, duration in enumerate(durations):
+                if math.isclose(duration, prev_val, rel_tol=1e-6, abs_tol=1e-6):
+                    prev_idx = idx
+                    break
+
+    if prev_idx is None:
+        threshold = view_duration / promote_ratio
+        best: float | None = None
+        for duration in durations:
+            if duration <= threshold + 1e-9:
+                if best is None or duration > best:
+                    best = duration
+        return best
+
+    target_idx = prev_idx
+    for idx in range(prev_idx + 1, len(durations)):
+        duration = durations[idx]
+        if view_duration >= promote_ratio * duration:
+            target_idx = idx
+        else:
+            break
+
+    effective_demote = demote_ratio if demote_ratio > 0.0 else promote_ratio
+    while target_idx > 0 and view_duration < effective_demote * durations[target_idx]:
+        target_idx -= 1
+
+    return durations[target_idx]
 
 
 class OverscanTileBuilder:
@@ -424,8 +508,33 @@ class OverscanTileBuilder:
             except (TypeError, ValueError):
                 min_view = 0.0
             self._lod_min_view_duration = min_view if min_view > 0.0 else None
-        self._lod_ratio = float(lod_ratio or 0.0)
+        self._lod_ratio_raw = lod_ratio
+        promote, demote = normalise_lod_ratio(lod_ratio)
+        self._lod_promote_ratio = promote
+        self._lod_demote_ratio = demote if demote > 0.0 else promote
+        self._previous_lod_hints: dict[int, float] = {}
         self._preview_sample_cap = 4096
+
+    def set_previous_lod_hints(
+        self, hints: Mapping[int, float | None] | None
+    ) -> None:
+        """Provide per-channel LOD hints from the worker."""
+
+        if not hints:
+            self._previous_lod_hints = {}
+            return
+        parsed: dict[int, float] = {}
+        for key, value in hints.items():
+            if value is None:
+                continue
+            try:
+                duration = float(value)
+            except (TypeError, ValueError):
+                continue
+            if duration <= 0.0 or not math.isfinite(duration):
+                continue
+            parsed[int(key)] = float(duration)
+        self._previous_lod_hints = parsed
 
     def build_tile(
         self, request: OverscanRequest, *, preview: bool
@@ -619,9 +728,15 @@ class OverscanTileBuilder:
         min_view = self._lod_min_view_duration
         if min_view is not None and view_duration < min_view:
             return None
-        ratio = self._lod_ratio
+        ratio = self._lod_promote_ratio
         if ratio > 0 and np.isfinite(ratio):
-            selected = choose_lod_duration(view_duration, durations, ratio=ratio)
+            previous = self._previous_lod_hints.get(int(channel))
+            selected = choose_lod_duration(
+                view_duration,
+                durations,
+                ratio=(self._lod_promote_ratio, self._lod_demote_ratio),
+                previous_duration=previous,
+            )
             if selected is not None:
                 return selected
         return select_lod_duration(
@@ -802,6 +917,9 @@ class OverscanRenderer:
         channel: int,
         window_duration: float,
         plot_width_px: int,
+        *,
+        zoom_factor: float | None = None,
+        display_dpi: float | None = None,
     ) -> float | None:
         """Return the most suitable envelope duration for the current viewport."""
 
@@ -814,7 +932,20 @@ class OverscanRenderer:
         if not math.isfinite(fs) or fs <= 0:
             return None
 
-        samples_per_pixel = window_duration * fs / float(plot_width_px)
+        base_pixels = float(plot_width_px)
+        if base_pixels <= 0 or not math.isfinite(base_pixels):
+            return None
+        zoom = float(zoom_factor) if zoom_factor is not None else 1.0
+        if not math.isfinite(zoom) or zoom <= 0:
+            zoom = 1.0
+        dpi = float(display_dpi) if display_dpi is not None else 96.0
+        if not math.isfinite(dpi) or dpi <= 0:
+            dpi = 96.0
+        effective_pixels = base_pixels * math.sqrt(zoom) * (dpi / 96.0)
+        if effective_pixels <= 0 or not math.isfinite(effective_pixels):
+            return None
+
+        samples_per_pixel = window_duration * fs / effective_pixels
         if not math.isfinite(samples_per_pixel) or samples_per_pixel <= 0:
             return None
 
@@ -836,13 +967,22 @@ class OverscanRenderer:
         start: float,
         end: float,
         plot_width_px: int,
+        *,
+        zoom_factor: float | None = None,
+        display_dpi: float | None = None,
     ) -> SignalChunk:
         """Return data for the requested window using the best available LOD."""
 
         window_duration = max(0.0, float(end) - float(start))
         duration = None
         try:
-            duration = self.choose_envelope_duration(channel, window_duration, plot_width_px)
+            duration = self.choose_envelope_duration(
+                channel,
+                window_duration,
+                plot_width_px,
+                zoom_factor=zoom_factor,
+                display_dpi=display_dpi,
+            )
         except AttributeError:
             duration = None
 
@@ -971,6 +1111,7 @@ class AsyncTileWorker:
         self._queue_ready = threading.Event()
         self._expected_request_id = -1
         self._stopped = False
+        self._last_lod_durations: dict[int, float] = {}
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
         self._queue_ready.wait()
@@ -1006,6 +1147,7 @@ class AsyncTileWorker:
         self._expected_request_id = max(self._expected_request_id, request.request_id)
         cached = self._cached_tile(request)
         if cached is not None:
+            self._record_lod_from_tile(cached)
             if on_preview is not None:
                 try:
                     on_preview(self._clone_tile(cached, request_id=request.request_id))
@@ -1035,6 +1177,7 @@ class AsyncTileWorker:
                 self._queue.task_done()
                 continue
             try:
+                self._builder.set_previous_lod_hints(self._last_lod_durations)
                 preview_tile = self._builder.build_tile(request, preview=True)
                 if (
                     preview_tile is not None
@@ -1055,10 +1198,12 @@ class AsyncTileWorker:
                     except Exception:
                         pass
 
+                self._builder.set_previous_lod_hints(self._last_lod_durations)
                 final_tile = self._builder.build_tile(request, preview=False)
                 if final_tile is None:
                     raise RuntimeError("Overscan tile build returned no data")
                 final_tile.is_final = True
+                self._record_lod_from_tile(final_tile)
                 self._store_cache(final_tile)
                 if request.request_id < self._expected_request_id:
                     if not task.future.done():
@@ -1170,3 +1315,19 @@ class AsyncTileWorker:
             if tile.hypnogram_payload is None
             else dict(tile.hypnogram_payload),
         )
+
+    def _record_lod_from_tile(self, tile: OverscanTile) -> None:
+        for idx, channel in enumerate(tile.channel_indices):
+            if idx >= len(tile.lod_durations):
+                continue
+            duration = tile.lod_durations[idx]
+            if duration is None:
+                self._last_lod_durations.pop(int(channel), None)
+                continue
+            try:
+                value = float(duration)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(value) or value <= 0.0:
+                continue
+            self._last_lod_durations[int(channel)] = value

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -18,12 +19,14 @@ LOG = logging.getLogger(__name__)
 
 try:  # pragma: no cover - import guarded for optional dependency
     from vispy import app as _vispy_app
+    from vispy import gloo
     from vispy import scene
     from vispy.scene import transforms
     from vispy.color import Color
     from vispy.visuals.axis import Ticker as _AxisTicker
 except Exception:  # pragma: no cover - handled by MainWindow fallback
     _vispy_app = None
+    gloo = None  # type: ignore
     scene = None  # type: ignore
     Color = None  # type: ignore
     _AxisTicker = None  # type: ignore
@@ -79,6 +82,20 @@ else:  # pragma: no cover - VisPy unavailable
 class _ChannelState:
     t: np.ndarray
     x: np.ndarray
+
+
+@dataclass(slots=True)
+class _BufferPair:
+    front: object
+    back: object
+
+
+@dataclass(slots=True)
+class _PendingChannelUpdate:
+    vertices: np.ndarray | None
+    state: _ChannelState | None
+    color: Color | None
+    visible: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -229,6 +246,10 @@ class VispyChannelCanvas(QtWidgets.QWidget):
         self._channel_label_texts: list[str] = []
         self._channel_label_hidden: list[bool] = []
         self._view_y_ranges: list[tuple[float, float]] = []
+        self._buffer_pairs: list[_BufferPair | None] = []
+        self._pending_channel_updates: dict[int, _PendingChannelUpdate] = {}
+        self._buffer_lock = threading.Lock()
+        self._swap_scheduled = False
 
         self._background_color = Color("#10141a")
         self._label_active_color = Color("#dfe7ff")
@@ -498,24 +519,45 @@ class VispyChannelCanvas(QtWidgets.QWidget):
         if idx >= len(self._lines):
             return
         if t.size == 0 or x.size == 0:
-            self._lines[idx].set_data(pos=self._empty_vertices())
-            if idx < len(self._channel_states):
-                self._channel_states[idx] = _ChannelState(t=np.array([]), x=np.array([]))
+            self._stage_channel_update(
+                idx,
+                _PendingChannelUpdate(
+                    vertices=None,
+                    state=None,
+                    color=None,
+                    visible=False,
+                ),
+            )
             return
 
         pos = self._prepare_vertices(t, x)
+        if pos is None or pos.shape[0] < 2:
+            self._stage_channel_update(
+                idx,
+                _PendingChannelUpdate(
+                    vertices=None,
+                    state=None,
+                    color=None,
+                    visible=False,
+                ),
+            )
+            return
+
         if idx < len(self._channel_colors):
             color = self._channel_colors[idx]
         else:
             color = Color("#66aaff")
-        self._lines[idx].set_data(pos=pos, color=color, width=1.2)
 
         state = _ChannelState(t=t.copy(), x=x.copy())
-        if idx < len(self._channel_states):
-            self._channel_states[idx] = state
-        else:
-            self._channel_states.append(state)
-        self._update_channel_range(idx, state)
+        self._stage_channel_update(
+            idx,
+            _PendingChannelUpdate(
+                vertices=pos,
+                state=state,
+                color=color,
+                visible=True,
+            ),
+        )
 
     def apply_tile_data(
         self,
@@ -534,34 +576,66 @@ class VispyChannelCanvas(QtWidgets.QWidget):
             if idx < len(self._channel_visible) and not self._channel_visible[idx]:
                 hidden = True
             if hidden:
-                self.clear_channel(idx)
+                self._stage_channel_update(
+                    idx,
+                    _PendingChannelUpdate(
+                        vertices=None,
+                        state=None,
+                        color=None,
+                        visible=False,
+                    ),
+                )
                 continue
 
             t_arr, x_arr = series[idx]
             if t_arr.size == 0 or x_arr.size == 0:
-                self.clear_channel(idx)
+                self._stage_channel_update(
+                    idx,
+                    _PendingChannelUpdate(
+                        vertices=None,
+                        state=None,
+                        color=None,
+                        visible=False,
+                    ),
+                )
                 continue
             vertex = vertices[idx] if idx < len(vertices) else None
             if vertex is None:
                 vertex = self._prepare_vertices(t_arr, x_arr)
             if vertex is None or vertex.shape[0] < 2:
-                self.clear_channel(idx)
+                self._stage_channel_update(
+                    idx,
+                    _PendingChannelUpdate(
+                        vertices=None,
+                        state=None,
+                        color=None,
+                        visible=False,
+                    ),
+                )
                 continue
 
             color = self._channel_colors[idx] if idx < len(self._channel_colors) else Color("#66aaff")
-            line_item = self._lines[idx]
-            line_item.visible = True
-            line_item.set_data(pos=vertex, color=color, width=1.2)
-
             state = _ChannelState(t=t_arr.copy(), x=x_arr.copy())
-            if idx < len(self._channel_states):
-                self._channel_states[idx] = state
-            else:
-                self._channel_states.append(state)
-            self._update_channel_range(idx, state)
+            self._stage_channel_update(
+                idx,
+                _PendingChannelUpdate(
+                    vertices=vertex,
+                    state=state,
+                    color=color,
+                    visible=True,
+                ),
+            )
 
         for idx in range(limit, len(self._lines)):
-            self.clear_channel(idx)
+            self._stage_channel_update(
+                idx,
+                _PendingChannelUpdate(
+                    vertices=None,
+                    state=None,
+                    color=None,
+                    visible=False,
+                ),
+            )
 
     def apply_series(
         self,
@@ -872,9 +946,113 @@ class VispyChannelCanvas(QtWidgets.QWidget):
             self._channel_label_texts.append("")
             self._channel_label_hidden.append(False)
             self._view_y_ranges.append((-1.0, 1.0))
+            self._buffer_pairs.append(None)
 
         self._install_axis_widget()
         self.set_view(self._view_start, self._view_duration)
+
+    def _ensure_buffer_pair(self, idx: int) -> _BufferPair:
+        if gloo is None:
+            raise RuntimeError("VisPy gloo module is unavailable")
+        if idx >= len(self._buffer_pairs):
+            self._buffer_pairs.extend([None] * (idx + 1 - len(self._buffer_pairs)))
+        pair = self._buffer_pairs[idx]
+        if pair is None:
+            pair = _BufferPair(front=gloo.VertexBuffer(), back=gloo.VertexBuffer())
+            self._buffer_pairs[idx] = pair
+        return pair
+
+    def _stage_channel_update(self, idx: int, update: _PendingChannelUpdate) -> None:
+        should_schedule = False
+        with self._buffer_lock:
+            self._pending_channel_updates[idx] = update
+            if not self._swap_scheduled:
+                self._swap_scheduled = True
+                should_schedule = True
+        if not should_schedule:
+            return
+        if QtCore.QThread.currentThread() is self.thread():
+            self._commit_pending_swaps()
+            return
+        connection_type = getattr(QtCore.Qt, "ConnectionType", None)
+        queued = (
+            connection_type.QueuedConnection
+            if connection_type is not None
+            else QtCore.Qt.QueuedConnection
+        )
+        QtCore.QMetaObject.invokeMethod(self, "_commit_pending_swaps", queued)
+
+    @QtCore.Slot()
+    def _commit_pending_swaps(self) -> None:
+        with self._buffer_lock:
+            updates = self._pending_channel_updates
+            self._pending_channel_updates = {}
+            self._swap_scheduled = False
+        if not updates:
+            return
+        for idx in sorted(updates):
+            self._apply_buffer_update(idx, updates[idx])
+
+    def _apply_buffer_update(self, idx: int, update: _PendingChannelUpdate) -> None:
+        if idx >= len(self._lines):
+            return
+        if not update.visible or update.vertices is None or update.vertices.size < 2:
+            self.clear_channel(idx)
+            return
+
+        line = self._lines[idx]
+        color = update.color
+        if color is None:
+            if idx < len(self._channel_colors):
+                color = self._channel_colors[idx]
+            else:
+                color = Color("#66aaff")
+        vertices32 = np.ascontiguousarray(update.vertices, dtype=np.float32)
+
+        swapped = False
+        if gloo is not None:
+            try:
+                pair = self._ensure_buffer_pair(idx)
+                back_buffer = pair.back
+                front_buffer = pair.front
+                if hasattr(back_buffer, "set_data"):
+                    back_buffer.set_data(vertices32)
+                pair.front, pair.back = back_buffer, front_buffer
+                gl_line = getattr(line, "_line_visual", None)
+                if gl_line is not None:
+                    gl_line._pos_vbo = pair.front
+                    program = getattr(gl_line, "_program", None)
+                    if program is not None:
+                        program.vert["position"] = pair.front
+                    try:
+                        line._pos = vertices32  # type: ignore[attr-defined]
+                        line._bounds = None  # type: ignore[attr-defined]
+                        line._changed["pos"] = False  # type: ignore[attr-defined]
+                    except Exception:
+                        pass
+                    swapped = True
+            except Exception as exc:  # pragma: no cover - defensive
+                LOG.debug("Failed to swap VisPy buffers for channel %d: %s", idx, exc)
+                if idx < len(self._buffer_pairs):
+                    self._buffer_pairs[idx] = None
+                swapped = False
+
+        if not swapped:
+            line.set_data(pos=vertices32, color=color, width=1.2)
+        else:
+            line.set_data(color=color, width=1.2)
+        if idx < len(self._grid_lines):
+            self._grid_lines[idx].visible = True
+        line.visible = True
+        line.update()
+
+        state = update.state
+        if state is not None:
+            if idx < len(self._channel_states):
+                self._channel_states[idx] = state
+            else:
+                self._channel_states.extend([state])
+            self._update_channel_range(idx, state)
 
     def _install_axis_widget(self) -> None:
         if self._x_axis is not None:

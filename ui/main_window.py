@@ -6,13 +6,13 @@ import logging
 import math
 import os
 import re
-from collections import Counter, OrderedDict
+from collections import Counter, OrderedDict, deque
 from concurrent.futures import Future
 from dataclasses import dataclass
 from functools import partial
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Iterable, Optional, Sequence
 
 import numpy as np
 import pyqtgraph as pg
@@ -37,6 +37,7 @@ from core.overscan import (
     select_lod_duration,
     slice_and_decimate,
     choose_lod_duration,
+    normalise_lod_ratio,
 )
 from core.prefetch import prefetch_service
 from core.view_window import WindowLimits, clamp_window, pan_window, zoom_window
@@ -66,6 +67,16 @@ class _HoverSample:
     channel: int
     time: float
     value: float
+
+
+@dataclass(slots=True)
+class _ViewDurationBand:
+    lower: float
+    upper: float
+    target: float
+
+    def contains(self, value: float) -> bool:
+        return self.lower <= value < self.upper
 
 
 class _ZarrIngestWorker(QtCore.QObject):
@@ -133,6 +144,7 @@ class _OverscanWorker(QtCore.QObject):
         self._loader = loader
         self._owns_loader = bool(owns_loader)
         self._preview_sample_cap = getattr(self._builder, "_preview_sample_cap", 4096)
+        self._last_lod_durations: dict[int, float] = {}
 
     @QtCore.Slot(object)
     def render(self, request_obj):
@@ -140,6 +152,7 @@ class _OverscanWorker(QtCore.QObject):
             return
         req: OverscanRequest = request_obj
         try:
+            self._builder.set_previous_lod_hints(self._last_lod_durations)
             preview_tile = self._builder.build_tile(req, preview=True)
         except Exception as exc:  # pragma: no cover - preview failures are non fatal
             LOG.debug("Overscan preview failed: %s", exc)
@@ -147,10 +160,12 @@ class _OverscanWorker(QtCore.QObject):
         if preview_tile is not None:
             self.finished.emit(req.request_id, preview_tile)
         try:
+            self._builder.set_previous_lod_hints(self._last_lod_durations)
             final_tile = self._builder.build_tile(req, preview=False)
         except Exception as exc:  # pragma: no cover - worker error propagated to UI
             self.failed.emit(req.request_id, str(exc))
             return
+        self._record_lod_durations(final_tile)
         self.finished.emit(req.request_id, final_tile)
 
     @QtCore.Slot()
@@ -165,6 +180,23 @@ class _OverscanWorker(QtCore.QObject):
                 close_fn()
             except Exception:
                 pass
+        self._last_lod_durations.clear()
+
+    def _record_lod_durations(self, tile: OverscanTile) -> None:
+        for idx, channel in enumerate(tile.channel_indices):
+            if idx >= len(tile.lod_durations):
+                continue
+            duration = tile.lod_durations[idx]
+            if duration is None:
+                self._last_lod_durations.pop(int(channel), None)
+                continue
+            try:
+                value = float(duration)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(value) or value <= 0.0:
+                continue
+            self._last_lod_durations[int(channel)] = value
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -205,6 +237,7 @@ class MainWindow(QtWidgets.QMainWindow):
             total=loader.duration_s,
             limits=self._limits,
         )
+        self._default_view_duration = self._view_duration
         self._updating_viewbox = False
         self._maybe_build_int16_cache()
         self._prefetch_loader: object | None = None
@@ -284,7 +317,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._hover_sample: _HoverSample | None = None
         self._hover_backend_enabled: bool = False
         self._plot_viewport: QtWidgets.QWidget | None = None
-        self._overscan_factor = 2.0  # windows per side
+        self._overscan_factor = 2.0  # baseline window multiple per side
         self._overscan_zoom_reuse_ratio = 0.7
         self._overscan_tile: OverscanTile | None = None
         self._overscan_request_id = 0
@@ -294,10 +327,20 @@ class MainWindow(QtWidgets.QMainWindow):
             tuple[tuple[int, ...], int, int], OverscanTile
         ] = OrderedDict()
         self._overscan_tile_cache_limit = 6
+        self._tile_upload_budget_per_frame = max(
+            1, int(getattr(self._config, "tile_uploads_per_frame", 2) or 2)
+        )
+        self._tile_upload_budget_remaining = self._tile_upload_budget_per_frame
+        self._tile_upload_queue: deque[OverscanTile] = deque()
         self._lod_enabled = bool(getattr(self._config, "lod_enabled", True))
         self._lod_min_bin_multiple = max(
             1.0, float(getattr(self._config, "lod_min_bin_multiple", 2.0) or 2.0)
         )
+        raw_ratio = getattr(self._config, "lod_envelope_ratio", 0.0)
+        self._lod_envelope_ratio = raw_ratio
+        promote, demote = normalise_lod_ratio(raw_ratio)
+        self._lod_promote_ratio = promote
+        self._lod_demote_ratio = demote if demote > 0.0 else promote
         raw_min_view = getattr(self._config, "lod_min_view_duration_s", 240.0)
         try:
             min_view = float(raw_min_view)
@@ -305,11 +348,37 @@ class MainWindow(QtWidgets.QMainWindow):
             min_view = 0.0
         self._lod_min_view_duration = min_view if min_view > 0.0 else None
         self._config.lod_min_view_duration_s = min_view if min_view > 0.0 else 0.0
+        band_ratio_raw = getattr(self._config, "view_duration_band_ratio", 1.6)
+        try:
+            band_ratio = float(band_ratio_raw)
+        except (TypeError, ValueError):
+            band_ratio = 1.6
+        if not math.isfinite(band_ratio) or band_ratio <= 1.0:
+            band_ratio = 1.6
+        self._view_duration_band_ratio = band_ratio
+        self._config.view_duration_band_ratio = band_ratio
+
+        config_bands = getattr(self._config, "view_duration_bands", ())
+        band_values: list[float] = []
+        for value in config_bands:
+            try:
+                candidate = float(value)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(candidate) or candidate <= 0.0:
+                continue
+            band_values.append(candidate)
+        self._view_duration_band_config = tuple(band_values)
+        self._view_duration_bands: tuple[_ViewDurationBand, ...] = ()
+        self._view_duration_band: int | None = None
+        self._refresh_view_duration_bands()
+        self._apply_view_duration_quantisation()
         self._overscan_worker: AsyncTileWorker | None = None
         self._overscan_worker_loader: object | None = None
         self._overscan_worker_owned: bool = False
         self._overscan_future: Future | None = None
         self._overscan_preview_cap = 4096
+        self._last_lod_durations: dict[int, float] = {}
         self._init_overscan_worker()
 
         self._hidden_channels: set[int] = set(getattr(self._config, "hidden_channels", ()))
@@ -1631,6 +1700,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _init_overscan_worker(self):
         self._shutdown_overscan_worker()
+        self._last_lod_durations.clear()
         worker_loader, owns_loader = self._make_background_loader(self.loader)
         if not owns_loader and worker_loader is self.loader:
             LOG.warning(
@@ -1642,13 +1712,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self._overscan_inflight = None
             self._current_tile_id = None
             return
-        lod_ratio = float(getattr(self._config, "lod_envelope_ratio", 0.0) or 0.0)
         worker = AsyncTileWorker(
             worker_loader,
             lod_enabled=self._lod_enabled,
             lod_min_bin_multiple=self._lod_min_bin_multiple,
             lod_min_view_duration=self._lod_min_view_duration,
-            lod_ratio=lod_ratio,
+            lod_ratio=self._lod_envelope_ratio,
         )
         self._overscan_worker = worker
         self._overscan_worker_loader = worker_loader
@@ -1681,6 +1750,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     close_fn()
                 except Exception:
                     pass
+        self._last_lod_durations.clear()
+        self._tile_upload_queue.clear()
 
     def _available_lod_durations(self, channel: int, loader=None) -> tuple[float, ...]:
         durations: list[float] = []
@@ -1708,6 +1779,169 @@ class MainWindow(QtWidgets.QMainWindow):
         filtered = [float(val) for val in durations if float(val) > 0.0]
         return tuple(sorted(filtered))
 
+    def _resolve_view_duration_band_centers(self) -> list[float]:
+        limit = float(getattr(self._limits, "duration_max", 0.0) or 0.0)
+        if not math.isfinite(limit) or limit <= 0.0:
+            total = float(getattr(self.loader, "duration_s", 0.0) or 0.0)
+            if math.isfinite(total) and total > 0.0:
+                limit = total
+        config_values = getattr(self, "_view_duration_band_config", ())
+        if config_values:
+            return self._normalise_band_centers(config_values, limit, densify=False)
+
+        values: set[float] = set()
+        default_duration = float(getattr(self, "_default_view_duration", 0.0) or 0.0)
+        if math.isfinite(default_duration) and default_duration > 0.0:
+            values.add(default_duration)
+        if math.isfinite(limit) and limit > 0.0:
+            values.add(limit)
+
+        n_channels = int(getattr(self.loader, "n_channels", 0) or 0)
+        max_channels = max(1, min(n_channels, 8)) if n_channels else 0
+        if max_channels:
+            min_multiple = max(1.0, float(getattr(self, "_lod_min_bin_multiple", 1.0)))
+            promote = float(getattr(self, "_lod_promote_ratio", 0.0) or 0.0)
+            for idx in range(max_channels):
+                for duration in self._available_lod_durations(idx):
+                    base = float(duration)
+                    if not math.isfinite(base) or base <= 0.0:
+                        continue
+                    values.add(base)
+                    scaled = base * min_multiple
+                    if scaled > 0.0:
+                        values.add(scaled)
+                    if promote > 0.0:
+                        values.add(base * promote)
+
+        if not values:
+            baseline = default_duration
+            if not (math.isfinite(baseline) and baseline > 0.0):
+                baseline = 30.0
+            if math.isfinite(limit) and limit > 0.0:
+                baseline = min(baseline, limit)
+            current = baseline
+            if math.isfinite(limit) and limit > 0.0:
+                while current <= limit:
+                    values.add(current)
+                    current *= 1.5
+            else:
+                values.add(baseline)
+
+        return self._normalise_band_centers(values, limit, densify=True)
+
+    def _normalise_band_centers(
+        self, values: Iterable[float], limit: float, *, densify: bool
+    ) -> list[float]:
+        filtered: list[float] = []
+        finite_limit = limit if math.isfinite(limit) and limit > 0.0 else None
+        for value in values:
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(numeric) or numeric <= 0.0:
+                continue
+            if finite_limit is not None and numeric > finite_limit * 1.000001:
+                continue
+            filtered.append(numeric)
+        filtered.sort()
+        deduped: list[float] = []
+        for numeric in filtered:
+            if deduped and math.isclose(numeric, deduped[-1], rel_tol=1e-6, abs_tol=1e-6):
+                continue
+            deduped.append(numeric)
+        if not deduped:
+            return []
+        if densify and len(deduped) > 1:
+            ratio_limit = max(1.05, float(getattr(self, "_view_duration_band_ratio", 1.6)))
+            densified = deduped[:]
+            idx = 0
+            while idx < len(densified) - 1:
+                current = densified[idx]
+                nxt = densified[idx + 1]
+                ratio = nxt / current if current > 0 else float("inf")
+                if ratio > ratio_limit + 1e-9:
+                    filler = math.sqrt(current * nxt)
+                    if not math.isfinite(filler):
+                        idx += 1
+                        continue
+                    if filler <= current * (1.0 + 1e-6) or filler >= nxt * (1.0 - 1e-6):
+                        idx += 1
+                        continue
+                    densified.insert(idx + 1, filler)
+                else:
+                    idx += 1
+            deduped = densified
+        return deduped
+
+    def _refresh_view_duration_bands(self) -> None:
+        centers = self._resolve_view_duration_band_centers()
+        if not centers:
+            self._view_duration_bands = tuple()
+            return
+        ratio = max(1.05, float(getattr(self, "_view_duration_band_ratio", 1.6)))
+        bands: list[_ViewDurationBand] = []
+        prev_center = None
+        prev_band: _ViewDurationBand | None = None
+        for center in centers:
+            target = float(center)
+            if prev_center is None:
+                lower = target / ratio
+                if not math.isfinite(lower) or lower < 0.0:
+                    lower = 0.0
+            else:
+                boundary = math.sqrt(prev_center * target)
+                if not math.isfinite(boundary) or boundary <= 0.0:
+                    boundary = prev_band.upper if prev_band is not None else 0.0
+                if prev_band is not None:
+                    if boundary <= prev_band.lower:
+                        boundary = prev_band.lower + 1e-6
+                    prev_band.upper = boundary
+                lower = boundary
+            upper = target * ratio
+            if not math.isfinite(upper) or upper <= lower:
+                upper = lower + max(1e-6, lower * 0.1)
+            band = _ViewDurationBand(lower=lower, upper=upper, target=target)
+            bands.append(band)
+            prev_center = target
+            prev_band = band
+        if bands:
+            bands[-1].upper = float("inf")
+        self._view_duration_bands = tuple(bands)
+
+    def _quantise_view_duration(self, duration: float) -> tuple[float, int | None]:
+        try:
+            value = float(duration)
+        except (TypeError, ValueError):
+            return duration, None
+        if value <= 0.0:
+            return value, None
+        for idx, band in enumerate(self._view_duration_bands):
+            if value < band.lower:
+                continue
+            if band.contains(value):
+                return band.target, idx
+        if self._view_duration_bands and value >= self._view_duration_bands[-1].lower:
+            last = self._view_duration_bands[-1]
+            return last.target, len(self._view_duration_bands) - 1
+        return value, None
+
+    def _apply_view_duration_quantisation(self) -> None:
+        quantised, band_idx = self._quantise_view_duration(self._view_duration)
+        if band_idx is not None:
+            start_new, duration_new = clamp_window(
+                self._view_start,
+                quantised,
+                total=self.loader.duration_s,
+                limits=self._limits,
+            )
+            self._view_start = start_new
+            self._view_duration = duration_new
+            quantised, band_idx = self._quantise_view_duration(self._view_duration)
+            if band_idx is not None:
+                self._view_duration = quantised
+        self._view_duration_band = band_idx
+
     def _expected_lod_duration_for_channel(
         self, channel: int, view_duration: float
     ) -> Optional[float]:
@@ -1716,12 +1950,47 @@ class MainWindow(QtWidgets.QMainWindow):
         durations = self._available_lod_durations(channel)
         if not durations:
             return None
+        promote = self._lod_promote_ratio
+        if promote > 0.0 and math.isfinite(promote):
+            previous = self._last_lod_durations.get(int(channel))
+            selected = choose_lod_duration(
+                view_duration,
+                durations,
+                ratio=(self._lod_promote_ratio, self._lod_demote_ratio),
+                previous_duration=previous,
+            )
+            if selected is not None:
+                return selected
         return select_lod_duration(
             view_duration,
             durations,
             self._lod_min_bin_multiple,
             min_view_duration=self._lod_min_view_duration,
         )
+
+    def _next_lod_duration_for_channel(
+        self, channel: int, view_duration: float, loader=None
+    ) -> Optional[float]:
+        if not self._lod_enabled:
+            return None
+        durations = self._available_lod_durations(channel, loader)
+        if not durations:
+            return None
+        selected = select_lod_duration(
+            view_duration,
+            durations,
+            self._lod_min_bin_multiple,
+            min_view_duration=self._lod_min_view_duration,
+        )
+        # If no selection is made, fall back to the smallest available duration.
+        if selected is None:
+            return durations[0] if durations else None
+        for duration in durations:
+            if math.isclose(duration, selected, rel_tol=1e-6, abs_tol=1e-6):
+                continue
+            if duration > selected:
+                return duration
+        return None
 
     # ----- Behaviors -------------------------------------------------------
 
@@ -1772,6 +2041,41 @@ class MainWindow(QtWidgets.QMainWindow):
     def _schedule_refresh(self):
         self._debounce_timer.start()
 
+    def _reset_tile_upload_budget(self) -> None:
+        self._tile_upload_budget_remaining = self._tile_upload_budget_per_frame
+
+    def _drop_pending_tile_request(self, request_id: int) -> None:
+        if request_id < 0 or not self._tile_upload_queue:
+            return
+        existing = [
+            tile
+            for tile in self._tile_upload_queue
+            if int(getattr(tile, "request_id", -1)) != request_id
+        ]
+        self._tile_upload_queue = deque(existing)
+
+    def _schedule_tile_upload(self, tile: OverscanTile, *, priority: bool = False) -> None:
+        request_id = int(getattr(tile, "request_id", -1))
+        self._drop_pending_tile_request(request_id)
+        if self._tile_upload_budget_remaining > 0 and not self._tile_upload_queue:
+            self._tile_upload_budget_remaining -= 1
+            self._apply_tile_to_curves(tile)
+            return
+        if priority:
+            self._tile_upload_queue.appendleft(tile)
+        else:
+            self._tile_upload_queue.append(tile)
+
+    def _drain_tile_upload_queue(self) -> None:
+        if not self._tile_upload_queue:
+            return
+        while self._tile_upload_queue and self._tile_upload_budget_remaining > 0:
+            tile = self._tile_upload_queue.popleft()
+            self._tile_upload_budget_remaining -= 1
+            self._apply_tile_to_curves(tile)
+        if self._tile_upload_queue and self._tile_upload_budget_remaining <= 0:
+            self._schedule_refresh()
+
     def _on_start_spin_changed(self, value: float):
         self._set_view(float(value), self._view_duration, sender="controls")
 
@@ -1782,6 +2086,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def refresh(self):
         if hasattr(self, "_debounce_timer"):
             self._debounce_timer.stop()
+        self._reset_tile_upload_budget()
+        self._drain_tile_upload_queue()
         t0 = self._view_start
         duration = self._view_duration
         t1 = min(self.loader.duration_s, t0 + duration)
@@ -2047,12 +2353,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 except Exception:
                     pass
         self._update_limits_from_loader()
+        self._refresh_view_duration_bands()
         self._view_start, self._view_duration = clamp_window(
             self._view_start,
             self._view_duration,
             total=self.loader.duration_s,
             limits=self._limits,
         )
+        self._apply_view_duration_quantisation()
 
         self.time_axis.set_timebase(self.loader.timebase)
         if self.loader.timebase.start_dt is not None:
@@ -2082,12 +2390,24 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _set_view(self, start: float, duration: float, *, sender: str | None = None):
         old_duration = self._view_duration
+        old_band = getattr(self, "_view_duration_band", None)
         start_new, duration_new = clamp_window(
             start,
             duration,
             total=self.loader.duration_s,
             limits=self._limits,
         )
+        quantised_duration, new_band = self._quantise_view_duration(duration_new)
+        if new_band is not None:
+            start_new, duration_new = clamp_window(
+                start_new,
+                quantised_duration,
+                total=self.loader.duration_s,
+                limits=self._limits,
+            )
+            quantised_duration, new_band = self._quantise_view_duration(duration_new)
+            if new_band is not None:
+                duration_new = quantised_duration
         if (
             abs(start_new - self._view_start) < 1e-6
             and abs(duration_new - self._view_duration) < 1e-6
@@ -2097,8 +2417,10 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         duration_changed = abs(duration_new - old_duration) >= 1e-6
+        band_changed = new_band != old_band
         self._view_start = start_new
         self._view_duration = duration_new
+        self._view_duration_band = new_band
         self._refresh_limits()
         if sender != "controls":
             self._update_controls_from_state()
@@ -2109,7 +2431,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._view_start,
                 self._view_start + self._view_duration,
             )
-        if duration_changed:
+        if band_changed or (new_band is None and duration_changed):
             self._invalidate_overscan_tile_cache()
         self._schedule_refresh()
         self._schedule_prefetch()
@@ -2243,8 +2565,37 @@ class MainWindow(QtWidgets.QMainWindow):
         duration = max(0.0, end - start)
         if duration <= 0:
             return
+        neighbour_offsets = (-1, 0, 1)
+        preview_multiplier = 2 if getattr(self._prefetch, "preview_fetch", None) is not None else 1
+        tile_duration = getattr(getattr(self._prefetch, "config", None), "tile_duration", None)
+        try:
+            base_tile = float(tile_duration) if tile_duration is not None else float(self._config.prefetch_tile_s)
+        except (TypeError, ValueError):
+            base_tile = float(self._config.prefetch_tile_s)
+        if base_tile <= 0:
+            base_tile = max(1.0, self._view_duration)
+        base_tile_count = max(1, int(math.ceil(duration / base_tile)))
         for ch in visible_channels:
-            self._prefetch.prefetch_window(ch, start, duration)
+            lod_duration = self._next_lod_duration_for_channel(ch, self._view_duration, loader)
+            if lod_duration is not None and math.isclose(
+                float(lod_duration), base_tile, rel_tol=1e-6, abs_tol=1e-6
+            ):
+                lod_duration = None
+            lod_tile_count = 0
+            if lod_duration is not None and lod_duration > 0:
+                lod_tile_count = int(math.ceil(duration / float(lod_duration)))
+            total_tiles = base_tile_count * len(neighbour_offsets)
+            if lod_tile_count:
+                total_tiles += lod_tile_count * len(neighbour_offsets)
+            max_tasks = max(1, total_tiles * preview_multiplier)
+            self._prefetch.prefetch_window(
+                ch,
+                start,
+                duration,
+                neighbours=neighbour_offsets,
+                lod_duration=lod_duration,
+                max_per_frame=max_tasks,
+            )
         prefetch_service.update_hints(channels=visible_channels, window_s=self._view_duration)
         self._config.prefetch_hint_channels = tuple(visible_channels)
         self._config.prefetch_hint_window_s = float(self._view_duration)
@@ -2411,6 +2762,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._overscan_inflight = None
         self._current_tile_id = None
         self._overscan_request_id += 1
+        self._last_lod_durations.clear()
+        self._tile_upload_queue.clear()
 
     def _request_overscan_tile(self, window_start: float, window_duration: float):
         if self._overscan_worker is None or self.loader.n_channels == 0:
@@ -2430,6 +2783,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._overscan_tile = cached_tile
             self._update_tile_view_metadata(cached_tile, window_start, window_duration)
             self._current_tile_id = None
+            self._record_lod_durations(cached_tile)
             self._apply_tile_to_curves(cached_tile)
             try:
                 self._schedule_refresh()
@@ -2439,6 +2793,8 @@ class MainWindow(QtWidgets.QMainWindow):
         req_id = self._overscan_request_id + 1
         self._overscan_request_id = req_id
         self._overscan_inflight = req_id
+        pixel_width = self._estimate_pixels() or 0
+        pixel_hint = int(pixel_width) if pixel_width > 0 else None
         request = OverscanRequest(
             request_id=req_id,
             start=start,
@@ -2447,6 +2803,9 @@ class MainWindow(QtWidgets.QMainWindow):
             view_duration=window_duration,
             channel_indices=channels,
             max_samples=None,
+            pixel_width=pixel_hint,
+            zoom_factor=self._current_zoom_factor(),
+            display_dpi=self._current_display_dpi(),
         )
         if self._overscan_future is not None:
             self._overscan_future.cancel()
@@ -2471,9 +2830,39 @@ class MainWindow(QtWidgets.QMainWindow):
         future.add_done_callback(_handle_completion)
 
     def _compute_overscan_bounds(self, view_start: float, view_duration: float) -> tuple[float, float]:
-        total = self.loader.duration_s
-        left_desired = self._overscan_factor * view_duration
-        right_desired = self._overscan_factor * view_duration
+        total = float(self.loader.duration_s)
+        try:
+            view_start = float(view_start)
+        except (TypeError, ValueError):
+            view_start = 0.0
+        try:
+            view_duration = float(view_duration)
+        except (TypeError, ValueError):
+            view_duration = 0.0
+        if view_duration <= 0.0:
+            clamped_start = max(0.0, min(view_start, total))
+            return clamped_start, clamped_start
+
+        pixel_width = self._estimate_pixels() or 0
+        if pixel_width > 0:
+            reference_window = getattr(self, "_default_view_duration", None)
+            try:
+                reference_window = float(reference_window)
+            except (TypeError, ValueError):
+                reference_window = None
+            if reference_window is None or not math.isfinite(reference_window) or reference_window <= 0.0:
+                reference_window = view_duration
+            zoom_factor = reference_window / max(view_duration, 1e-6)
+            if not math.isfinite(zoom_factor) or zoom_factor <= 0.0:
+                zoom_factor = 1.0
+            sec_per_px = view_duration / float(pixel_width)
+            base_pixels = float(pixel_width) * float(self._overscan_factor)
+            overscan_seconds = base_pixels * math.sqrt(zoom_factor) * sec_per_px
+        else:
+            overscan_seconds = self._overscan_factor * view_duration
+
+        left_desired = max(0.0, overscan_seconds)
+        right_desired = left_desired
         left = min(left_desired, view_start)
         right = min(right_desired, max(0.0, total - (view_start + view_duration)))
         span = left + view_duration + right
@@ -2523,8 +2912,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._overscan_tile = tile_obj
         self._update_tile_view_metadata(self._overscan_tile, self._view_start, self._view_duration)
         self._current_tile_id = None
-        self._apply_tile_to_curves(tile_obj)
+        self._schedule_tile_upload(tile_obj, priority=is_final)
         if is_final:
+            self._record_lod_durations(tile_obj)
             self._cache_tile(tile_obj)
         self._schedule_refresh()
 
@@ -2535,6 +2925,25 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         tile.view_start = view_start
         tile.view_duration = view_duration
+
+    def _record_lod_durations(self, tile: OverscanTile | None) -> None:
+        if tile is None:
+            return
+        for idx, channel in enumerate(tile.channel_indices):
+            if idx >= len(tile.lod_durations):
+                continue
+            duration = tile.lod_durations[idx]
+            key = int(channel)
+            if duration is None:
+                self._last_lod_durations.pop(key, None)
+                continue
+            try:
+                value = float(duration)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(value) or value <= 0.0:
+                continue
+            self._last_lod_durations[key] = value
 
     def _handle_overscan_failed(self, request_id: int, message: str):
         if request_id != self._overscan_request_id:
@@ -3315,8 +3724,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _prepare_tile(self, tile: OverscanTile) -> bool:
         pixels = self._estimate_pixels() or 0
+        effective_pixels = int(round(self._effective_pixel_span(pixels))) if pixels else 0
+        pixel_basis = effective_pixels if effective_pixels > 0 else pixels
         overscan_span = 2 * self._overscan_factor + 1
-        budget = int(max(200, pixels * overscan_span * 2)) if pixels else 2000
+        budget = (
+            int(max(200, pixel_basis * overscan_span * 2))
+            if pixel_basis
+            else 2000
+        )
         want_vertices = self._use_gpu_canvas or self._gpu_autoswitch_enabled
         changed = False
 
@@ -3756,6 +4171,67 @@ class MainWindow(QtWidgets.QMainWindow):
             return 0
         width = int(vb.width())
         return max(0, width)
+
+    def _current_zoom_factor(self) -> float:
+        baseline = getattr(self, "_lod_min_view_duration", None)
+        if baseline is None or not math.isfinite(baseline) or baseline <= 0:
+            baseline = getattr(self, "_default_view_duration", None)
+            if baseline is None or not math.isfinite(baseline) or baseline <= 0:
+                baseline = float(self._view_duration) if self._view_duration > 0 else 1.0
+        current = float(self._view_duration) if self._view_duration > 0 else 1.0
+        zoom = float(baseline) / max(current, 1e-6)
+        if not math.isfinite(zoom) or zoom <= 0:
+            return 1.0
+        return zoom
+
+    def _current_display_dpi(self) -> float:
+        widget: QtWidgets.QWidget | None
+        if self._use_gpu_canvas and self._gpu_canvas is not None:
+            widget = self._gpu_canvas
+        elif self._channel_backend is not None:
+            widget = self._channel_backend.widget
+        else:
+            widget = self
+
+        screen: QtGui.QScreen | None = None
+        window_handle = getattr(widget, "windowHandle", None)
+        if callable(window_handle):
+            handle = window_handle()
+            if handle is not None:
+                screen = handle.screen()
+        if screen is None:
+            app = QtWidgets.QApplication.instance()
+            if app is not None:
+                screen = app.primaryScreen()
+
+        dpi: float | None = None
+        if screen is not None:
+            try:
+                dpi = float(screen.logicalDotsPerInchX())
+            except Exception:
+                dpi = None
+            if dpi is None or not math.isfinite(dpi) or dpi <= 0:
+                try:
+                    dpi = float(screen.logicalDotsPerInch())
+                except Exception:
+                    dpi = None
+        if dpi is None or not math.isfinite(dpi) or dpi <= 0:
+            dpi = 96.0
+        return dpi
+
+    def _effective_pixel_span(self, base_px: int | float) -> float:
+        try:
+            base = float(base_px)
+        except (TypeError, ValueError):
+            return 0.0
+        if not math.isfinite(base) or base <= 0:
+            return 0.0
+        zoom = self._current_zoom_factor()
+        dpi = self._current_display_dpi()
+        effective = base * math.sqrt(max(zoom, 1e-6)) * (dpi / 96.0)
+        if not math.isfinite(effective) or effective <= 0:
+            return 0.0
+        return effective
 
     # ----- Plot helpers ------------------------------------------------------
 

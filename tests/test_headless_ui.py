@@ -43,7 +43,7 @@ def qt_app():
 class _DummyPrefetchCache:
     fetch: Callable[[int, float, float], tuple[np.ndarray, np.ndarray]]
     preview_fetch: Callable[[int, float, float], tuple[np.ndarray, np.ndarray]] | None
-    requests: list[tuple[str, int, float, float]]
+    requests: list[tuple[str, int, float, float, dict[str, object]]]
 
     def __init__(
         self,
@@ -63,10 +63,28 @@ class _DummyPrefetchCache:
     def clear(self) -> None:
         self.requests.clear()
 
-    def prefetch_window(self, channel: int, start: float, duration: float) -> None:
+    def prefetch_window(
+        self,
+        channel: int,
+        start: float,
+        duration: float,
+        *,
+        neighbours: Sequence[int] | None = None,
+        lod_duration: float | None = None,
+        lod_neighbours: Sequence[int] | None = None,
+        max_per_frame: int | None = None,
+    ) -> None:
+        meta = {
+            "neighbours": tuple(neighbours) if neighbours is not None else (),
+            "lod_duration": lod_duration,
+            "lod_neighbours": tuple(lod_neighbours)
+            if lod_neighbours is not None
+            else (),
+            "max_per_frame": max_per_frame,
+        }
         if self.preview_fetch is not None:
-            self.requests.append(("preview", channel, start, duration))
-        self.requests.append(("final", channel, start, duration))
+            self.requests.append(("preview", channel, start, duration, meta))
+        self.requests.append(("final", channel, start, duration, meta))
 
 
 class _DummyPrefetchService:
@@ -500,6 +518,57 @@ def test_gpu_hover_signal_updates_state(qt_app, monkeypatch):
     _process_events(qt_app)
     assert window._hover_backend_enabled
     assert canvas.hover_enabled_history[-1] is True
+
+    window._shutdown_overscan_worker()
+    window.close()
+    _process_events(qt_app)
+
+
+@pytest.mark.skipif(not HAS_QT, reason="Qt dependencies unavailable")
+def test_view_duration_quantisation_reuses_band(qt_app, monkeypatch):
+    from ui import main_window as mw
+
+    dummy_service = _DummyPrefetchService()
+    monkeypatch.setattr(mw, "prefetch_service", dummy_service)
+
+    loader = FakeHeadlessLoader(duration_s=200.0, base_fs=60.0, n_channels=2)
+    config = ViewerConfig(
+        canvas_backend="pyqtgraph",
+        lod_enabled=False,
+        view_duration_bands=(20.0, 40.0, 80.0),
+        view_duration_band_ratio=1.3,
+    )
+
+    window = mw.MainWindow(loader, config=config)
+    window.show()
+    _process_events(qt_app)
+
+    invalidations: list[bool] = []
+    original_invalidate = window._invalidate_overscan_tile_cache
+
+    def _tracker():
+        invalidations.append(True)
+        original_invalidate()
+
+    monkeypatch.setattr(window, "_invalidate_overscan_tile_cache", _tracker)
+
+    window._set_view(window._view_start, 18.0, sender="tests")
+    _process_events(qt_app)
+    assert window._view_duration == pytest.approx(20.0)
+    assert window._view_duration_band is not None
+    assert invalidations
+
+    invalidations.clear()
+    window._set_view(window._view_start, 19.5, sender="tests")
+    _process_events(qt_app)
+    assert window._view_duration == pytest.approx(20.0)
+    assert not invalidations
+
+    invalidations.clear()
+    window._set_view(window._view_start, 55.0, sender="tests")
+    _process_events(qt_app)
+    assert window._view_duration == pytest.approx(40.0)
+    assert invalidations
 
     window._shutdown_overscan_worker()
     window.close()
