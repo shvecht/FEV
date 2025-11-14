@@ -218,6 +218,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._annotation_control_states: dict[QtWidgets.QWidget, bool] = {}
         self._annotation_control_tooltips: dict[QtWidgets.QWidget, str] = {}
         self._plot_viewport_filter_installed = False
+        # GPU label panel placeholders (created on-demand)
+        self._gpu_label_container = None
+        self._gpu_label_layout = None
+        self._gpu_label_spacer = None
+        self._gpu_label_widgets: list[QtWidgets.QLabel] = []
         self._ingest_thread: QtCore.QThread | None = None
         self._ingest_worker: _ZarrIngestWorker | None = None
         self._zarr_path: Path | None = None
