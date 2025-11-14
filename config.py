@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -27,6 +28,8 @@ class ViewerConfig:
     lod_enabled: bool = True
     lod_min_bin_multiple: float = 2.0
     lod_min_view_duration_s: float = 240.0
+    view_duration_bands: tuple[float, ...] = ()
+    view_duration_band_ratio: float = 1.6
     ini_path: Path | None = None
 
     @classmethod
@@ -141,6 +144,25 @@ class ViewerConfig:
                 cfg.lod_envelope_ratio = lod_section.getfloat(
                     "envelope_ratio", fallback=cfg.lod_envelope_ratio
                 )
+                band_raw = lod_section.get("view_duration_bands", fallback="")
+                if band_raw:
+                    values: list[float] = []
+                    for part in band_raw.split(","):
+                        part = part.strip()
+                        if not part:
+                            continue
+                        try:
+                            value = float(part)
+                        except ValueError:
+                            continue
+                        if not math.isfinite(value) or value <= 0:
+                            continue
+                        values.append(value)
+                    if values:
+                        cfg.view_duration_bands = tuple(values)
+                cfg.view_duration_band_ratio = lod_section.getfloat(
+                    "view_duration_band_ratio", fallback=cfg.view_duration_band_ratio
+                )
         cfg.ini_path = path
         return cfg
 
@@ -187,6 +209,10 @@ class ViewerConfig:
             "min_bin_multiple": f"{self.lod_min_bin_multiple:.3f}",
             "min_view_duration_s": f"{self.lod_min_view_duration_s:.3f}",
             "envelope_ratio": f"{self.lod_envelope_ratio:.3f}",
+            "view_duration_bands": ",".join(
+                f"{float(value):.6f}" for value in self.view_duration_bands
+            ),
+            "view_duration_band_ratio": f"{self.view_duration_band_ratio:.6f}",
         }
         with self.ini_path.open("w") as fh:
             parser.write(fh)

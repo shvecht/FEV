@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from functools import partial
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Iterable, Optional, Sequence
 
 import numpy as np
 import pyqtgraph as pg
@@ -67,6 +67,16 @@ class _HoverSample:
     channel: int
     time: float
     value: float
+
+
+@dataclass(slots=True)
+class _ViewDurationBand:
+    lower: float
+    upper: float
+    target: float
+
+    def contains(self, value: float) -> bool:
+        return self.lower <= value < self.upper
 
 
 class _ZarrIngestWorker(QtCore.QObject):
@@ -333,6 +343,31 @@ class MainWindow(QtWidgets.QMainWindow):
             min_view = 0.0
         self._lod_min_view_duration = min_view if min_view > 0.0 else None
         self._config.lod_min_view_duration_s = min_view if min_view > 0.0 else 0.0
+        band_ratio_raw = getattr(self._config, "view_duration_band_ratio", 1.6)
+        try:
+            band_ratio = float(band_ratio_raw)
+        except (TypeError, ValueError):
+            band_ratio = 1.6
+        if not math.isfinite(band_ratio) or band_ratio <= 1.0:
+            band_ratio = 1.6
+        self._view_duration_band_ratio = band_ratio
+        self._config.view_duration_band_ratio = band_ratio
+
+        config_bands = getattr(self._config, "view_duration_bands", ())
+        band_values: list[float] = []
+        for value in config_bands:
+            try:
+                candidate = float(value)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(candidate) or candidate <= 0.0:
+                continue
+            band_values.append(candidate)
+        self._view_duration_band_config = tuple(band_values)
+        self._view_duration_bands: tuple[_ViewDurationBand, ...] = ()
+        self._view_duration_band: int | None = None
+        self._refresh_view_duration_bands()
+        self._apply_view_duration_quantisation()
         self._overscan_worker: AsyncTileWorker | None = None
         self._overscan_worker_loader: object | None = None
         self._overscan_worker_owned: bool = False
@@ -1738,6 +1773,169 @@ class MainWindow(QtWidgets.QMainWindow):
         filtered = [float(val) for val in durations if float(val) > 0.0]
         return tuple(sorted(filtered))
 
+    def _resolve_view_duration_band_centers(self) -> list[float]:
+        limit = float(getattr(self._limits, "duration_max", 0.0) or 0.0)
+        if not math.isfinite(limit) or limit <= 0.0:
+            total = float(getattr(self.loader, "duration_s", 0.0) or 0.0)
+            if math.isfinite(total) and total > 0.0:
+                limit = total
+        config_values = getattr(self, "_view_duration_band_config", ())
+        if config_values:
+            return self._normalise_band_centers(config_values, limit, densify=False)
+
+        values: set[float] = set()
+        default_duration = float(getattr(self, "_default_view_duration", 0.0) or 0.0)
+        if math.isfinite(default_duration) and default_duration > 0.0:
+            values.add(default_duration)
+        if math.isfinite(limit) and limit > 0.0:
+            values.add(limit)
+
+        n_channels = int(getattr(self.loader, "n_channels", 0) or 0)
+        max_channels = max(1, min(n_channels, 8)) if n_channels else 0
+        if max_channels:
+            min_multiple = max(1.0, float(getattr(self, "_lod_min_bin_multiple", 1.0)))
+            promote = float(getattr(self, "_lod_promote_ratio", 0.0) or 0.0)
+            for idx in range(max_channels):
+                for duration in self._available_lod_durations(idx):
+                    base = float(duration)
+                    if not math.isfinite(base) or base <= 0.0:
+                        continue
+                    values.add(base)
+                    scaled = base * min_multiple
+                    if scaled > 0.0:
+                        values.add(scaled)
+                    if promote > 0.0:
+                        values.add(base * promote)
+
+        if not values:
+            baseline = default_duration
+            if not (math.isfinite(baseline) and baseline > 0.0):
+                baseline = 30.0
+            if math.isfinite(limit) and limit > 0.0:
+                baseline = min(baseline, limit)
+            current = baseline
+            if math.isfinite(limit) and limit > 0.0:
+                while current <= limit:
+                    values.add(current)
+                    current *= 1.5
+            else:
+                values.add(baseline)
+
+        return self._normalise_band_centers(values, limit, densify=True)
+
+    def _normalise_band_centers(
+        self, values: Iterable[float], limit: float, *, densify: bool
+    ) -> list[float]:
+        filtered: list[float] = []
+        finite_limit = limit if math.isfinite(limit) and limit > 0.0 else None
+        for value in values:
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(numeric) or numeric <= 0.0:
+                continue
+            if finite_limit is not None and numeric > finite_limit * 1.000001:
+                continue
+            filtered.append(numeric)
+        filtered.sort()
+        deduped: list[float] = []
+        for numeric in filtered:
+            if deduped and math.isclose(numeric, deduped[-1], rel_tol=1e-6, abs_tol=1e-6):
+                continue
+            deduped.append(numeric)
+        if not deduped:
+            return []
+        if densify and len(deduped) > 1:
+            ratio_limit = max(1.05, float(getattr(self, "_view_duration_band_ratio", 1.6)))
+            densified = deduped[:]
+            idx = 0
+            while idx < len(densified) - 1:
+                current = densified[idx]
+                nxt = densified[idx + 1]
+                ratio = nxt / current if current > 0 else float("inf")
+                if ratio > ratio_limit + 1e-9:
+                    filler = math.sqrt(current * nxt)
+                    if not math.isfinite(filler):
+                        idx += 1
+                        continue
+                    if filler <= current * (1.0 + 1e-6) or filler >= nxt * (1.0 - 1e-6):
+                        idx += 1
+                        continue
+                    densified.insert(idx + 1, filler)
+                else:
+                    idx += 1
+            deduped = densified
+        return deduped
+
+    def _refresh_view_duration_bands(self) -> None:
+        centers = self._resolve_view_duration_band_centers()
+        if not centers:
+            self._view_duration_bands = tuple()
+            return
+        ratio = max(1.05, float(getattr(self, "_view_duration_band_ratio", 1.6)))
+        bands: list[_ViewDurationBand] = []
+        prev_center = None
+        prev_band: _ViewDurationBand | None = None
+        for center in centers:
+            target = float(center)
+            if prev_center is None:
+                lower = target / ratio
+                if not math.isfinite(lower) or lower < 0.0:
+                    lower = 0.0
+            else:
+                boundary = math.sqrt(prev_center * target)
+                if not math.isfinite(boundary) or boundary <= 0.0:
+                    boundary = prev_band.upper if prev_band is not None else 0.0
+                if prev_band is not None:
+                    if boundary <= prev_band.lower:
+                        boundary = prev_band.lower + 1e-6
+                    prev_band.upper = boundary
+                lower = boundary
+            upper = target * ratio
+            if not math.isfinite(upper) or upper <= lower:
+                upper = lower + max(1e-6, lower * 0.1)
+            band = _ViewDurationBand(lower=lower, upper=upper, target=target)
+            bands.append(band)
+            prev_center = target
+            prev_band = band
+        if bands:
+            bands[-1].upper = float("inf")
+        self._view_duration_bands = tuple(bands)
+
+    def _quantise_view_duration(self, duration: float) -> tuple[float, int | None]:
+        try:
+            value = float(duration)
+        except (TypeError, ValueError):
+            return duration, None
+        if value <= 0.0:
+            return value, None
+        for idx, band in enumerate(self._view_duration_bands):
+            if value < band.lower:
+                continue
+            if band.contains(value):
+                return band.target, idx
+        if self._view_duration_bands and value >= self._view_duration_bands[-1].lower:
+            last = self._view_duration_bands[-1]
+            return last.target, len(self._view_duration_bands) - 1
+        return value, None
+
+    def _apply_view_duration_quantisation(self) -> None:
+        quantised, band_idx = self._quantise_view_duration(self._view_duration)
+        if band_idx is not None:
+            start_new, duration_new = clamp_window(
+                self._view_start,
+                quantised,
+                total=self.loader.duration_s,
+                limits=self._limits,
+            )
+            self._view_start = start_new
+            self._view_duration = duration_new
+            quantised, band_idx = self._quantise_view_duration(self._view_duration)
+            if band_idx is not None:
+                self._view_duration = quantised
+        self._view_duration_band = band_idx
+
     def _expected_lod_duration_for_channel(
         self, channel: int, view_duration: float
     ) -> Optional[float]:
@@ -2112,12 +2310,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 except Exception:
                     pass
         self._update_limits_from_loader()
+        self._refresh_view_duration_bands()
         self._view_start, self._view_duration = clamp_window(
             self._view_start,
             self._view_duration,
             total=self.loader.duration_s,
             limits=self._limits,
         )
+        self._apply_view_duration_quantisation()
 
         self.time_axis.set_timebase(self.loader.timebase)
         if self.loader.timebase.start_dt is not None:
@@ -2147,12 +2347,24 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _set_view(self, start: float, duration: float, *, sender: str | None = None):
         old_duration = self._view_duration
+        old_band = getattr(self, "_view_duration_band", None)
         start_new, duration_new = clamp_window(
             start,
             duration,
             total=self.loader.duration_s,
             limits=self._limits,
         )
+        quantised_duration, new_band = self._quantise_view_duration(duration_new)
+        if new_band is not None:
+            start_new, duration_new = clamp_window(
+                start_new,
+                quantised_duration,
+                total=self.loader.duration_s,
+                limits=self._limits,
+            )
+            quantised_duration, new_band = self._quantise_view_duration(duration_new)
+            if new_band is not None:
+                duration_new = quantised_duration
         if (
             abs(start_new - self._view_start) < 1e-6
             and abs(duration_new - self._view_duration) < 1e-6
@@ -2162,8 +2374,10 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         duration_changed = abs(duration_new - old_duration) >= 1e-6
+        band_changed = new_band != old_band
         self._view_start = start_new
         self._view_duration = duration_new
+        self._view_duration_band = new_band
         self._refresh_limits()
         if sender != "controls":
             self._update_controls_from_state()
@@ -2174,7 +2388,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._view_start,
                 self._view_start + self._view_duration,
             )
-        if duration_changed:
+        if band_changed or (new_band is None and duration_changed):
             self._invalidate_overscan_tile_cache()
         self._schedule_refresh()
         self._schedule_prefetch()
