@@ -37,6 +37,7 @@ from core.overscan import (
     select_lod_duration,
     slice_and_decimate,
     choose_lod_duration,
+    normalise_lod_ratio,
 )
 from core.prefetch import prefetch_service
 from core.view_window import WindowLimits, clamp_window, pan_window, zoom_window
@@ -133,6 +134,7 @@ class _OverscanWorker(QtCore.QObject):
         self._loader = loader
         self._owns_loader = bool(owns_loader)
         self._preview_sample_cap = getattr(self._builder, "_preview_sample_cap", 4096)
+        self._last_lod_durations: dict[int, float] = {}
 
     @QtCore.Slot(object)
     def render(self, request_obj):
@@ -140,6 +142,7 @@ class _OverscanWorker(QtCore.QObject):
             return
         req: OverscanRequest = request_obj
         try:
+            self._builder.set_previous_lod_hints(self._last_lod_durations)
             preview_tile = self._builder.build_tile(req, preview=True)
         except Exception as exc:  # pragma: no cover - preview failures are non fatal
             LOG.debug("Overscan preview failed: %s", exc)
@@ -147,10 +150,12 @@ class _OverscanWorker(QtCore.QObject):
         if preview_tile is not None:
             self.finished.emit(req.request_id, preview_tile)
         try:
+            self._builder.set_previous_lod_hints(self._last_lod_durations)
             final_tile = self._builder.build_tile(req, preview=False)
         except Exception as exc:  # pragma: no cover - worker error propagated to UI
             self.failed.emit(req.request_id, str(exc))
             return
+        self._record_lod_durations(final_tile)
         self.finished.emit(req.request_id, final_tile)
 
     @QtCore.Slot()
@@ -165,6 +170,23 @@ class _OverscanWorker(QtCore.QObject):
                 close_fn()
             except Exception:
                 pass
+        self._last_lod_durations.clear()
+
+    def _record_lod_durations(self, tile: OverscanTile) -> None:
+        for idx, channel in enumerate(tile.channel_indices):
+            if idx >= len(tile.lod_durations):
+                continue
+            duration = tile.lod_durations[idx]
+            if duration is None:
+                self._last_lod_durations.pop(int(channel), None)
+                continue
+            try:
+                value = float(duration)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(value) or value <= 0.0:
+                continue
+            self._last_lod_durations[int(channel)] = value
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -299,7 +321,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._lod_min_bin_multiple = max(
             1.0, float(getattr(self._config, "lod_min_bin_multiple", 2.0) or 2.0)
         )
-        self._lod_envelope_ratio = float(getattr(self._config, "lod_envelope_ratio", 0.0) or 0.0)
+        raw_ratio = getattr(self._config, "lod_envelope_ratio", 0.0)
+        self._lod_envelope_ratio = raw_ratio
+        promote, demote = normalise_lod_ratio(raw_ratio)
+        self._lod_promote_ratio = promote
+        self._lod_demote_ratio = demote if demote > 0.0 else promote
         raw_min_view = getattr(self._config, "lod_min_view_duration_s", 240.0)
         try:
             min_view = float(raw_min_view)
@@ -312,6 +338,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._overscan_worker_owned: bool = False
         self._overscan_future: Future | None = None
         self._overscan_preview_cap = 4096
+        self._last_lod_durations: dict[int, float] = {}
         self._init_overscan_worker()
 
         self._hidden_channels: set[int] = set(getattr(self._config, "hidden_channels", ()))
@@ -1633,6 +1660,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _init_overscan_worker(self):
         self._shutdown_overscan_worker()
+        self._last_lod_durations.clear()
         worker_loader, owns_loader = self._make_background_loader(self.loader)
         if not owns_loader and worker_loader is self.loader:
             LOG.warning(
@@ -1682,6 +1710,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     close_fn()
                 except Exception:
                     pass
+        self._last_lod_durations.clear()
 
     def _available_lod_durations(self, channel: int, loader=None) -> tuple[float, ...]:
         durations: list[float] = []
@@ -1717,6 +1746,17 @@ class MainWindow(QtWidgets.QMainWindow):
         durations = self._available_lod_durations(channel)
         if not durations:
             return None
+        promote = self._lod_promote_ratio
+        if promote > 0.0 and math.isfinite(promote):
+            previous = self._last_lod_durations.get(int(channel))
+            selected = choose_lod_duration(
+                view_duration,
+                durations,
+                ratio=(self._lod_promote_ratio, self._lod_demote_ratio),
+                previous_duration=previous,
+            )
+            if selected is not None:
+                return selected
         return select_lod_duration(
             view_duration,
             durations,
@@ -2465,6 +2505,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._overscan_inflight = None
         self._current_tile_id = None
         self._overscan_request_id += 1
+        self._last_lod_durations.clear()
 
     def _request_overscan_tile(self, window_start: float, window_duration: float):
         if self._overscan_worker is None or self.loader.n_channels == 0:
@@ -2484,6 +2525,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._overscan_tile = cached_tile
             self._update_tile_view_metadata(cached_tile, window_start, window_duration)
             self._current_tile_id = None
+            self._record_lod_durations(cached_tile)
             self._apply_tile_to_curves(cached_tile)
             try:
                 self._schedule_refresh()
@@ -2614,6 +2656,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._current_tile_id = None
         self._apply_tile_to_curves(tile_obj)
         if is_final:
+            self._record_lod_durations(tile_obj)
             self._cache_tile(tile_obj)
         self._schedule_refresh()
 
@@ -2624,6 +2667,25 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         tile.view_start = view_start
         tile.view_duration = view_duration
+
+    def _record_lod_durations(self, tile: OverscanTile | None) -> None:
+        if tile is None:
+            return
+        for idx, channel in enumerate(tile.channel_indices):
+            if idx >= len(tile.lod_durations):
+                continue
+            duration = tile.lod_durations[idx]
+            key = int(channel)
+            if duration is None:
+                self._last_lod_durations.pop(key, None)
+                continue
+            try:
+                value = float(duration)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(value) or value <= 0.0:
+                continue
+            self._last_lod_durations[key] = value
 
     def _handle_overscan_failed(self, request_id: int, message: str):
         if request_id != self._overscan_request_id:
