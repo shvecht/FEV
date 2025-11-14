@@ -312,6 +312,21 @@ def test_choose_lod_duration_prefers_coarsest_available():
     assert choose_lod_duration(1.5, durations, ratio=2.0) is None
 
 
+def test_choose_lod_duration_applies_hysteresis():
+    durations = [1.0, 5.0, 30.0]
+    ratio = (3.0, 2.0)
+    assert choose_lod_duration(80.0, durations, ratio=ratio, previous_duration=5.0) == 5.0
+    assert (
+        choose_lod_duration(100.0, durations, ratio=ratio, previous_duration=5.0) == 30.0
+    )
+    assert (
+        choose_lod_duration(70.0, durations, ratio=ratio, previous_duration=30.0) == 30.0
+    )
+    assert (
+        choose_lod_duration(40.0, durations, ratio=ratio, previous_duration=30.0) == 5.0
+    )
+
+
 class _SyntheticLoader:
     def __init__(self, *, fs: float, lod_durations: Sequence[float]):
         self._fs = float(fs)
